@@ -40,6 +40,10 @@ pub struct RosterEntry {
     /// removed pack, or an unknown type). Absent for a live type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orphan: Option<String>,
+    /// Spec 0.4: this record is retired. Present only on the operator path
+    /// when true; the agent path never lists a retired record.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub retired: bool,
 }
 
 /// The whole roster plus the envelope-level context a reader needs.
@@ -149,6 +153,7 @@ pub fn build_roster(
                 no_ai,
                 kind: rec.kind.as_str().to_owned(),
                 orphan,
+                retired: vault.is_retired(&rec.id),
             },
         ));
     }
@@ -384,5 +389,28 @@ mod tests {
             roster.records.iter().all(|entry| entry.id != note),
             "notes are not roster kinds"
         );
+    }
+
+    #[test]
+    fn agent_roster_hides_retired_and_operator_shows_the_badge() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/vaults/corrections-0.4");
+        let vault = crate::vault::load_vault(&root).unwrap();
+        let agent = build_roster(&vault, Some("person"), &PackScope::All, false);
+        let retired = RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
+        assert!(agent
+            .records
+            .iter()
+            .all(|entry| entry.id != retired.to_string()));
+        assert!(agent.records.iter().all(|entry| !entry.retired));
+
+        let operator = build_roster(&vault, Some("person"), &PackScope::All, true);
+        let entry = operator
+            .records
+            .iter()
+            .find(|entry| entry.id == retired.to_string())
+            .expect("operator roster must include a retired record");
+        assert!(entry.retired);
+        assert!(!agent.records.iter().any(|entry| entry.retired));
     }
 }

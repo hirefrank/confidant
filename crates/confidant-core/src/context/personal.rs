@@ -433,8 +433,7 @@ fn last_contact_on(
 ) -> Option<NaiveDate> {
     let is_member = |id: &RecordId| id == canonical || members.contains(id);
     let ledger = vault
-        .entries
-        .iter()
+        .effective_entries()
         .filter(|s| event_verbs.contains(&s.entry.verb.as_str()))
         .filter(|s| s.entry.date <= as_of)
         .filter(|s| is_member(&s.entry.id))
@@ -444,6 +443,7 @@ fn last_contact_on(
         .records
         .values()
         .filter(|r| r.kind == RecordKind::Interaction)
+        .filter(|r| !vault.is_retired(&r.id))
         .filter_map(|r| {
             let date = r.field("date").and_then(parse_strict_date)?;
             if date > as_of {
@@ -470,8 +470,7 @@ fn recent_touches(
     as_of: NaiveDate,
 ) -> Vec<RecentTouch> {
     let mut touches: Vec<RecentTouch> = vault
-        .entries
-        .iter()
+        .effective_entries()
         .filter(|s| {
             s.entry.verb == "touch"
                 && s.entry.date <= as_of

@@ -43,6 +43,24 @@ impl LineRef {
     pub fn short(&self) -> String {
         hex(&self.hash)[..12].to_owned()
     }
+
+    /// The full lowercase hex fingerprint.
+    pub fn hash_hex(&self) -> String {
+        hex(&self.hash)
+    }
+
+    /// Parse a full `line:<64 hex>` reference, with an optional `#<n>`
+    /// occurrence suffix. Prefixes are resolved by the CLI, which needs the
+    /// vault's line set for ambiguity handling.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.strip_prefix("line:").unwrap_or(raw);
+        let (hash_part, occurrence) = match raw.split_once('#') {
+            Some((hash, n)) => (hash, n.parse::<u32>().ok().filter(|n| *n > 0)?),
+            None => (raw, 1),
+        };
+        let hash = parse_hash(hash_part)?;
+        Some(Self::new(hash, occurrence))
+    }
 }
 
 impl std::fmt::Display for LineRef {

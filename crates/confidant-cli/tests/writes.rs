@@ -3893,3 +3893,486 @@ fn record_self_edge_edit_is_blocked_by_check_and_commits_nothing() {
         "the file was not rolled back: {on_disk}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #746 corrections and retirement (spec 0.4)
+// ---------------------------------------------------------------------------
+
+const CP_PERSON: &str = "p-01J9Z3K4QF0000000000000010";
+const CP_NOTE: &str = "n-01J9Z3K4QF0000000000000011";
+const CP_DATE: &str = "2026-11-02";
+const CP_REQUEST: &str = "01J9Z3K4QF7F3A000000000099";
+
+fn make_corrections_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.4\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-11-02\"\n",
+    )
+    .unwrap();
+    let person_dir = root.join(format!("people/{CP_PERSON}"));
+    std::fs::create_dir_all(person_dir.join("notes")).unwrap();
+    std::fs::write(
+        person_dir.join("profile.md"),
+        format!(
+            "---\nid: {CP_PERSON}\ntype: person\nname: \"Correction Person\"\n---\n\nFake bio.\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        person_dir.join(format!("notes/{CP_NOTE}.md")),
+        format!("---\nid: {CP_NOTE}\ntype: note\nperson: {CP_PERSON}\ndate: 2026-10-01\n---\n\nFake note body.\n"),
+    )
+    .unwrap();
+    let ledger = root.join("ledger/2026");
+    std::fs::create_dir_all(&ledger).unwrap();
+    std::fs::write(
+        ledger.join("10.cfd"),
+        format!("2026-10-01 touch {CP_PERSON} call\n2026-10-01 touch {CP_PERSON} call\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    dir
+}
+
+fn find_refs(root: &Path, query: &str) -> Vec<String> {
+    let v = run_json(&["find", query, "--json", "--vault", &vault_arg(root)]).1;
+    v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|hit| hit["ref"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn retract_dry_run_apply_request_id_and_find_output() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let before = commits(root);
+    let refs = find_refs(root, "call");
+    assert_eq!(refs.len(), 2, "{refs:?}");
+    let target = refs[1].clone();
+    let (ok, text, _) = run_raw(&["find", "call", "--no-input", "--vault", &vault_arg(root)]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("line:"),
+        "ledger hit lost its ref in text: {text}"
+    );
+
+    let (ok, dry) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--dry-run",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{dry}");
+    assert_eq!(dry["dry_run"], true, "{dry}");
+    assert_eq!(commits(root), before, "dry run must not commit");
+    assert!(!root.join("ledger/2026/11.cfd").exists());
+
+    let (ok, applied) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--request-id",
+        CP_REQUEST,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{applied}");
+    assert!(applied["commit"].as_str().is_some(), "{applied}");
+    assert_eq!(commits(root), before + 1);
+    let ledger = std::fs::read_to_string(root.join("ledger/2026/11.cfd")).unwrap();
+    assert!(ledger.contains("retract"), "{ledger}");
+    assert!(ledger.contains("reason:duplicate"), "{ledger}");
+
+    let (ok, check) = run_json(&["check", "--json", "--vault", &vault_arg(root)]);
+    assert!(ok, "{check}");
+    assert_eq!(check["summary"]["warnings"], 0, "{check}");
+    assert_eq!(find_refs(root, "call").len(), 1);
+
+    // The retry replays the recorded request instead of refusing the
+    // now-voided target.
+    let (ok, replay) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--request-id",
+        CP_REQUEST,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{replay}");
+    assert_eq!(replay["idempotent"], true, "{replay}");
+    assert_eq!(commits(root), before + 1);
+}
+
+#[test]
+fn bulk_retract_clears_a_duplicate_batch_in_one_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.4\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-11-02\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(format!("people/{CP_PERSON}"))).unwrap();
+    std::fs::write(
+        root.join(format!("people/{CP_PERSON}/profile.md")),
+        format!("---\nid: {CP_PERSON}\ntype: person\nname: \"Correction Person\"\n---\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("ledger/2026")).unwrap();
+    let mut lines = String::new();
+    for _ in 0..41 {
+        lines.push_str(&format!("2026-10-01 touch {CP_PERSON} call\n"));
+    }
+    std::fs::write(root.join("ledger/2026/10.cfd"), lines).unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let before = commits(root);
+    let (ok, out) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--verb",
+        "touch",
+        "--match-date",
+        "2026-10-01",
+        "--keep",
+        "1",
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{out}");
+    assert!(out["commit"].as_str().is_some(), "{out}");
+    assert_eq!(out["targets"].as_array().unwrap().len(), 40, "{out}");
+    assert_eq!(commits(root), before + 1);
+    let ledger = std::fs::read_to_string(root.join("ledger/2026/11.cfd")).unwrap();
+    assert_eq!(ledger.matches("retract ").count(), 40, "{ledger}");
+    let (ok, check) = run_json(&["check", "--json", "--vault", &vault_arg(root)]);
+    assert!(ok, "{check}");
+    assert_eq!(check["summary"]["warnings"], 0, "{check}");
+    assert_eq!(find_refs(root, "call").len(), 1);
+}
+
+#[test]
+fn correct_appends_replacement_and_context_shows_it() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let before = commits(root);
+    let target = find_refs(root, "call")[0].clone();
+    let replacement = format!("2026-10-01 touch {CP_PERSON} meet");
+
+    let (ok, out) = run_json(&[
+        "correct",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--replacement",
+        &replacement,
+        "--reason",
+        "wrong-kind",
+        "--date",
+        CP_DATE,
+        "--request-id",
+        CP_REQUEST,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{out}");
+    assert!(out["commit"].as_str().is_some(), "{out}");
+    assert_eq!(commits(root), before + 1);
+    let october = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+    let november = std::fs::read_to_string(root.join("ledger/2026/11.cfd")).unwrap();
+    assert!(october.contains("meet"), "{october}");
+    assert!(november.contains("replace:"), "{november}");
+    assert!(november.contains("reason:wrong-kind"), "{november}");
+    let (ok, context) = run_json(&[
+        "context",
+        CP_PERSON,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{context}");
+    let touchpoints = context["touchpoints"].as_array().unwrap();
+    // One of the two identical call lines was corrected; the other remains.
+    assert_eq!(touchpoints.len(), 2, "{context}");
+    assert_eq!(
+        touchpoints.iter().filter(|t| t["kind"] == "call").count(),
+        1,
+        "{context}"
+    );
+    assert_eq!(
+        touchpoints.iter().filter(|t| t["kind"] == "meet").count(),
+        1,
+        "{context}"
+    );
+    let (_ok, check) = run_json(&["check", "--json", "--vault", &vault_arg(root)]);
+    assert_eq!(check["summary"]["warnings"], 0, "{check}");
+
+    let (ok, replay) = run_json(&[
+        "correct",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--replacement",
+        &replacement,
+        "--reason",
+        "wrong-kind",
+        "--date",
+        CP_DATE,
+        "--request-id",
+        CP_REQUEST,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{replay}");
+    assert_eq!(replay["idempotent"], true, "{replay}");
+    assert_eq!(commits(root), before + 1);
+}
+
+#[test]
+fn record_retire_hides_agent_reads_and_operator_sees_the_badge() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let (ok, out) = run_json(&[
+        "record",
+        "retire",
+        CP_PERSON,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["retired"], true, "{out}");
+    let profile =
+        std::fs::read_to_string(root.join(format!("people/{CP_PERSON}/profile.md"))).unwrap();
+    assert!(profile.contains("retired: true"), "{profile}");
+
+    assert!(find_refs(root, "Correction Person").is_empty());
+    let (ok, op) = run_json(&[
+        "find",
+        "Correction Person",
+        "--for-operator",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{op}");
+    assert_eq!(op["matches"].as_array().unwrap().len(), 1, "{op}");
+
+    let (ok, list) = run_json(&["record", "list", "--json", "--vault", &vault_arg(root)]);
+    assert!(ok, "{list}");
+    assert!(list["records"].as_array().unwrap().is_empty(), "{list}");
+    let (ok, op_list) = run_json(&[
+        "record",
+        "list",
+        "--for-operator",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{op_list}");
+    let entry = &op_list["records"][0];
+    assert_eq!(entry["id"], CP_PERSON, "{op_list}");
+    assert_eq!(entry["retired"], true, "{op_list}");
+
+    let (ok, show) = run_json(&[
+        "record",
+        "show",
+        CP_PERSON,
+        "--for-edit",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{show}");
+    assert_eq!(show["retired"], true, "{show}");
+    let (ok, _out, err) = run_raw(&[
+        "record",
+        "show",
+        CP_PERSON,
+        "--for-edit",
+        "--no-input",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{err}");
+    assert!(err.contains("retired"), "missing retired hint: {err}");
+
+    let (ok, err) = run_json(&[
+        "context",
+        CP_PERSON,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(!ok, "{err}");
+    assert_eq!(err["error"]["code"], "E_NOT_FOUND", "{err}");
+
+    let (ok, err) = run_json(&[
+        "log",
+        "touch",
+        CP_PERSON,
+        "meet",
+        "--date",
+        "2026-10-13",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(!ok, "{err}");
+    assert_eq!(err["error"]["code"], "E_INVALID", "{err}");
+
+    let (ok, out) = run_json(&[
+        "record",
+        "unretire",
+        CP_PERSON,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["retired"], false, "{out}");
+    let (ok, found) = run_json(&[
+        "find",
+        "Correction Person",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{found}");
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1, "{found}");
+
+    // Notes are records too; `record retire` keeps the note file and hides
+    // it from agent reads.
+    let (ok, out) = run_json(&[
+        "record",
+        "retire",
+        CP_NOTE,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["retired"], true, "{out}");
+    let (ok, hidden) = run_json(&[
+        "find",
+        "Fake note body",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{hidden}");
+    assert!(hidden["matches"].as_array().unwrap().is_empty(), "{hidden}");
+}
+
+#[test]
+fn retract_is_refused_on_spec_03() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.3\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(format!("people/{CP_PERSON}"))).unwrap();
+    std::fs::write(
+        root.join(format!("people/{CP_PERSON}/profile.md")),
+        format!("---\nid: {CP_PERSON}\ntype: person\nname: \"Correction Person\"\n---\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("ledger/2026")).unwrap();
+    std::fs::write(
+        root.join("ledger/2026/10.cfd"),
+        format!("2026-10-01 touch {CP_PERSON} call\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let refs = find_refs(root, "call");
+    let (ok, err) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--line",
+        &refs[0],
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(!ok, "{err}");
+    assert_eq!(err["error"]["code"], "E_INVALID", "{err}");
+}
+
+#[test]
+fn retract_refuses_a_dirty_month_file() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let target = find_refs(root, "call")[1].clone();
+    let draft_path = root.join("ledger/2026/11.cfd");
+    let mut draft =
+        std::fs::read_to_string(&draft_path).unwrap_or_else(|_| "; local draft\n".to_owned());
+    draft.push_str("; uncommitted\n");
+    std::fs::write(draft_path, draft).unwrap();
+    let (ok, err) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(!ok, "{err}");
+    assert_eq!(err["error"]["code"], "E_CONFLICT", "{err}");
+}

@@ -228,14 +228,15 @@ pub fn contract_schema() -> Value {
                     "query": {"type": "string"},
                     "matches": {
                         "type": "array",
-                        "description": "Allowlisted hits only; no-ai records never appear.",
+                        "description": "Allowlisted hits only; no-ai and retired records never appear. Parsed ledger hits carry a stable `ref`.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "id": {"type": ["string", "null"]},
                                 "path": {"type": "string"},
                                 "line": {"type": ["integer", "null"]},
-                                "excerpt": {"type": "string"}
+                                "excerpt": {"type": "string"},
+                                "ref": {"type": "string", "description": "Parsed ledger hits only: the stable line:<64 hex> correction reference. Absent on record hits and malformed lines."}
                             }
                         }
                     },
@@ -287,13 +288,18 @@ pub fn contract_schema() -> Value {
                     "ok": {"type": "boolean", "const": true},
                     "schema_version": {"type": "string"},
                     "vault": {"type": "string"},
-                    "command": {"type": "string", "enum": ["log-touch", "import", "note-add", "record-add", "record-edit"]},
+                    "command": {"type": "string", "enum": ["log-touch", "import", "note-add", "record-add", "record-edit", "retract", "correct", "record-retire", "record-unretire"]},
                     "dry_run": {"type": "boolean"},
                     "idempotent": {"type": "boolean"},
                     "unchanged": {"type": "boolean", "description": "The write would not change any file (for example re-saving a record with identical content). No commit is reported with it; exit status is success."},
                     "commit": {"type": ["string", "null"], "description": "Full commit SHA; null on dry-run."},
                     "files": {"type": "array", "items": {"type": "string"}},
-                    "lines": {"type": "array", "items": {"type": "string"}, "description": "Ledger lines appended (log/import). Opaque IDs only."},
+                    "lines": {"type": "array", "items": {"type": "string"}, "description": "Ledger lines appended (log/import/retract/correct). Opaque IDs only."},
+                    "target": {"type": "string", "description": "retract/correct: the target line ref."},
+                    "subject": {"type": "string", "description": "retract/correct: the target line's subject record id."},
+                    "reason": {"type": "string", "description": "retract/correct: the closed reason token."},
+                    "replacement": {"type": "string", "description": "correct: the replacement line ref."},
+                    "bulk": {"type": "boolean", "description": "retract: the bulk selector path."},
                     "id": {"type": ["string", "null"], "description": "New record id (note-add)."},
                     "path": {"type": ["string", "null"], "description": "New record path (note-add)."},
                     "rekeyed": {
@@ -321,7 +327,7 @@ pub fn contract_schema() -> Value {
             },
             "contextBundle": {
                 "title": "context --json",
-                "description": "Everything the vault knows about one entity: a core person or org, or a record of a pack-declared type with entity = true (#813, #814). `entity` is the canonical target view; `person` is a deprecated person-only alias, present only when the target is a core person. PII fields (name/profile/bodies/edge endpoint names) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions/edges are omitted entirely, never nulled. An edge is visible only when both endpoints are cleared and the edge itself is not no-ai: true, so a no-ai endpoint or no-ai edge omits the edge from the other endpoint's bundle with no count or hint; an operator bundle badges it instead. --exclude-private strips PII regardless; ledger facts and opaque edge ids/kinds/dates are kept. The `packs[\"personal@0.2\"]` entry (core: context::personal) carries the personal pack's declared fields (birthday, dates, relationship, location, emails, phones, links, tags, …) plus cadence_days, cadence_never, snooze_until, last_touch, days_since_touch, overdue and recent_touches. cadence_never is true only when the declared cadence is the literal `never` (and is omitted otherwise), so it distinguishes a deliberate never-nudge from no cadence set: both omit cadence_days. --exclude-private removes the PII fields by name; title, company, cadence_days and snooze_until stay. For a person outside the cleared set (no-ai) the declared fields are denied by default: only snooze_until and the derived cadence/touch metadata (cadence_days, cadence_never, last_touch, days_since_touch, overdue, recent_touches) remain. A non-person-like bundle (an org, or a pack type without person_like) has empty `touchpoints`, `aliases`, and `packs`; its notes/interactions are those linked by `org:` or `entity:`. A pack-declared type is a target only when it is enabled and its declaring pack is in scope; a disabled, retired, or undeclared type is operator-only.",
+                "description": "Everything the vault knows about one entity: a core person or org, or a record of a pack-declared type with entity = true (#813, #814). `entity` is the canonical target view; `person` is a deprecated person-only alias, present only when the target is a core person. PII fields (name/profile/bodies/edge endpoint names) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions/edges are omitted entirely, never nulled. An edge is visible only when both endpoints are cleared and the edge itself is not no-ai: true, so a no-ai endpoint or no-ai edge omits the edge from the other endpoint's bundle with no count or hint; an operator bundle badges it instead. --exclude-private strips PII regardless; ledger facts and opaque edge ids/kinds/dates are kept. The `packs[\"personal@0.2\"]` entry (core: context::personal) carries the personal pack's declared fields (birthday, dates, relationship, location, emails, phones, links, tags, …) plus cadence_days, cadence_never, snooze_until, last_touch, days_since_touch, overdue and recent_touches. cadence_never is true only when the declared cadence is the literal `never` (and is omitted otherwise), so it distinguishes a deliberate never-nudge from no cadence set: both omit cadence_days. --exclude-private removes the PII fields by name; title, company, cadence_days and snooze_until stay. For a person outside the cleared set (no-ai) the declared fields are denied by default: only snooze_until and the derived cadence/touch metadata (cadence_days, cadence_never, last_touch, days_since_touch, overdue, recent_touches) remain. A non-person-like bundle (an org, or a pack type without person_like) has empty `touchpoints`, `aliases`, and `packs`; its notes/interactions are those linked by `org:` or `entity:`. A pack-declared type is a target only when it is enabled and its declaring pack is in scope; a disabled, retired, or undeclared type is operator-only. A retired record (spec 0.4) returns no bundle on either path; superseded ledger lines are omitted from touchpoints and pack views.",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "entity", "notes", "interactions", "edges", "packs", "aliases"],
                 "properties": {
@@ -383,7 +389,7 @@ pub fn contract_schema() -> Value {
             },
             "rosterResponse": {
                 "title": "record list --json",
-                "description": "Operator-only roster (#558, #813, #814). `record list` is never exposed over MCP. `kind` is the requested filter; the default is `all`, which covers the core identity kinds plus declared types with roster = true. `kinds` lists the kinds included by this call. Without --for-operator entries are the section-12 cleared set; with it, records hidden only by their own no-ai and orphaned types are added and every entry carries the tri-state no_ai string the #559 ruling specifies.",
+                "description": "Operator-only roster (#558, #813, #814, #746). `record list` is never exposed over MCP. `kind` is the requested filter; the default is `all`, which covers the core identity kinds plus declared types with roster = true. `kinds` lists the kinds included by this call. Without --for-operator entries are the section-12 cleared set (no retired records); with it, records hidden only by their own no-ai, retired records, and orphaned types are added. Every entry carries the tri-state no_ai string the #559 ruling specifies; retired entries also carry `retired: true`.",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "kind", "kinds", "for_operator", "records", "scope"],
                 "properties": {
@@ -412,7 +418,8 @@ pub fn contract_schema() -> Value {
                     "name": {"type": "string", "description": "Display name, falling back to the opaque id."},
                     "no_ai": {"type": "string", "enum": ["true", "notes", "false"]},
                     "kind": {"type": "string"},
-                    "orphan": {"type": "string", "description": "Operator path only: the disabled pack name, removed, or unknown."}
+                    "orphan": {"type": "string", "description": "Operator path only: the disabled pack name, removed, or unknown."},
+                    "retired": {"type": "boolean", "description": "Operator path only: the record is retired (spec 0.4). Absent when false; agent reads never list a retired record."}
                 }
             },
             "doctorReport": {
@@ -557,6 +564,11 @@ mod tests {
             "string"
         );
         assert!(s["$defs"]["rosterEntry"]["properties"]["orphan"].is_object());
+        assert!(s["$defs"]["rosterEntry"]["properties"]["retired"].is_object());
+        assert!(
+            s["$defs"]["findResponse"]["properties"]["matches"]["items"]["properties"]["ref"]
+                .is_object()
+        );
         assert!(s["properties"]["record_types"].is_array());
         assert_eq!(
             s["$defs"]["recordType"]["properties"]["enabled"]["type"],

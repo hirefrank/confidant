@@ -107,7 +107,7 @@ python3 crates/confidant-cli/skills/qmd-search/tests/test_qmd_query.py --cli tar
                                                     # skill allowlist/verification tests (needs a built CLI; the "skills smoke" job)
 cargo build -p confidant-cli --locked --all-features   # build the CLI for qa-smoke (same build as CI's test job)
 python3 .github/scripts/qa-smoke.py --cli target/debug/confidant
-                                                    # 22-step end-to-end smoke on a throwaway vault (.agents/skills/qa-sweep/SKILL.md)
+                                                    # end-to-end smoke on a throwaway vault (.agents/skills/qa-sweep/SKILL.md)
 ```
 
 `--locked` means the lockfile must already be right. If you add a
