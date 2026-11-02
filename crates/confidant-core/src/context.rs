@@ -204,9 +204,9 @@ pub struct PersonContext {
     /// §12 cleared set, the kind's endpoint declaration, merge
     /// canonicalization, and pack scope.
     pub edges: Vec<EdgeView>,
-    /// Pack state grouped by pack name (`"personal@0.2"` today). Each pack
-    /// decides its own view shape via `Pack::context_view`. Empty for an
-    /// org: pack views are person-keyed.
+    /// Pack state grouped by pack name (`"personal@0.2"` in 0.1–0.3,
+    /// `"personal@0.3"` in 0.4). Each pack decides its own view shape via
+    /// `Pack::context_view`. Empty for an org: pack views are person-keyed.
     pub packs: BTreeMap<String, serde_json::Value>,
     /// The person's contact values (`emails`, `phones`, `handles`), shown
     /// only when private data is included. Empty under `--exclude-private`,
@@ -1451,7 +1451,7 @@ mod tests {
             bea_bundle.touchpoints
         );
         assert_eq!(bea_bundle.touchpoints[0].kind.as_deref(), Some("meet"));
-        let personal = &bea_bundle.packs["personal@0.2"];
+        let personal = &bea_bundle.packs["personal@0.3"];
         assert_eq!(personal["recent_touches"].as_array().unwrap().len(), 1);
         assert_eq!(personal["recent_touches"][0]["kind"], "meet");
 

@@ -326,9 +326,16 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     // vault cannot install or shadow one (the external loader refuses any
     // vendored directory or pin for its name, #504 R8).
     let builtins: &[packs_embedded::EmbeddedPack] = packs_embedded::embedded_packs();
+    let spec = SpecVersion::parse(&config.spec);
+    let compiled = match spec {
+        Some(spec) => PackRegistry::compiled_for_spec(spec),
+        // Unsupported specs fail `check` on the spec itself; keep the
+        // all-versions registry so the failure does not cascade into pack
+        // findings.
+        None => PackRegistry::compiled(),
+    };
     let (pack_registry, pack_problems, external_manifests, lockfile_error) =
         if SpecVersion::is_supported(&config.spec) {
-            let compiled = PackRegistry::compiled();
             let load = packs_external::load_external_packs(
                 root,
                 &config.spec,
@@ -342,7 +349,7 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
             }
             (registry, load.problems, load.manifests, load.lockfile_error)
         } else {
-            (PackRegistry::compiled(), Vec::new(), Vec::new(), false)
+            (compiled, Vec::new(), Vec::new(), false)
         };
 
     let mut manifests = crate::packs::pack_manifests_for_config();
@@ -380,7 +387,6 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     // declarations. Disabled packs stay known (orphans warn); retired types
     // come from `[[retired_types]]`. The registry is built before the record
     // walk because collections come from it.
-    let spec = SpecVersion::parse(&config.spec);
     let (enabled, _) = pack_registry.resolve_enabled(&config.packs);
     let enabled_names: HashSet<&str> = enabled.iter().map(|pack| pack.name()).collect();
     let mut sources: Vec<TypeSource> = pack_registry

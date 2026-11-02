@@ -9709,11 +9709,28 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
         Some(name) => {
             if name.is_empty() {
                 return Err(anyhow::Error::new(DomainError::usage(
-                    "empty pack name: use `help pack:<name>`, e.g. `help pack:personal@0.2`",
+                    "empty pack name: use `help pack:<name>`, e.g. `help pack:personal@0.3`",
                 )));
             }
-            if !names.iter().any(|n| n == name) {
-                let known = v.pack_registry().all().iter().any(|p| p.name() == name);
+            // A built-in listing names the active version at any version
+            // (#551, #745): `personal@0.2` in a 0.4 vault serves 0.3.
+            let canonical = name
+                .split_once('@')
+                .filter(|(_, version)| !version.is_empty())
+                .and_then(|(base, _)| {
+                    v.pack_registry()
+                        .implicit()
+                        .iter()
+                        .find(|p| p.name().split_once('@').map(|(n, _)| n) == Some(base))
+                        .map(|p| p.name())
+                })
+                .unwrap_or(name);
+            if !names.iter().any(|n| n == canonical) {
+                let known = v
+                    .pack_registry()
+                    .all()
+                    .iter()
+                    .any(|p| p.name() == canonical);
                 return Err(anyhow::Error::new(
                     DomainError::not_found(if known {
                         format!(
@@ -9725,20 +9742,20 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
                     .with_fix("Enable it in confidant.toml `packs = [...]` or widen --packs"),
                 ));
             }
-            let mut text = embedded::pack_skill_text_from_registry(v.pack_registry(), name)
+            let mut text = embedded::pack_skill_text_from_registry(v.pack_registry(), canonical)
                 .ok_or_else(|| {
                     anyhow::Error::new(DomainError::internal(format!(
-                        "pack `{name}` is enabled but ships no SKILL.md"
+                        "pack `{canonical}` is enabled but ships no SKILL.md"
                     )))
                 })?
                 .to_owned();
             // PD10 (#445): external pack text shown to agents is labelled
             // with where it came from. Compiled packs are shipped with the
             // binary and print exactly as before.
-            if let Some(label) = external_pack_label(v.pack_registry(), root, name) {
+            if let Some(label) = external_pack_label(v.pack_registry(), root, canonical) {
                 text = format!("{label}\n{text}");
             }
-            (vec![name.to_owned()], text)
+            (vec![canonical.to_owned()], text)
         }
         None => {
             debug_assert_eq!(topic, "pack");

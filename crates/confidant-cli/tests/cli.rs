@@ -1275,7 +1275,8 @@ fn help_pack_bare_includes_external_pack() {
 }
 
 /// PD10 (#445) acceptance: a compiled pack's skill output is unchanged
-/// byte for byte — it ships with the binary, so it gets no label.
+/// byte for byte — it ships with the binary, so it gets no label. The demo
+/// vault is spec 0.2, so it serves the frozen 0.2 text.
 #[test]
 fn help_pack_compiled_is_unlabelled() {
     let out = Command::new(bin())
@@ -1289,12 +1290,57 @@ fn help_pack_compiled_is_unlabelled() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    let shipped = include_str!("../pack-skills/personal/SKILL.md");
+    let shipped = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../confidant-core/pack-manifests/personal-0.2/SKILL.md"),
+    )
+    .expect("read frozen 0.2 skill");
     assert!(!stdout.starts_with("[external pack:"), "{stdout:?}");
     assert_eq!(
         stdout,
         format!("{shipped}\n"),
         "compiled skill output must be byte-identical to the shipped text"
+    );
+}
+
+/// #745: a 0.4 vault serves the 0.3 built-in skill, byte for byte.
+#[test]
+fn help_pack_personal_0_3_serves_the_0_4_skill() {
+    let vault = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/corrections-0.4");
+    let out = Command::new(bin())
+        .args(["help", "pack:personal@0.3", "--vault"])
+        .arg(vault)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let shipped = include_str!("../pack-skills/personal/SKILL.md");
+    assert!(!stdout.starts_with("[external pack:"), "{stdout:?}");
+    assert_eq!(
+        stdout,
+        format!("{shipped}\n"),
+        "0.4 must serve the personal@0.3 skill text"
+    );
+
+    // A versioned built-in listing names the active version at any version.
+    let alias = Command::new(bin())
+        .args(["help", "pack:personal@0.2", "--vault"])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/corrections-0.4"))
+        .output()
+        .unwrap();
+    assert!(
+        alias.status.success(),
+        "{}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(alias.stdout).unwrap(),
+        format!("{shipped}\n"),
+        "personal@0.2 is a no-op alias on 0.4"
     );
 }
 

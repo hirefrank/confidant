@@ -80,6 +80,7 @@ jobs:
                    testdata/golden/check.json \
                    testdata/packs/example-pack/manifest.toml \
                    crates/confidant-core/pack-manifests/personal-0.2/SKILL.md \
+                   crates/confidant-core/pack-manifests/personal-0.3/SKILL.md \
                    crates/confidant-cli/pack-skills/personal/SKILL.md \
                    crates/confidant-cli/skills/qmd-search/SKILL.md \
                    Cargo.toml .github/workflows/ci.yml; do
