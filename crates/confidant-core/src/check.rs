@@ -93,6 +93,7 @@ pub enum FindingCode {
     Frontmatter,
     UnknownVerb,
     UnknownRecord,
+    UnknownRecordType,
     UnknownMetric,
     LedgerPath,
     LedgerDate,
@@ -147,6 +148,7 @@ impl FindingCode {
             Self::Frontmatter => "E_FRONTMATTER",
             Self::UnknownVerb => "E_UNKNOWN_VERB",
             Self::UnknownRecord => "E_UNKNOWN_RECORD",
+            Self::UnknownRecordType => "E_UNKNOWN_RECORD_TYPE",
             Self::UnknownMetric => "E_UNKNOWN_METRIC",
             Self::LedgerPath => "E_LEDGER_PATH",
             Self::LedgerDate => "E_LEDGER_DATE",
@@ -202,6 +204,7 @@ impl FindingCode {
         "E_FRONTMATTER",
         "E_UNKNOWN_VERB",
         "E_UNKNOWN_RECORD",
+        "E_UNKNOWN_RECORD_TYPE",
         "E_UNKNOWN_METRIC",
         "E_LEDGER_PATH",
         "E_LEDGER_DATE",
@@ -339,6 +342,7 @@ impl FindingCode {
             "E_FRONTMATTER" => Self::Frontmatter,
             "E_UNKNOWN_VERB" => Self::UnknownVerb,
             "E_UNKNOWN_RECORD" => Self::UnknownRecord,
+            "E_UNKNOWN_RECORD_TYPE" => Self::UnknownRecordType,
             "E_UNKNOWN_METRIC" => Self::UnknownMetric,
             "E_LEDGER_PATH" => Self::LedgerPath,
             "E_LEDGER_DATE" => Self::LedgerDate,
@@ -513,10 +517,10 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
             Finding::new(
                 FindingCode::SpecUnsupported,
                 Severity::Error,
-                "vault spec is not supported (this CLI implements 0.1 and 0.2)".to_owned(),
+                "vault spec is not supported (this CLI implements 0.1, 0.2, and 0.3)".to_owned(),
             )
             .at_file("confidant.toml")
-            .with_fix("Use spec = \"0.1\" or \"0.2\", or upgrade the CLI"),
+            .with_fix("Use spec = \"0.1\", \"0.2\", or \"0.3\", or upgrade the CLI"),
         );
     }
 
@@ -596,7 +600,24 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     // drift apart (#732 fix wave).
     let accepted = accepted_verbs(vault, &enabled_packs);
     let known_verbs = accepted.known;
-    let orphans = accepted.orphans;
+    let mut orphans = accepted.orphans;
+    // A vendored pack that is no longer listed still owns its edge kinds,
+    // fields, and metrics for orphan warnings. Its verbs stay unaccepted so
+    // a write cannot silently create more disabled-pack data.
+    for pack in vault.disabled_packs() {
+        for verb in pack.verbs {
+            orphans.verbs.entry(verb).or_insert(pack.name);
+        }
+        for kind in pack.edge_kinds {
+            orphans.edge_kinds.entry(kind.name).or_insert(pack.name);
+        }
+        for field in pack.fields {
+            orphans.fields.entry(field).or_insert(pack.name);
+        }
+        for metric in pack.balance_metrics {
+            orphans.balance_metrics.entry(metric).or_insert(pack.name);
+        }
+    }
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
 
     check_ledger_paths(vault, &mut findings);
@@ -611,6 +632,7 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
         &mut findings,
     );
     check_orphan_fields_and_types(vault, &orphans, &mut findings);
+    check_unknown_record_types(vault, &mut findings);
     check_duplicate_ulids(vault, &mut findings);
     check_dangling_refs(vault, &known_ids, &mut findings);
     check_edges(
@@ -1013,12 +1035,12 @@ fn check_verbs_and_refs(
                     Finding::new(
                         FindingCode::WrongIdType,
                         Severity::Error,
-                        format!("requires a {} id", want.as_str()),
+                        format!("requires a {} id", want),
                     )
                     .at_file(&sourced.file)
                     .at_line(sourced.line)
                     .for_id(&e.id)
-                    .with_fix(format!("Use a {}-<ULID> id", want.as_str())),
+                    .with_fix(format!("Use a {}-<ULID> id", want)),
                 );
                 continue;
             }
@@ -1240,11 +1262,8 @@ fn check_orphan_fields_and_types(
     orphans: &OrphanOwners,
     findings: &mut Vec<Finding>,
 ) {
-    if orphans.fields.is_empty() && orphans.record_types.is_empty() {
-        return;
-    }
     for rec in vault.records.values() {
-        if let Some(owner) = orphans.record_types.get(rec.kind.as_str()) {
+        let type_orphaned = if let Some(owner) = orphans.record_types.get(rec.kind.as_str()) {
             findings.push(
                 Finding::new(
                     FindingCode::PackOrphan,
@@ -1255,6 +1274,46 @@ fn check_orphan_fields_and_types(
                 .for_id(&rec.id)
                 .with_fix(format!("Enable {owner} or remove the record")),
             );
+            true
+        } else if let Some(decl) = vault.type_registry().get(rec.kind.as_str()) {
+            if decl.retired {
+                findings.push(
+                    Finding::new(
+                        FindingCode::PackOrphan,
+                        Severity::Warning,
+                        "record type belongs to a removed pack".to_owned(),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix("Re-add the pack that declared this type, or remove the record"),
+                );
+                true
+            } else if !decl.enabled && matches!(decl.owner, crate::record_type::TypeOwner::Pack(_))
+            {
+                findings.push(
+                    Finding::new(
+                        FindingCode::PackOrphan,
+                        Severity::Warning,
+                        "record type belongs to a disabled pack".to_owned(),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix(format!(
+                        "Enable {} or remove the record",
+                        decl.owner.label()
+                    )),
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if type_orphaned {
+            // The whole record is orphaned; per-field warnings would only
+            // repeat the same cause.
+            continue;
         }
         for key in rec.fields.keys() {
             if let Some(owner) = orphans.fields.get(key.as_str()) {
@@ -1271,6 +1330,55 @@ fn check_orphan_fields_and_types(
                 }
                 findings.push(finding);
             }
+        }
+    }
+}
+
+/// Unknown record types (spec 0.3): a typo in a core collection is an error;
+/// an undeclared pack prefix is a removed-pack orphan warning. A type declared
+/// by a disabled or retired pack is known and handled by
+/// [`check_orphan_fields_and_types`].
+fn check_unknown_record_types(vault: &Vault, findings: &mut Vec<Finding>) {
+    for rec in vault.records.values() {
+        if vault.type_registry().get(rec.kind.as_str()).is_some() {
+            continue;
+        }
+        let prefix_decl = vault.type_registry().get_by_prefix(rec.id.prefix());
+        if prefix_decl.is_some() {
+            findings.push(
+                Finding::new(
+                    FindingCode::UnknownRecordType,
+                    Severity::Error,
+                    "front matter key 'type' is not a declared record type".to_owned(),
+                )
+                .at_file(&rec.path)
+                .for_id(&rec.id)
+                .with_fix("Use a core type or a type declared by an enabled pack"),
+            );
+        } else if rec.id.prefix().pack_bytes().is_some()
+            || prefix_decl.is_some_and(|decl| decl.retired)
+        {
+            findings.push(
+                Finding::new(
+                    FindingCode::PackOrphan,
+                    Severity::Warning,
+                    "record type belongs to a removed pack".to_owned(),
+                )
+                .at_file(&rec.path)
+                .for_id(&rec.id)
+                .with_fix("Re-add the pack that declared this type, or remove the record"),
+            );
+        } else {
+            findings.push(
+                Finding::new(
+                    FindingCode::UnknownRecordType,
+                    Severity::Error,
+                    "front matter key 'type' is not a declared record type".to_owned(),
+                )
+                .at_file(&rec.path)
+                .for_id(&rec.id)
+                .with_fix("Use a core type or a type declared by an enabled pack"),
+            );
         }
     }
 }
@@ -1426,7 +1534,26 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
                     }
                     findings.push(finding);
                 }
-                FrontmatterRef::Id(_) => {}
+                FrontmatterRef::Id(id) => {
+                    if crate::record::canonical_ref_key(key) == Some("entity") {
+                        if let Some(target) = vault.records.get(&id) {
+                            if !vault.type_registry().is_entity(target.id.prefix()) {
+                                findings.push(
+                                    Finding::new(
+                                        FindingCode::WrongIdType,
+                                        Severity::Error,
+                                        format!("front matter key '{key}' names a non-entity type"),
+                                    )
+                                    .at_file(&rec.path)
+                                    .for_id(&rec.id)
+                                    .with_fix(
+                                        "Use a person, org, or declared entity id for entity:",
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1449,10 +1576,16 @@ fn edge_kind_names(enabled_packs: &[&dyn Pack], spec: SpecVersion) -> Vec<&'stat
 
 /// Human wording for an allowed endpoint set (`a person`, `an org`,
 /// `a person or org`), used only in fix text.
-fn endpoint_words(endpoints: &[Prefix]) -> String {
+fn endpoint_words(endpoints: &[Prefix], types: &crate::record_type::TypeRegistry) -> String {
     let labels: Vec<&str> = endpoints
         .iter()
-        .map(|prefix| prefix.record_type().unwrap_or("record"))
+        .map(|prefix| {
+            types
+                .get_by_prefix(*prefix)
+                .map(|decl| decl.name)
+                .or_else(|| prefix.record_type())
+                .unwrap_or("record")
+        })
         .collect();
     match labels.as_slice() {
         ["person"] => "a person".to_owned(),
@@ -1522,10 +1655,12 @@ fn check_edges(
         let declared_kind = kind_resolved.or(orphan_kind);
 
         let end_fix = |key: &str| -> String {
-            if spec == SpecVersion::V01 {
-                format!("Add {key}: p-<ULID>")
-            } else {
-                format!("Add {key}: p-<ULID> or o-<ULID>")
+            match spec {
+                SpecVersion::V01 => format!("Add {key}: p-<ULID>"),
+                SpecVersion::V02 => format!("Add {key}: p-<ULID> or o-<ULID>"),
+                SpecVersion::V03 => {
+                    format!("Add {key}: an entity id (p-, o-, or a declared type)")
+                }
             }
         };
 
@@ -1583,12 +1718,12 @@ fn check_edges(
                     }
                     FrontmatterRef::Id(id) => {
                         let prefix = id.prefix();
-                        // 0.1 is person-only; 0.2 allows the declared
-                        // entity types.
+                        // 0.1 is person-only; 0.2 and 0.3 allow the
+                        // declared entity types.
                         let entity_ok = if spec == SpecVersion::V01 {
                             prefix == Prefix::Person
                         } else {
-                            prefix.is_entity()
+                            vault.type_registry().is_entity(prefix)
                         };
                         let mut acceptable = entity_ok;
                         if !entity_ok {
@@ -1604,7 +1739,7 @@ fn check_edges(
                                     .for_id(&rec.id)
                                     .with_fix("Use a p-<ULID> id"),
                                 );
-                            } else {
+                            } else if spec == SpecVersion::V02 {
                                 findings.push(
                                     Finding::new(
                                         FindingCode::WrongIdType,
@@ -1615,8 +1750,19 @@ fn check_edges(
                                     .for_id(&rec.id)
                                     .with_fix("Use a p-<ULID> or o-<ULID> id"),
                                 );
+                            } else {
+                                findings.push(
+                                    Finding::new(
+                                        FindingCode::WrongIdType,
+                                        Severity::Error,
+                                        format!("edge end '{key}' must be an entity id"),
+                                    )
+                                    .at_file(&rec.path)
+                                    .for_id(&rec.id)
+                                    .with_fix("Use a person, org, or declared entity id"),
+                                );
                             }
-                        } else if spec == SpecVersion::V02 {
+                        } else if spec != SpecVersion::V01 {
                             // The kind owns the endpoint declaration. An
                             // unknown kind has no authoritative set, so
                             // only the global entity rule applies.
@@ -1637,7 +1783,7 @@ fn check_edges(
                                         .for_id(&rec.id)
                                         .with_fix(format!(
                                             "Use {} id for this kind",
-                                            endpoint_words(allowed)
+                                            endpoint_words(allowed, vault.type_registry())
                                         )),
                                     );
                                 }
@@ -1666,10 +1812,10 @@ fn check_edges(
             }
         }
 
-        // Self-edges compare the canonical pair in 0.2, so a merge cannot
+        // Self-edges compare the canonical pair in 0.2+, so a merge cannot
         // leave a record linked to itself. 0.1 keeps the raw comparison.
         if ends.len() == 2 {
-            let (left, right) = if spec == SpecVersion::V02 {
+            let (left, right) = if spec != SpecVersion::V01 {
                 (
                     canonical_on(&ends[0], merges, as_of),
                     canonical_on(&ends[1], merges, as_of),
@@ -1758,7 +1904,7 @@ fn check_edges(
         // still keys separately here so the duplicate rule stays total.
         if ends.len() == 2 && ends_valid {
             let kind_key = kind_raw.unwrap_or("").to_string();
-            let (left, right) = if spec == SpecVersion::V02 {
+            let (left, right) = if spec != SpecVersion::V01 {
                 (
                     canonical_on(&ends[0], merges, as_of),
                     canonical_on(&ends[1], merges, as_of),
@@ -2218,6 +2364,7 @@ mod tests {
             FindingCode::Frontmatter,
             FindingCode::UnknownVerb,
             FindingCode::UnknownRecord,
+            FindingCode::UnknownRecordType,
             FindingCode::UnknownMetric,
             FindingCode::LedgerPath,
             FindingCode::LedgerDate,
@@ -2269,6 +2416,7 @@ mod tests {
                 | FindingCode::Frontmatter
                 | FindingCode::UnknownVerb
                 | FindingCode::UnknownRecord
+                | FindingCode::UnknownRecordType
                 | FindingCode::UnknownMetric
                 | FindingCode::LedgerPath
                 | FindingCode::LedgerDate

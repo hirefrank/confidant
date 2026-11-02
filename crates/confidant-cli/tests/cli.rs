@@ -2024,7 +2024,7 @@ fn hostile_pack_dir() -> tempfile::TempDir {
         dir.path().join("manifest.toml"),
         format!(
             "manifest_version = 2\n\
-             record_types = [\"bad{bidi}record\"]\n\
+             record_types = []\n\
              balance_metrics = [\"bad{bidi}metric\"]\n\
              finding_codes = [\"E_FRONTMATTER\", \"W_EXAMPLE_UNSAFE\"]\n\
              \n\
@@ -2100,7 +2100,6 @@ fn pack_add_escapes_untrusted_report_text_and_lists_every_claim() {
     }
     // One-line values are escaped, including the newline in a field name.
     assert!(stdout.contains("bad\\u{202e}\\nfield"), "{stdout}");
-    assert!(stdout.contains("bad\\u{202e}record"), "{stdout}");
     assert!(stdout.contains("bad\\u{202e}metric"), "{stdout}");
     assert!(stdout.contains("example-pack.bad\\u{202e}key"), "{stdout}");
     // PD10: the full claim list, not just counts.
@@ -2134,10 +2133,7 @@ fn pack_add_escapes_untrusted_report_text_and_lists_every_claim() {
         v["claims"]["fields"],
         serde_json::json!(["bad\\u{202e}\\nfield", "birthday"])
     );
-    assert_eq!(
-        v["claims"]["record_types"],
-        serde_json::json!(["bad\\u{202e}record"])
-    );
+    assert_eq!(v["claims"]["record_types"], serde_json::json!([]));
     let files = v["files"].as_array().unwrap();
     assert!(
         files.iter().any(|f| f["path"] == "README-\\u{202e}evil"),

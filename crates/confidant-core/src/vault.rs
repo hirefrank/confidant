@@ -9,11 +9,15 @@ use crate::id::{collect_uncovered_ulid_windows, scan_id_tokens, IdToken, Prefix,
 use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
 use crate::packs::embedded as packs_embedded;
 use crate::packs::external as packs_external;
+use crate::packs::Pack;
 use crate::packs::PackRegistry;
 use crate::paths::{self, EntryKind};
 use crate::record::{
-    frontmatter_line_spec_key, frontmatter_region, has_conflict_markers, parse_record, Record,
-    RecordKind,
+    frontmatter_line_spec_key, frontmatter_region, has_conflict_markers, parse_record_with_schema,
+    Record,
+};
+use crate::record_type::{
+    retired_decls, RecordSchema, TypeOwner, TypeProblem, TypeRegistry, TypeSource,
 };
 
 const COLLECTIONS: &[&str] = &["people", "orgs", "deals", "interactions", "notes", "edges"];
@@ -62,9 +66,26 @@ pub struct Vault {
     /// The vault's own pack registry: compiled packs plus the loaded
     /// external packs (#438). Replaces #432's process-wide static.
     pack_registry: PackRegistry,
+    /// Resolved record types for this vault: core plus enabled/disabled/
+    /// retired pack types (spec 0.3).
+    type_registry: TypeRegistry,
     /// External packs that failed to load, fail closed (PD12). Converted
     /// to findings in `check.rs`; read commands ignore them.
     pub pack_problems: Vec<packs_external::PackProblem>,
+    /// Vendored packs that are no longer listed. Their type declarations are
+    /// known (so records parse and warn) and their edge kinds/fields warn as
+    /// orphans, but their verbs/rules are not enabled.
+    disabled_packs: Vec<DisabledPackClaims>,
+}
+
+/// Claims from a vendored but unlisted pack that still need orphan warnings.
+#[derive(Clone, Copy, Debug)]
+pub struct DisabledPackClaims {
+    pub name: &'static str,
+    pub verbs: &'static [&'static str],
+    pub edge_kinds: &'static [crate::packs::EdgeKind],
+    pub fields: &'static [&'static str],
+    pub balance_metrics: &'static [&'static str],
 }
 
 impl Vault {
@@ -73,6 +94,16 @@ impl Vault {
     /// process-wide static.
     pub fn pack_registry(&self) -> &PackRegistry {
         &self.pack_registry
+    }
+
+    /// The resolved record-type table for this vault.
+    pub fn type_registry(&self) -> &TypeRegistry {
+        &self.type_registry
+    }
+
+    /// Vendored packs whose listing was removed from `confidant.toml`.
+    pub fn disabled_packs(&self) -> &[DisabledPackClaims] {
+        &self.disabled_packs
     }
 
     /// The declared spec version, when this binary implements it. `check`
@@ -300,11 +331,59 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     let mut ledger_lines = Vec::new();
     let mut ledger_unread_count = 0u32;
 
+    // Record types (spec 0.3): core plus every registered pack's
+    // declarations. Disabled packs stay known (orphans warn); retired types
+    // come from `[[retired_types]]`. The registry is built before the record
+    // walk because collections come from it.
+    let spec = SpecVersion::parse(&config.spec);
+    let (enabled, _) = pack_registry.resolve_enabled(&config.packs);
+    let enabled_names: HashSet<&str> = enabled.iter().map(|pack| pack.name()).collect();
+    let mut sources: Vec<TypeSource> = pack_registry
+        .all()
+        .iter()
+        .map(|pack| TypeSource {
+            owner: TypeOwner::Pack(pack.name()),
+            decls: pack.record_type_decls(),
+            enabled: enabled_names.contains(pack.name()),
+        })
+        .collect();
+    let mut disabled_packs = Vec::new();
+    if spec == Some(SpecVersion::V03) {
+        let (extra_sources, extra_packs) =
+            unlisted_type_sources(root, &config, &pack_registry, SpecVersion::V03);
+        sources.extend(extra_sources);
+        disabled_packs = extra_packs;
+    }
+    let (retired, retired_problems) = if spec == Some(SpecVersion::V03) {
+        retired_decls(&config.retired_types)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (type_registry, type_problems) = TypeRegistry::build(
+        spec.unwrap_or(SpecVersion::V02),
+        &sources,
+        retired,
+        retired_problems,
+    );
+    push_type_problems(&mut findings, &type_problems);
+
     if SpecVersion::is_supported(&config.spec) {
         let mut jobs = Vec::new();
         let mut names = Vec::new();
-        scan_collections(root, &mut path_ids, &mut findings, &mut jobs, &mut names);
-        let outs = load_markdown_jobs(root, &jobs);
+        scan_collections(
+            root,
+            &type_registry,
+            &mut path_ids,
+            &mut findings,
+            &mut jobs,
+            &mut names,
+        );
+        let outs = load_markdown_jobs(
+            root,
+            &jobs,
+            &type_registry,
+            spec.unwrap_or(SpecVersion::V02),
+        );
         for (job, out) in jobs.iter().zip(outs) {
             if out.conflicted {
                 if let Some(id) = &job.path_id {
@@ -320,8 +399,14 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
             &mut findings,
             &mut ledger_unread_count,
         );
-        scan_unexpected_top_level(root, &mut findings);
-        walk_seed_names(root, Path::new(""), &mut path_ids, &mut names);
+        scan_unexpected_top_level(root, &type_registry, &mut findings);
+        walk_seed_names(
+            root,
+            Path::new(""),
+            &mut path_ids,
+            &mut names,
+            &type_registry,
+        );
         seed_path_ulids(&names, &records, &mut path_ulids);
     }
 
@@ -337,7 +422,9 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         conflicted_ids,
         path_ulids,
         pack_registry,
+        type_registry,
         pack_problems,
+        disabled_packs,
     })
 }
 
@@ -425,6 +512,7 @@ fn walk_seed_names(
     rel: &Path,
     path_ids: &mut BTreeSet<RecordId>,
     names: &mut Vec<String>,
+    types: &TypeRegistry,
 ) {
     let Ok(listing) = paths::read_dir(root, rel) else {
         return;
@@ -446,10 +534,10 @@ fn walk_seed_names(
             // Collection subtrees were already seeded name-by-name during
             // scan_collections; descending again would re-list hundreds of
             // directories for identical seeds (#2).
-            if rel.as_os_str().is_empty() && COLLECTIONS.contains(&ent.name.as_str()) {
+            if rel.as_os_str().is_empty() && types.get_by_collection(&ent.name).is_some() {
                 continue;
             }
-            walk_seed_names(root, &rel.join(&ent.name), path_ids, names);
+            walk_seed_names(root, &rel.join(&ent.name), path_ids, names, types);
         }
     }
 }
@@ -481,6 +569,10 @@ fn leftover_tmp(name: &str, child: &Path, findings: &mut Vec<Finding>) -> bool {
 /// or `./`-prefixed path fails the trust test on its first component and
 /// collapses to a bare marker, losing the parent directory).
 fn redacted_filename(child: &Path) -> String {
+    redacted_filename_with(&TypeRegistry::default(), child)
+}
+
+fn redacted_filename_with(types: &TypeRegistry, child: &Path) -> String {
     const MARKER: &str = "<invalid-filename>";
     let mut kept: Vec<&str> = Vec::new();
     let mut truncated = false;
@@ -489,7 +581,7 @@ fn redacted_filename(child: &Path) -> String {
             truncated = true;
             break;
         };
-        if is_trusted_component(s) {
+        if is_trusted_component_with(types, s) {
             kept.push(s);
         } else {
             truncated = true;
@@ -509,7 +601,12 @@ fn redacted_filename(child: &Path) -> String {
 /// Path components that can never be a client name: structural directories,
 /// valid record IDs (bare or with the `.md` record-file suffix), ledger
 /// years/months, and fixed filenames.
+#[cfg(test)]
 fn is_trusted_component(name: &str) -> bool {
+    is_trusted_component_with(&TypeRegistry::default(), name)
+}
+
+fn is_trusted_component_with(types: &TypeRegistry, name: &str) -> bool {
     matches!(
         name,
         "people"
@@ -528,7 +625,9 @@ fn is_trusted_component(name: &str) -> bool {
             | "deal.md"
             | "interaction.md"
             | "edge.md"
-    ) || is_yyyy(name)
+    ) || types.get_by_collection(name).is_some()
+        || types.main_files().contains(&name)
+        || is_yyyy(name)
         || is_month_cfd(name)
         || RecordId::parse(name).is_ok()
         || name
@@ -537,6 +636,15 @@ fn is_trusted_component(name: &str) -> bool {
 }
 
 fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Finding>) {
+    flag_entry_with(&TypeRegistry::default(), ent, child, findings);
+}
+
+fn flag_entry_with(
+    types: &TypeRegistry,
+    ent: &paths::DirectoryEntry,
+    child: &Path,
+    findings: &mut Vec<Finding>,
+) {
     if !ent.utf8 {
         findings.push(
             Finding::new(
@@ -544,7 +652,7 @@ fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Find
                 Severity::Error,
                 "non-UTF-8 filename".to_owned(),
             )
-            .at_file(redacted_filename(child))
+            .at_file(redacted_filename_with(types, child))
             .with_fix("Rename the file to a UTF-8 record ID"),
         );
         return;
@@ -556,28 +664,177 @@ fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Find
                 Severity::Error,
                 "symbolic link".to_owned(),
             )
-            .at_file(redacted_filename(child))
+            .at_file(redacted_filename_with(types, child))
             .with_fix("Replace the symlink with a real file or directory"),
         );
     }
 }
 
-fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
-    let allowed = [
+/// Declarations from a vendored pack that is no longer listed. They stay
+/// known so a disabled pack's records parse and warn instead of turning the
+/// collection into an unknown directory. They are registered only as type
+/// sources and orphan claims, never as enabled packs: rules and writes stay
+/// disabled, while their records/fields/edges warn as orphans. A pack whose
+/// manifest does not verify or support this spec is skipped (its data then
+/// fails closed as an unknown collection).
+fn unlisted_type_sources(
+    root: &Path,
+    config: &VaultConfig,
+    registered: &PackRegistry,
+    spec: SpecVersion,
+) -> (Vec<TypeSource>, Vec<DisabledPackClaims>) {
+    let listed: HashSet<&str> = config
+        .packs
+        .iter()
+        .filter_map(|pack| pack.split_once('@').map(|(name, _)| name))
+        .collect();
+    let already: HashSet<&str> = registered.all().iter().map(|pack| pack.name()).collect();
+    let retired_names: HashSet<&str> = config
+        .retired_types
+        .iter()
+        .map(|retired| retired.name.as_str())
+        .collect();
+    let retired_prefixes: HashSet<&str> = config
+        .retired_types
+        .iter()
+        .map(|retired| retired.id_prefix.as_str())
+        .collect();
+    let retired_collections: HashSet<&str> = config
+        .retired_types
+        .iter()
+        .map(|retired| retired.collection.as_str())
+        .collect();
+    let Ok(listing) = paths::read_dir(root, Path::new("packs")) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut packs: Vec<DisabledPackClaims> = Vec::new();
+    for ent in listing.entries {
+        if !ent.utf8 || !ent.kind.is_directory() {
+            continue;
+        }
+        let Some((name, version)) = ent.name.split_once('@') else {
+            continue;
+        };
+        if listed.contains(name)
+            || already.contains(ent.name.as_str())
+            || packs_embedded::is_builtin_listing(&ent.name)
+            || crate::packs::manifest::is_reserved_pack_name(name)
+        {
+            continue;
+        }
+        let dir = root.join("packs").join(&ent.name);
+        let Some(manifest) = crate::packs::dir::read_manifest_best_effort(&dir) else {
+            continue;
+        };
+        if manifest.pack.name != name
+            || manifest.pack.version != version
+            || manifest.record_types.decls.is_empty()
+            || !manifest
+                .pack
+                .requires_spec
+                .iter()
+                .any(|supported| supported == spec.as_str())
+        {
+            continue;
+        }
+        let pack = crate::packs::manifest_pack::build_manifest_pack(manifest, String::new());
+        let decls: Vec<crate::record_type::RecordTypeDecl> = pack
+            .record_type_decls()
+            .iter()
+            .filter(|decl| {
+                !retired_names.contains(decl.name)
+                    && !retired_prefixes.contains(decl.id_prefix)
+                    && !retired_collections.contains(decl.collection)
+            })
+            .copied()
+            .collect();
+        if decls.is_empty() {
+            continue;
+        }
+        out.push(TypeSource {
+            owner: TypeOwner::Pack(pack.name()),
+            decls: Box::leak(decls.into_boxed_slice()),
+            enabled: false,
+        });
+        if !packs.iter().any(|existing| existing.name == pack.name()) {
+            packs.push(DisabledPackClaims {
+                name: pack.name(),
+                verbs: pack.verbs(),
+                edge_kinds: pack.edge_kinds(),
+                fields: pack.fields(),
+                balance_metrics: pack.balance_metrics(),
+            });
+        }
+    }
+    (out, packs)
+}
+
+fn push_type_problems(findings: &mut Vec<Finding>, problems: &[TypeProblem]) {
+    for problem in problems {
+        match problem {
+            TypeProblem::Conflict {
+                claim_kind,
+                claim,
+                first,
+                second,
+            } => findings.push(
+                Finding::new(
+                    FindingCode::PackConflict,
+                    Severity::Error,
+                    format!("two packs claim the same {claim_kind} '{claim}'"),
+                )
+                .with_fix(format!(
+                    "Rename or remove one of the declarations (packs {first} and {second})"
+                )),
+            ),
+            TypeProblem::CoreCollision {
+                claim_kind,
+                claim,
+                pack,
+            } => findings.push(
+                Finding::new(
+                    FindingCode::PackInvalid,
+                    Severity::Error,
+                    format!("{pack} claims reserved {claim_kind} '{claim}'"),
+                )
+                .with_fix("Remove the declaration or choose a different name/prefix/collection"),
+            ),
+            TypeProblem::RetiredCollision {
+                claim_kind,
+                claim,
+                live,
+            } => findings.push(
+                Finding::new(
+                    FindingCode::Config,
+                    Severity::Error,
+                    format!("a retired type reuses the live {claim_kind} '{claim}' ({live})"),
+                )
+                .at_file("confidant.toml")
+                .with_fix("Remove the stale [[retired_types]] entry"),
+            ),
+            TypeProblem::InvalidRetired { message } => findings.push(
+                Finding::new(FindingCode::Config, Severity::Error, message.clone())
+                    .at_file("confidant.toml")
+                    .with_fix("Fix or remove the [[retired_types]] entry"),
+            ),
+        }
+    }
+}
+
+fn scan_unexpected_top_level(root: &Path, types: &TypeRegistry, findings: &mut Vec<Finding>) {
+    let mut allowed: BTreeSet<&str> = [
         "confidant.toml",
         "confidant.lock",
         "packs",
-        "people",
-        "orgs",
-        "deals",
-        "interactions",
-        "notes",
-        "edges",
         "ledger",
         "keys",
         "README.md",
         "LICENSE",
-    ];
+    ]
+    .into_iter()
+    .collect();
+    allowed.extend(types.collections());
     let Listed::Ok(entries) = list_dir(root, Path::new(""), findings) else {
         return;
     };
@@ -587,7 +844,7 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
             continue;
         }
         if !ent.utf8 || ent.kind == EntryKind::Symlink {
-            flag_entry(&ent, child, findings);
+            flag_entry_with(types, &ent, child, findings);
             continue;
         }
         if paths::skip_walk_entry(&ent.name, ent.kind) {
@@ -600,7 +857,7 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
                     Severity::Error,
                     "unexpected vault entry".to_owned(),
                 )
-                .at_file(redacted_filename(Path::new(&ent.name)))
+                .at_file(redacted_filename_with(types, Path::new(&ent.name)))
                 .with_fix("Use the vault layout in spec/ (people/, orgs/, deals/, ledger/, …)"),
             );
         }
@@ -609,12 +866,18 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
 
 fn scan_collections(
     root: &Path,
+    types: &TypeRegistry,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
     jobs: &mut Vec<MarkdownJob>,
     names: &mut Vec<String>,
 ) {
-    for collection in COLLECTIONS {
+    for collection in types.collections() {
+        let Some(decl) = types.get_by_collection(collection) else {
+            continue;
+        };
+        let expected_prefix = decl.prefix;
+        let main_file = decl.main_file;
         let rel = Path::new(collection);
         match paths::read_dir(root, rel) {
             Err(err) if crate::error::is_missing(&err) => continue,
@@ -631,11 +894,10 @@ fn scan_collections(
                             Severity::Error,
                             "path is unreadable".to_owned(),
                         )
-                        .at_file(redacted_filename(&rel.join(&name)))
+                        .at_file(redacted_filename_with(types, &rel.join(&name)))
                         .with_fix("Fix permissions or replace the unreadable entry"),
                     );
                 }
-                let prefix = Prefix::from_collection(collection).expect("known collection");
                 for ent in listing.entries {
                     let child = rel.join(&ent.name);
                     if ent.utf8 {
@@ -645,7 +907,7 @@ fn scan_collections(
                         continue;
                     }
                     if !ent.utf8 || ent.kind == EntryKind::Symlink {
-                        flag_entry(&ent, &child, findings);
+                        flag_entry_with(types, &ent, &child, findings);
                         continue;
                     }
                     if paths::skip_walk_entry(&ent.name, ent.kind) {
@@ -654,7 +916,17 @@ fn scan_collections(
                     match ent.kind {
                         EntryKind::File => {
                             if let Some(stem) = ent.name.strip_suffix(".md") {
-                                ingest_file(&child, stem, prefix, path_ids, findings, jobs, None);
+                                ingest_file(
+                                    &child,
+                                    stem,
+                                    expected_prefix,
+                                    collection,
+                                    types,
+                                    path_ids,
+                                    findings,
+                                    jobs,
+                                    None,
+                                );
                             } else {
                                 findings.push(
                                     Finding::new(
@@ -662,14 +934,25 @@ fn scan_collections(
                                         Severity::Error,
                                         "filename is not a valid record ID".to_owned(),
                                     )
-                                    .at_file(redacted_filename(&child))
+                                    .at_file(redacted_filename_with(types, &child))
                                     .with_fix("Rename to <prefix>-<ULID>.md or move it out of the collection"),
                                 );
                             }
                         }
                         EntryKind::Directory => {
                             ingest_dir(
-                                root, &child, &ent.name, prefix, path_ids, findings, jobs, names,
+                                root,
+                                &child,
+                                &ent.name,
+                                expected_prefix,
+                                collection,
+                                main_file,
+                                expected_prefix == Prefix::Person,
+                                types,
+                                path_ids,
+                                findings,
+                                jobs,
+                                names,
                             );
                         }
                         EntryKind::Other => findings.push(
@@ -678,7 +961,7 @@ fn scan_collections(
                                 Severity::Error,
                                 "record directory contains an unexpected entry".to_owned(),
                             )
-                            .at_file(redacted_filename(&child)),
+                            .at_file(redacted_filename_with(types, &child)),
                         ),
                         EntryKind::Symlink => {}
                     }
@@ -688,10 +971,13 @@ fn scan_collections(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_file(
     relative: &Path,
     stem: &str,
     expected_prefix: Prefix,
+    expected_collection: &str,
+    types: &TypeRegistry,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
     jobs: &mut Vec<MarkdownJob>,
@@ -707,7 +993,7 @@ fn ingest_file(
                     Severity::Error,
                     "filename is not a valid record ID".to_owned(),
                 )
-                .at_file(redacted_filename(relative))
+                .at_file(redacted_filename_with(types, relative))
                 .with_fix("Name the file <prefix>-<26-character ULID>.md"),
             );
             return;
@@ -719,10 +1005,7 @@ fn ingest_file(
             Finding::new(
                 FindingCode::TypePathMismatch,
                 Severity::Error,
-                format!(
-                    "id '{path_id}' does not belong in '{}'",
-                    expected_prefix.collection().unwrap_or("?")
-                ),
+                format!("id '{path_id}' does not belong in '{expected_collection}'"),
             )
             .at_file(&file)
             .for_id(&path_id),
@@ -742,6 +1025,10 @@ fn ingest_dir(
     relative: &Path,
     name: &str,
     expected_prefix: Prefix,
+    expected_collection: &str,
+    main_file: &str,
+    allow_notes: bool,
+    types: &TypeRegistry,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
     jobs: &mut Vec<MarkdownJob>,
@@ -757,13 +1044,13 @@ fn ingest_dir(
                     Severity::Error,
                     "directory name is not a valid record ID".to_owned(),
                 )
-                .at_file(redacted_filename(relative))
+                .at_file(redacted_filename_with(types, relative))
                 .with_fix("Name the directory <prefix>-<26-character ULID>"),
             );
             // The walk stops here, but the seed walk must still see the
             // names below: an unexpected directory can hide ID-shaped file
             // names that seed bare-ULID matching (#116 hold).
-            walk_seed_names(root, relative, path_ids, names);
+            walk_seed_names(root, relative, path_ids, names, types);
             return;
         }
     };
@@ -773,18 +1060,13 @@ fn ingest_dir(
             Finding::new(
                 FindingCode::TypePathMismatch,
                 Severity::Error,
-                format!(
-                    "id '{path_id}' does not belong in '{}'",
-                    expected_prefix.collection().unwrap_or("?")
-                ),
+                format!("id '{path_id}' does not belong in '{expected_collection}'"),
             )
             .at_file(&dir)
             .for_id(&path_id),
         );
     }
-    let main = expected_prefix
-        .main_filename()
-        .expect("collection records have a main file");
+    let main = main_file;
     let mut saw_main = false;
     let entries = match list_dir(root, relative, findings) {
         Listed::Failed => return,
@@ -799,7 +1081,7 @@ fn ingest_dir(
             continue;
         }
         if !ent.utf8 || ent.kind == EntryKind::Symlink {
-            flag_entry(&ent, &child, findings);
+            flag_entry_with(types, &ent, &child, findings);
             if ent.name == main {
                 saw_main = true;
             }
@@ -817,11 +1099,10 @@ fn ingest_dir(
             });
             continue;
         }
-        if expected_prefix == Prefix::Person
-            && ent.name == "notes"
-            && ent.kind == EntryKind::Directory
-        {
-            scan_person_notes(root, relative, &path_id, path_ids, findings, jobs, names);
+        if allow_notes && ent.name == "notes" && ent.kind == EntryKind::Directory {
+            scan_person_notes(
+                root, relative, &path_id, types, path_ids, findings, jobs, names,
+            );
             continue;
         }
         findings.push(
@@ -830,17 +1111,19 @@ fn ingest_dir(
                 Severity::Error,
                 "record directory contains an unexpected entry".to_owned(),
             )
-            .at_file(redacted_filename(&child))
+            .at_file(redacted_filename_with(types, &child))
             .for_id(&path_id)
-            .with_fix(format!(
-                "Keep only {main} (and notes/ for people) in the record directory"
-            )),
+            .with_fix(if allow_notes {
+                format!("Keep only {main} (and notes/ for people) in the record directory")
+            } else {
+                format!("Keep only {main} in the record directory")
+            }),
         );
         // Same seed-walk reasoning as the invalid-dir return above: the
         // walk stops here, so an unexpected directory's subtree still
         // needs name seeding (#116 hold).
         if ent.kind == EntryKind::Directory {
-            walk_seed_names(root, &child, path_ids, names);
+            walk_seed_names(root, &child, path_ids, names, types);
         }
     }
     if !saw_main {
@@ -857,10 +1140,12 @@ fn ingest_dir(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_person_notes(
     root: &Path,
     person_dir: &Path,
     person_id: &RecordId,
+    types: &TypeRegistry,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
     jobs: &mut Vec<MarkdownJob>,
@@ -881,7 +1166,7 @@ fn scan_person_notes(
                         Severity::Error,
                         "path is unreadable".to_owned(),
                     )
-                    .at_file(redacted_filename(&notes_rel.join(&name)))
+                    .at_file(redacted_filename_with(types, &notes_rel.join(&name)))
                     .with_fix("Fix permissions or replace the unreadable entry"),
                 );
             }
@@ -894,7 +1179,7 @@ fn scan_person_notes(
                     continue;
                 }
                 if !ent.utf8 || ent.kind == EntryKind::Symlink {
-                    flag_entry(&ent, &child, findings);
+                    flag_entry_with(types, &ent, &child, findings);
                     continue;
                 }
                 if paths::skip_walk_entry(&ent.name, ent.kind) {
@@ -907,12 +1192,12 @@ fn scan_person_notes(
                             Severity::Error,
                             "filename is not a valid record ID".to_owned(),
                         )
-                        .at_file(redacted_filename(&child)),
+                        .at_file(redacted_filename_with(types, &child)),
                     );
                     // Unexpected directories (e.g. notes/sub/) still need
                     // name seeding for the seed walk (#116 hold).
                     if ent.kind == EntryKind::Directory {
-                        walk_seed_names(root, &child, path_ids, names);
+                        walk_seed_names(root, &child, path_ids, names, types);
                     }
                     continue;
                 }
@@ -921,6 +1206,8 @@ fn scan_person_notes(
                     &child,
                     stem,
                     Prefix::Note,
+                    "notes",
+                    types,
                     path_ids,
                     findings,
                     jobs,
@@ -947,7 +1234,12 @@ struct MarkdownJob {
 
 /// Read, parse and check the jobs on worker threads, preserving job
 /// order in the output so the merge is deterministic.
-fn load_markdown_jobs(root: &Path, jobs: &[MarkdownJob]) -> Vec<JobOutput> {
+fn load_markdown_jobs(
+    root: &Path,
+    jobs: &[MarkdownJob],
+    types: &TypeRegistry,
+    spec: SpecVersion,
+) -> Vec<JobOutput> {
     if jobs.is_empty() {
         return Vec::new();
     }
@@ -962,7 +1254,7 @@ fn load_markdown_jobs(root: &Path, jobs: &[MarkdownJob]) -> Vec<JobOutput> {
         for part in jobs.chunks(chunk) {
             handles.push(s.spawn(|| {
                 part.iter()
-                    .map(|job| run_markdown_job(root, job))
+                    .map(|job| run_markdown_job(root, job, types, spec))
                     .collect::<Vec<_>>()
             }));
         }
@@ -1025,7 +1317,12 @@ fn merge_markdown_job(
     }
 }
 
-fn run_markdown_job(root: &Path, job: &MarkdownJob) -> JobOutput {
+fn run_markdown_job(
+    root: &Path,
+    job: &MarkdownJob,
+    types: &TypeRegistry,
+    spec: SpecVersion,
+) -> JobOutput {
     let mut findings = Vec::new();
     let file = paths::display_relative(&job.relative);
     let fail = |findings: Vec<Finding>, conflicted: bool| JobOutput {
@@ -1073,7 +1370,12 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob) -> JobOutput {
             return fail(findings, true);
         }
     }
-    match parse_record(&text, &file) {
+    let schema = RecordSchema {
+        spec,
+        types: Some(types),
+        require_declared: false,
+    };
+    match parse_record_with_schema(&text, &file, &schema) {
         Err(err) => {
             let mut finding =
                 Finding::new(FindingCode::Frontmatter, Severity::Error, err.message).at_file(&file);
@@ -1109,29 +1411,27 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob) -> JobOutput {
                     Finding::new(
                         FindingCode::TypePathMismatch,
                         Severity::Error,
-                        format!(
-                            "id '{}' prefix does not match type '{}'",
-                            rec.id,
-                            rec.kind.as_str()
-                        ),
+                        "id prefix does not match the record's type".to_owned(),
                     )
                     .at_file(&file)
                     .for_id(&rec.id),
                 );
             }
-            if let Some(expected) = rec.kind.prefix().collection() {
-                if !file.starts_with(expected)
-                    && !(rec.kind == RecordKind::Note && file.contains("/notes/"))
-                {
-                    findings.push(
-                        Finding::new(
-                            FindingCode::TypePathMismatch,
-                            Severity::Error,
-                            format!("type '{}' does not belong at this path", rec.kind.as_str()),
-                        )
-                        .at_file(&file)
-                        .for_id(&rec.id),
-                    );
+            if let Some(collection) = file.split('/').next() {
+                if let Some(decl) = types.get_by_collection(collection) {
+                    let note_in_person_dir =
+                        decl.name == "person" && rec.is_note() && file.contains("/notes/");
+                    if rec.kind.as_str() != decl.name && !note_in_person_dir {
+                        findings.push(
+                            Finding::new(
+                                FindingCode::TypePathMismatch,
+                                Severity::Error,
+                                "record type does not belong at this path".to_owned(),
+                            )
+                            .at_file(&file)
+                            .for_id(&rec.id),
+                        );
+                    }
                 }
             }
             // Duplicate detection and insert happen at merge, in walk

@@ -481,9 +481,11 @@ requires_spec = ["0.1"]
   person↔person rule may list `"0.1"` alone.
 - `[[rules]]`: the declarative checks (§13.2). Absent in v1.
 - `[context]`: the opt-in `context` view (§13.9). Absent in v1.
-- Everything else (§4) is unchanged: `record_types`, `balance_metrics`,
-  `finding_codes`, `[pack]` name/version/skill, `[[verbs]]`,
-  `[[fields]]`, `[[edge_kinds]]`, `[checks]`, `[messages]`.
+- Everything else (§4) is unchanged in v2: `record_types` (still an array
+  of names, and empty), `balance_metrics`, `finding_codes`, `[pack]`
+  name/version/skill, `[[verbs]]`, `[[fields]]`, `[[edge_kinds]]`,
+  `[checks]`, `[messages]`. A v3 manifest replaces the name array with
+  `[[record_types]]` tables; see §14.
 
 ### 13.2. `[[rules]]`: generic keys
 
@@ -1203,3 +1205,87 @@ surface. A pack without `[context]` is check-only, as before.
 over a vault and asserts the literal values and ordering, so arithmetic or
 shape drift fails. The golden `check` JSON files record findings and are
 **not** edited.
+
+## 14. Manifest v3: pack-declared record types (spec 0.3)
+
+*Part of #814. v3 is the same claims file as v2 plus `[[record_types]]`
+tables. The folds, findings, and read paths stay compiled in Rust; a pack
+declares data and text, never logic.*
+
+Set `manifest_version = 3`. A reader that does not implement v3 fails with
+`E_PACK_INVALID` and an "upgrade confidant" fix. A v3 manifest with no
+`[[record_types]]` is otherwise shaped like v2. A v2 manifest remains
+readable but its `record_types` must be an empty array; a string name
+without a declaration is `E_PACK_INVALID`.
+
+### 14.1. `[[record_types]]`
+
+```toml
+manifest_version = 3
+
+[pack]
+name = "place-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.3"]
+
+[[record_types]]
+name = "place"
+id_prefix = "pl"
+collection = "places"
+main_file = "place.md"
+entity = true
+person_like = false
+no_ai = "full"
+roster = true
+required_fields = ["name"]
+optional_fields = ["address"]
+
+[[fields]]
+name = "address"
+grammar = "non-empty-string"
+
+[[edge_kinds]]
+name = "visited"
+symmetric = false
+from = ["person"]
+to = ["place"]
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | The record's `type:` value; `^[a-z][a-z0-9_]{0,31}$`; not a core type or `package`. |
+| `id_prefix` | string | Exactly two lowercase letters; not core `p/o/d/i/n/e` or `pkg`; the second letter must not be `p/o/d/i/n/e` (the scanner must not confuse `xp-` with a glued `p-`). |
+| `collection` | string | Vault-relative directory; `^[a-z][a-z0-9_-]{0,31}$`; not a core/vault name; unique per type. |
+| `main_file` | string | Plain `.md` file name inside `<collection>/<prefix>-<ULID>/`; no slash/dotfile. |
+| `entity` | bool, default false | May be an edge endpoint, a `context` target, and an `entity:` target. |
+| `person_like` | bool, default false | Opts into person read semantics. In 0.3: `no_ai = "notes"` and a person-shaped `context` view. `resolve`, `touch`, and cadence-rule subjects remain core-person-only. Implies `entity = true`. |
+| `no_ai` | string, default `"none"` | `none`, `full`, or `notes`. `notes` requires `person_like`. |
+| `roster` | bool, default = `entity` | Included in `record list --kind all`. `--kind <type>` always works for a declared type. |
+| `required_fields` | string array, default empty | `name` or a field declared in this manifest's `[[fields]]`; missing is `E_FRONTMATTER`. |
+| `optional_fields` | string array, default empty | Same names; no duplicates and no overlap with required. |
+
+Unknown keys are an error. A type declaration also makes the type a pack
+claim: two enabled packs claiming the same name, prefix, or collection is
+`E_PACK_CONFLICT`; the same collision with core is `E_PACK_INVALID`.
+
+The declaration must list `"0.3"` in `requires_spec`. A 0.1/0.2 vault
+therefore fails closed with `E_PACK_VERSION` before the declaration matters.
+
+### 14.2. Verb and edge endpoint names
+
+`[[verbs]].id_type` and `[[edge_kinds]].from` / `to` resolve against core
+types plus the **same manifest's** declared types. Cross-pack type
+references are `E_PACK_INVALID` in 0.3: core is the shared vocabulary, and
+a pack's domain types are self-contained. A type with `entity = false`
+cannot appear in an edge endpoint list.
+
+### 14.3. Ownership, scope, and removal
+
+A declared type's records are owned by the declaring pack for `--packs`
+scoping. A disabled, retired, or undeclared type's records are
+`W_PACK_ORPHAN`: they remain parseable and editable, are hidden from agent
+reads by the type gate, and are visible to the operator path. A removed
+pack's types are preserved by `[[retired_types]]` in `confidant.toml`
+(spec 0.3 §2); writing that table belongs to the pack-removal workflow, not
+this manifest.

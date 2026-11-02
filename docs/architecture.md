@@ -425,9 +425,29 @@ registry, no signing in v1. External packs affect `check` only.
 
 **Consequences.** The spec gets a second frozen document (`spec/0.2.md`). A pack that declares a non-person endpoint must add `"0.2"` to `requires_spec`, and a 0.1 vault rejects it with `E_PACK_VERSION` rather than guessing. Org context and the default all-kinds roster followed in #813 phases 2 and 3. A per-edge or per-org `no-ai` mode remains an open privacy question.
 
+### ADR-18. Record types are pack-declarable (spec 0.3).
+
+**Door:** One-way (a vault that contains a pack-typed record has committed to the two-letter prefix and collection).
+
+**Context.** ADR-17 generalized edges to entities but left the type vocabulary closed. #796 then decided the domain model should generalize in two phases: entity edges first, pack-definable record types second (#814). The personal default schema still reads like a database diagram, and places/things have nowhere to live (#745). The pack cap was `record_types = []`.
+
+**Decision.**
+
+- Spec 0.3 adds a v3 pack manifest. `[[record_types]]` declares a type's name, two-letter ID prefix, collection directory, main file, `entity`/`person_like`/`no_ai`/`roster` flags, and required/optional fields.
+- Core keeps `person`, `org`, `deal`, `interaction`, `note`, `edge`; `deal` is legacy and not extended. `package` stays a ledger-only prefix. `place`/`thing` are pack types, not core.
+- Pack prefixes are exactly two lowercase letters, unique across registered packs and core, and never end in `p/o/d/i/n/e` (the scanner must keep a glued core ID recognizable). Core keeps one-letter prefixes and `pkg`.
+- A pack's `[[verbs]].id_type` and edge endpoints may name core types or its own types. Cross-pack type references are refused; core is the shared vocabulary.
+- Agent reads fail closed on a disabled, retired, or undeclared type. `check` reports `W_PACK_ORPHAN`; the operator path still sees the record. `[[retired_types]]` in `confidant.toml` keeps a removed pack's records parseable.
+- `entity:` is a generic front-matter reference key, so notes and interactions can attach to any declared entity. `person:`/`org:`/`deal:` stay.
+- Edge-level `no-ai` is the companion privacy change to the same format version; core orgs remain `no-ai`-free.
+
+**Alternatives considered.** (a) Move `deal`/`interaction` to the personal pack now: their one-letter prefixes and core verbs (`stage`) are frozen, and a format migration buys no user-visible gain. (b) Arbitrary prefix strings with a registry-aware scanner: more parser coupling and no orphan parsing after removal. (c) One core `thing`/`place`: repeats the database-diagram problem and makes the personal default a different product. (d) Reuse `person` for domains: fields can express a client, but the type identity, roster, and edges cannot.
+
+**Consequences.** Spec 0.3 is the current document; 0.1/0.2 stay frozen. `init` writes 0.3. A 0.2 vault opts in with one `spec` change and no record rewrite. A pack that declares types must list `"0.3"` in `requires_spec`; a 0.2 vault rejects it with `E_PACK_VERSION`. The built-in personal pack stays `personal@0.2` and declares no types in this slice. Pack removal tombstones ship with the removal workflow (#699); this ADR defines the read behavior.
+
 ## 8. v0 scope and milestones
 
-1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
+1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17) and 0.3 pack-declared types (ADR-18); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
 2. **Vault safety and sync.** `confidant doctor` (git repo and identity, transport, spec, `check`, staleness, skills links), `confidant sync` as the explicit git boundary, and the §12 `no-ai` allowlist. Done when a fresh clone on a clean machine reads and writes the vault with no extra setup.
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
 4. **Import skills.** Agent skills that pull events and transcripts from outside systems into the vault, with dry runs and safe retries.

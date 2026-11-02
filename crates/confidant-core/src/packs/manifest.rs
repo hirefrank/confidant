@@ -26,6 +26,9 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// still rejects 2.
 pub const MANIFEST_VERSION_V2: u32 = 2;
 
+/// Schema version that can declare `[[record_types]]` (spec 0.3).
+pub const MANIFEST_VERSION_V3: u32 = 3;
+
 /// Where a manifest's bytes came from (#550).
 ///
 /// This is the trust boundary for the stable-code allowance: a manifest
@@ -109,33 +112,6 @@ fn is_valid_rule_id(id: &str) -> bool {
 /// validation reads the same frozen list the parser registry dispatches.
 pub use crate::packs::grammars::KNOWN_GRAMMARS;
 
-/// Record ID types a verb may constrain its ledger ID to (spec §4,
-/// today's `Prefix`).
-const KNOWN_ID_TYPES: &[(&str, Prefix)] = &[
-    ("person", Prefix::Person),
-    ("org", Prefix::Org),
-    ("deal", Prefix::Deal),
-    ("interaction", Prefix::Interaction),
-    ("note", Prefix::Note),
-    ("edge", Prefix::Edge),
-    ("package", Prefix::Package),
-];
-
-/// Record types an edge endpoint may name in phase 1 (#813). Phase 2's
-/// pack-definable types extend this registry; until then a manifest that
-/// names anything else is `E_PACK_INVALID`.
-pub(crate) const ENTITY_ID_TYPES: &[(&str, Prefix)] =
-    &[("person", Prefix::Person), ("org", Prefix::Org)];
-
-/// Resolve an edge endpoint type name to its prefix. `None` for a type
-/// this spec does not declare as an entity.
-pub(crate) fn entity_prefix(name: &str) -> Option<Prefix> {
-    ENTITY_ID_TYPES
-        .iter()
-        .find(|(declared, _)| *declared == name)
-        .map(|(_, prefix)| *prefix)
-}
-
 /// Severity values a `[checks]` severity default may take.
 const KNOWN_SEVERITIES: &[&str] = &["error", "warning", "off"];
 
@@ -161,28 +137,78 @@ pub struct PackInfo {
     pub requires_spec: Vec<String>,
 }
 
-/// Parse an `id_type` name (`person`, `org`, …) into a [`Prefix`].
-/// The derived `Deserialize` on `Prefix` expects variant names, not the
-/// manifest's lowercase names, so this is wired via `deserialize_with`.
-fn deserialize_id_type<'de, D>(deserializer: D) -> Result<Option<Prefix>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s: String = serde::Deserialize::deserialize(deserializer)?;
-    KNOWN_ID_TYPES
-        .iter()
-        .find(|(name, _)| *name == s)
-        .map(|(_, prefix)| Some(*prefix))
-        .ok_or_else(|| {
-            serde::de::Error::custom(format!(
-                "unknown id_type '{s}'; expected one of: {}",
-                KNOWN_ID_TYPES
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        })
+/// A `[[record_types]]` table in a v3 manifest.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordTypeDeclToml {
+    pub name: String,
+    pub id_prefix: String,
+    pub collection: String,
+    pub main_file: String,
+    #[serde(default)]
+    pub entity: bool,
+    #[serde(default)]
+    pub person_like: bool,
+    #[serde(default = "default_no_ai")]
+    pub no_ai: String,
+    #[serde(default)]
+    pub roster: Option<bool>,
+    #[serde(default)]
+    pub required_fields: Vec<String>,
+    #[serde(default)]
+    pub optional_fields: Vec<String>,
+}
+
+fn default_no_ai() -> String {
+    "none".to_owned()
+}
+
+/// The `record_types` field: v2 holds names, v3 holds declaration tables.
+/// Keeping one wrapper lets the rest of the loader read `names` uniformly.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecordTypes {
+    pub names: Vec<String>,
+    pub decls: Vec<RecordTypeDeclToml>,
+}
+
+impl std::ops::Deref for RecordTypes {
+    type Target = [String];
+    fn deref(&self) -> &Self::Target {
+        &self.names
+    }
+}
+
+impl<'a> IntoIterator for &'a RecordTypes {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.names.iter()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawRecordTypes {
+    Names(Vec<String>),
+    Decls(Vec<RecordTypeDeclToml>),
+}
+
+impl<'de> Deserialize<'de> for RecordTypes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match RawRecordTypes::deserialize(deserializer)? {
+            RawRecordTypes::Names(names) => Ok(Self {
+                names,
+                decls: Vec::new(),
+            }),
+            RawRecordTypes::Decls(decls) => {
+                let names = decls.iter().map(|decl| decl.name.clone()).collect();
+                Ok(Self { names, decls })
+            }
+        }
+    }
 }
 
 /// One `[[verbs]]` entry: a ledger verb the pack owns.
@@ -191,9 +217,10 @@ where
 pub struct VerbDecl {
     pub name: String,
     /// The verb-to-ID-type claim (today's `verb_id_type`); `None` for
-    /// verbs with no ID-type claim.
-    #[serde(default, deserialize_with = "deserialize_id_type")]
-    pub id_type: Option<Prefix>,
+    /// verbs with no ID-type claim. Resolved against core + the manifest's
+    /// own declared types in `validate`.
+    #[serde(default)]
+    pub id_type: Option<String>,
 }
 
 /// One `[[fields]]` entry: a front-matter field the pack owns.
@@ -298,10 +325,12 @@ pub struct ChecksDecl {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PackManifest {
-    /// Schema version of the file; must equal [`MANIFEST_VERSION`].
+    /// Schema version of the file; 1/2/3 are supported by the appropriate
+    /// loader.
     pub manifest_version: u32,
-    /// Record types this pack owns (empty for both packs today).
-    pub record_types: Vec<String>,
+    /// Record types this pack owns. v2 carries names only; v3 carries
+    /// declaration tables (spec 0.3 §8).
+    pub record_types: RecordTypes,
     /// Balance metrics this pack's fold computes.
     pub balance_metrics: Vec<String>,
     /// Finding codes this pack's fold/findings can emit. Must match the
@@ -397,7 +426,10 @@ fn check_unique(names: &[String], what: &str) -> Result<(), DomainError> {
 /// declarations must be symmetric with the pair (both or neither),
 /// non-empty, duplicate-free, and name only declared entity types. A
 /// symmetric kind must allow the same set on both ends.
-fn validate_edge_endpoints(kind: &EdgeKindDecl) -> Result<(), DomainError> {
+fn validate_edge_endpoints(
+    kind: &EdgeKindDecl,
+    manifest: &PackManifest,
+) -> Result<(), DomainError> {
     let (from, to) = match (&kind.from, &kind.to) {
         (None, None) => return Ok(()),
         (Some(from), Some(to)) => (from, to),
@@ -427,14 +459,14 @@ fn validate_edge_endpoints(kind: &EdgeKindDecl) -> Result<(), DomainError> {
                 ))
                 .with_fix("List each endpoint type once"));
             }
-            if entity_prefix(name).is_none() {
-                let accepted: Vec<&str> = ENTITY_ID_TYPES.iter().map(|(n, _)| *n).collect();
+            if !manifest.is_entity_type(name) {
                 return Err(manifest_err(format!(
-                    "edge kind '{}' names unknown {label} endpoint type '{name}'; expected one of: {}",
-                    kind.name,
-                    accepted.join(", ")
+                    "edge kind '{}' names unknown {label} endpoint type '{name}'",
+                    kind.name
                 ))
-                .with_fix("Use a declared entity type; phase 1 allows person and org"));
+                .with_fix(
+                    "Use person, org, or an entity type declared by this pack (cross-pack references are not supported in 0.3)",
+                ));
             }
         }
     }
@@ -511,12 +543,15 @@ impl PackManifest {
     /// schema itself (rule ids, kinds, codes, message tables) still
     /// applies in full.
     fn validate_external(&self) -> Result<(), DomainError> {
-        if self.manifest_version != MANIFEST_VERSION_V2 {
+        if !matches!(
+            self.manifest_version,
+            MANIFEST_VERSION_V2 | MANIFEST_VERSION_V3
+        ) {
             return Err(manifest_err(format!(
-                "manifest_version {} is not an external pack manifest (this loader expects {})",
-                self.manifest_version, MANIFEST_VERSION_V2
+                "manifest_version {} is not an external pack manifest (this loader expects 2 or 3)",
+                self.manifest_version
             ))
-            .with_fix("Set manifest_version = 2 for external packs"));
+            .with_fix("Set manifest_version = 2 or 3 for external packs"));
         }
 
         // PD14: name grammar and reserved names. A compiled-in built-in
@@ -737,6 +772,186 @@ impl PackManifest {
         Ok(())
     }
 
+    /// Resolve a type name to its prefix: core types first, then this
+    /// manifest's own declared types. Cross-pack type references are refused
+    /// in 0.3; core is the shared vocabulary.
+    pub(crate) fn type_prefix(&self, name: &str) -> Option<Prefix> {
+        if let Some(prefix) = Prefix::from_type(name) {
+            return Some(prefix);
+        }
+        if name == "package" {
+            return Some(Prefix::Package);
+        }
+        self.record_types
+            .decls
+            .iter()
+            .find(|decl| decl.name == name)
+            .and_then(|decl| Prefix::parse(&decl.id_prefix))
+    }
+
+    /// Whether a type name is an entity for edge endpoints: core person/org
+    /// or a declared type with `entity = true`.
+    pub(crate) fn is_entity_type(&self, name: &str) -> bool {
+        matches!(name, "person" | "org")
+            || self
+                .record_types
+                .decls
+                .iter()
+                .any(|decl| decl.name == name && decl.entity)
+    }
+
+    /// Validate `[[record_types]]` (v3) and the v2 rule that a manifest may
+    /// not claim a type without a declaration.
+    fn validate_record_types(&self) -> Result<(), DomainError> {
+        if self.manifest_version < MANIFEST_VERSION_V3 {
+            if !self.record_types.names.is_empty() {
+                return Err(manifest_err(
+                    "record type declarations require manifest_version = 3",
+                )
+                .with_fix("Set manifest_version = 3 and use [[record_types]] tables, or remove the claim"));
+            }
+            return Ok(());
+        }
+        if self.record_types.decls.is_empty() {
+            if !self.record_types.names.is_empty() {
+                return Err(manifest_err(
+                    "manifest_version = 3 must declare record types as [[record_types]] tables",
+                )
+                .with_fix("Replace the string array with one [[record_types]] table per type"));
+            }
+            return Ok(());
+        }
+        if !self.pack.requires_spec.iter().any(|spec| spec == "0.3") {
+            return Err(manifest_err(
+                "a manifest that declares record types must list \"0.3\" in requires_spec",
+            )
+            .with_fix("Add \"0.3\" to requires_spec"));
+        }
+
+        let field_names: BTreeSet<&str> = self.fields.iter().map(|f| f.name.as_str()).collect();
+        let mut names = BTreeSet::new();
+        let mut prefixes = BTreeSet::new();
+        let mut collections = BTreeSet::new();
+        for decl in &self.record_types.decls {
+            if !crate::record_type::valid_type_name(&decl.name) {
+                return Err(manifest_err(format!(
+                    "record type '{}' is not valid (must match ^[a-z][a-z0-9_]{{0,31}}$)",
+                    decl.name
+                ))
+                .with_fix("Use a lowercase type name with underscores"));
+            }
+            if crate::record_type::is_core_type_name(&decl.name) {
+                return Err(manifest_err(format!(
+                    "record type '{}' is a core type and cannot be claimed",
+                    decl.name
+                ))
+                .with_fix("Remove the record type or choose a different name"));
+            }
+            if !crate::record_type::valid_pack_prefix(&decl.id_prefix) {
+                return Err(manifest_err(format!(
+                    "record type '{}' id_prefix '{}' must be two lowercase letters and must not end in p/o/d/i/n/e",
+                    decl.name, decl.id_prefix
+                ))
+                .with_fix("Use a two-letter prefix such as pl or th; the second letter cannot shadow a core prefix"));
+            }
+            if matches!(
+                decl.id_prefix.as_str(),
+                "p" | "o" | "d" | "i" | "n" | "e" | "pkg"
+            ) {
+                return Err(manifest_err(format!(
+                    "record type '{}' id_prefix '{}' is reserved",
+                    decl.name, decl.id_prefix
+                ))
+                .with_fix("Choose a two-letter prefix"));
+            }
+            if !crate::record_type::valid_collection(&decl.collection) {
+                return Err(manifest_err(format!(
+                    "record type '{}' collection '{}' is not valid or is reserved",
+                    decl.name, decl.collection
+                ))
+                .with_fix(
+                    "Use a lowercase collection directory that is not a core or vault name",
+                ));
+            }
+            if !crate::record_type::valid_main_file(&decl.main_file) {
+                return Err(manifest_err(format!(
+                    "record type '{}' main_file '{}' must be a plain .md file name",
+                    decl.name, decl.main_file
+                ))
+                .with_fix("Use a name like place.md"));
+            }
+            if !names.insert(decl.name.as_str())
+                || !prefixes.insert(decl.id_prefix.as_str())
+                || !collections.insert(decl.collection.as_str())
+            {
+                return Err(manifest_err(format!(
+                    "record type '{}' duplicates a name, prefix, or collection in this manifest",
+                    decl.name
+                ))
+                .with_fix("Each declared type needs a unique name, prefix, and collection"));
+            }
+            let no_ai = crate::record_type::NoAiPolicy::parse(&decl.no_ai).ok_or_else(|| {
+                manifest_err(format!(
+                    "record type '{}' no_ai must be none, full, or notes",
+                    decl.name
+                ))
+            })?;
+            if decl.person_like && !decl.entity {
+                return Err(manifest_err(format!(
+                    "record type '{}' sets person_like without entity",
+                    decl.name
+                ))
+                .with_fix("Set entity = true, or remove person_like"));
+            }
+            if no_ai == crate::record_type::NoAiPolicy::Notes && !decl.person_like {
+                return Err(manifest_err(format!(
+                    "record type '{}' sets no_ai = \"notes\" without person_like",
+                    decl.name
+                ))
+                .with_fix("Set person_like = true, or use no_ai = \"full\""));
+            }
+            let mut required = BTreeSet::new();
+            for key in &decl.required_fields {
+                if *key != "name" && !field_names.contains(key.as_str()) {
+                    return Err(manifest_err(format!(
+                        "record type '{}' requires undeclared field '{}'",
+                        decl.name, key
+                    ))
+                    .with_fix("Declare the field in [[fields]] or use name"));
+                }
+                if !required.insert(key.as_str()) {
+                    return Err(manifest_err(format!(
+                        "record type '{}' repeats required field '{}'",
+                        decl.name, key
+                    )));
+                }
+            }
+            let mut optional = BTreeSet::new();
+            for key in &decl.optional_fields {
+                if !optional.insert(key.as_str()) {
+                    return Err(manifest_err(format!(
+                        "record type '{}' repeats optional field '{}'",
+                        decl.name, key
+                    )));
+                }
+                if *key != "name" && !field_names.contains(key.as_str()) {
+                    return Err(manifest_err(format!(
+                        "record type '{}' lists undeclared optional field '{}'",
+                        decl.name, key
+                    ))
+                    .with_fix("Declare the field in [[fields]] or use name"));
+                }
+                if required.contains(key.as_str()) {
+                    return Err(manifest_err(format!(
+                        "record type '{}' lists field '{}' as both required and optional",
+                        decl.name, key
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_common(&self) -> Result<(), DomainError> {
         if self.pack.name.trim().is_empty() {
             return Err(manifest_err("[pack].name must be non-empty")
@@ -785,8 +1000,28 @@ impl PackManifest {
         }
         let edge_names: Vec<String> = self.edge_kinds.iter().map(|e| e.name.clone()).collect();
         check_unique(&edge_names, "edge kind")?;
+        self.validate_record_types()?;
         for edge_kind in &self.edge_kinds {
-            validate_edge_endpoints(edge_kind)?;
+            validate_edge_endpoints(edge_kind, self)?;
+        }
+        for verb in &self.verbs {
+            if let Some(id_type) = &verb.id_type {
+                if self.type_prefix(id_type).is_none() {
+                    let mut accepted: Vec<String> = crate::record_type::CORE_TYPES
+                        .iter()
+                        .map(|d| d.name.to_owned())
+                        .collect();
+                    accepted.push("package".to_owned());
+                    accepted.extend(self.record_types.decls.iter().map(|decl| decl.name.clone()));
+                    return Err(manifest_err(format!(
+                        "verb '{}' names unknown id_type '{}'; expected one of: {}",
+                        verb.name,
+                        id_type,
+                        accepted.join(", ")
+                    ))
+                    .with_fix("Use a core type or a type declared by this pack"));
+                }
+            }
         }
 
         // [checks] keys are namespaced <pack-name>.<rule>; a pack may only
@@ -1049,7 +1284,7 @@ default = "late"
         assert_eq!(m.pack.version, "0.1");
         assert_eq!(m.balance_metrics, vec!["sessions_remaining".to_string()]);
         assert_eq!(m.verbs.len(), 2);
-        assert_eq!(m.verbs[0].id_type, Some(Prefix::Person));
+        assert_eq!(m.verbs[0].id_type.as_deref(), Some("person"));
         assert_eq!(m.verbs[1].id_type, None);
         assert_eq!(m.fields[0].grammar, "recurring-date");
         assert!(!m.edge_kinds[0].symmetric);
@@ -1785,5 +2020,116 @@ max_open_n = 100000
         let text = valid_toml() + "\n[context]\nview = \"ledger-sessions\"\n";
         let err = parse_manifest(&text).unwrap_err();
         assert!(err.to_string().contains("manifest_version = 2"), "{err:?}");
+    }
+    fn v3_toml() -> String {
+        r#"manifest_version = 3
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER"]
+
+[pack]
+name = "place-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.3"]
+
+[[record_types]]
+name = "place"
+id_prefix = "pl"
+collection = "places"
+main_file = "place.md"
+entity = true
+no_ai = "full"
+required_fields = ["name"]
+optional_fields = ["address"]
+
+[[fields]]
+name = "address"
+grammar = "non-empty-string"
+
+[[verbs]]
+name = "visit"
+id_type = "place"
+
+[[edge_kinds]]
+name = "visited"
+symmetric = false
+from = ["person"]
+to = ["place"]
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
+"#
+        .to_owned()
+    }
+
+    #[test]
+    fn v3_declares_a_record_type_and_own_id_type() {
+        let m = parse_manifest_external(&v3_toml()).unwrap();
+        assert_eq!(m.manifest_version, 3);
+        assert_eq!(m.record_types.names, vec!["place".to_owned()]);
+        assert_eq!(m.record_types.decls.len(), 1);
+        assert_eq!(m.record_types.decls[0].id_prefix, "pl");
+        assert_eq!(m.verbs[0].id_type.as_deref(), Some("place"));
+        assert!(m.is_entity_type("place"));
+        assert_eq!(m.type_prefix("place"), Some(Prefix::Pack(*b"pl")));
+    }
+
+    #[test]
+    fn v3_types_require_spec_03() {
+        let text = v3_toml().replace("requires_spec = [\"0.3\"]", "requires_spec = [\"0.2\"]");
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("0.3"), "{err:?}");
+    }
+
+    #[test]
+    fn v2_may_not_claim_a_record_type() {
+        let text = valid_v2_toml().replace("record_types = []", "record_types = [\"place\"]");
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("manifest_version = 3"), "{err:?}");
+    }
+
+    #[test]
+    fn v3_rejects_bad_record_type_declarations() {
+        for (from, to, needle) in [
+            ("id_prefix = \"pl\"", "id_prefix = \"p\"", "two lowercase"),
+            ("id_prefix = \"pl\"", "id_prefix = \"xp\"", "two lowercase"),
+            ("name = \"place\"", "name = \"person\"", "core record type"),
+            (
+                "collection = \"places\"",
+                "collection = \"people\"",
+                "collection",
+            ),
+            ("no_ai = \"full\"", "no_ai = \"notes\"", "person_like"),
+            (
+                "optional_fields = [\"address\"]",
+                "optional_fields = [\"missing\"]",
+                "undeclared",
+            ),
+        ] {
+            let text = v3_toml().replace(from, to);
+            let err = parse_manifest_external(&text).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "expected {needle:?} for {to:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_rejects_duplicate_type_prefix() {
+        let text = v3_toml().replace(
+            "[[fields]]",
+            "[[record_types]]\nname = \"thing\"\nid_prefix = \"pl\"\ncollection = \"things\"\nmain_file = \"thing.md\"\n\n[[fields]]",
+        );
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("duplicates"), "{err:?}");
+    }
+
+    #[test]
+    fn v3_rejects_string_record_type_names() {
+        let text = "manifest_version = 3\nrecord_types = [\"place\"]\nbalance_metrics = []\nfinding_codes = []\n\n[pack]\nname = \"place-pack\"\nversion = \"0.1\"\nskill = \"SKILL.md\"\nrequires_spec = [\"0.3\"]\n\n[messages]\n";
+        let err = parse_manifest_external(text).unwrap_err();
+        assert!(err.to_string().contains("tables"), "{err:?}");
     }
 }

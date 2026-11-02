@@ -169,9 +169,9 @@ impl DomainError {
     pub fn spec_unsupported(spec: impl Display) -> Self {
         Self::new(
             ErrorKind::SpecUnsupported,
-            format!("vault spec '{spec}' is not supported (this CLI implements 0.1 and 0.2)"),
+            format!("vault spec '{spec}' is not supported (this CLI implements 0.1, 0.2, and 0.3)"),
         )
-        .with_fix("Use spec = \"0.1\" or \"0.2\", or upgrade the CLI")
+        .with_fix("Use spec = \"0.1\", \"0.2\", or \"0.3\", or upgrade the CLI")
         .with_file("confidant.toml")
     }
 

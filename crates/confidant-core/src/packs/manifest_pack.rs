@@ -17,9 +17,10 @@ use crate::context::ledger_sessions::LedgerSessionsParams;
 use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
 use crate::packs::groups::MergeGroups;
-use crate::packs::manifest::{entity_prefix, PackManifest, PackOrigin};
+use crate::packs::manifest::{PackManifest, PackOrigin};
 use crate::packs::rules::ledger::{self, LedgerFacts};
 use crate::packs::{EdgeKind, Pack, PackState};
+use crate::record_type::{NoAiPolicy, RecordTypeDecl, TypeOwner};
 use crate::vault::{SourcedEntry, Vault};
 use chrono::NaiveDate;
 
@@ -42,6 +43,7 @@ pub struct ManifestPack {
     verbs: &'static [&'static str],
     verb_id_types: Vec<(&'static str, Prefix)>,
     record_types: &'static [&'static str],
+    record_type_decls: &'static [RecordTypeDecl],
     fields: &'static [&'static str],
     balance_metrics: &'static [&'static str],
     balance_open_verbs: &'static [&'static str],
@@ -85,12 +87,51 @@ pub(crate) fn build_manifest_pack(
     let verb_id_types: Vec<(&'static str, Prefix)> = manifest
         .verbs
         .iter()
-        .filter_map(|v| v.id_type.map(|p| (leak_str(v.name.clone()), p)))
+        .filter_map(|v| {
+            let id_type = v.id_type.as_ref()?;
+            let prefix = manifest.type_prefix(id_type)?;
+            Some((leak_str(v.name.clone()), prefix))
+        })
         .collect();
     let record_types: Vec<&'static str> = manifest
         .record_types
         .iter()
         .map(|r| leak_str(r.clone()))
+        .collect();
+    let record_type_decls: Vec<RecordTypeDecl> = manifest
+        .record_types
+        .decls
+        .iter()
+        .map(|decl| {
+            let prefix = Prefix::parse(&decl.id_prefix)
+                .expect("record type prefix validated at manifest load");
+            let required: Vec<&'static str> = decl
+                .required_fields
+                .iter()
+                .map(|f| leak_str(f.clone()))
+                .collect();
+            let optional: Vec<&'static str> = decl
+                .optional_fields
+                .iter()
+                .map(|f| leak_str(f.clone()))
+                .collect();
+            RecordTypeDecl {
+                name: leak_str(decl.name.clone()),
+                id_prefix: leak_str(decl.id_prefix.clone()),
+                prefix,
+                collection: leak_str(decl.collection.clone()),
+                main_file: leak_str(decl.main_file.clone()),
+                entity: decl.entity,
+                person_like: decl.person_like,
+                no_ai: NoAiPolicy::parse(&decl.no_ai).expect("no_ai validated at manifest load"),
+                roster: decl.roster.unwrap_or(decl.entity),
+                required_fields: Box::leak(required.into_boxed_slice()),
+                optional_fields: Box::leak(optional.into_boxed_slice()),
+                owner: TypeOwner::Pack(name),
+                enabled: true,
+                retired: false,
+            }
+        })
         .collect();
     let fields: Vec<&'static str> = manifest
         .fields
@@ -115,7 +156,11 @@ pub(crate) fn build_manifest_pack(
     let endpoint_slice = |names: &[String]| -> &'static [Prefix] {
         let prefixes: Vec<Prefix> = names
             .iter()
-            .map(|name| entity_prefix(name).expect("edge endpoint type validated at manifest load"))
+            .map(|name| {
+                manifest
+                    .type_prefix(name)
+                    .expect("edge endpoint type validated at manifest load")
+            })
             .collect();
         Box::leak(prefixes.into_boxed_slice())
     };
@@ -154,6 +199,7 @@ pub(crate) fn build_manifest_pack(
         verbs: Box::leak(verbs.into_boxed_slice()),
         verb_id_types,
         record_types: Box::leak(record_types.into_boxed_slice()),
+        record_type_decls: Box::leak(record_type_decls.into_boxed_slice()),
         fields: Box::leak(fields.into_boxed_slice()),
         balance_metrics: Box::leak(balance_metrics.into_boxed_slice()),
         balance_open_verbs: Box::leak(balance_open_verbs.into_boxed_slice()),
@@ -174,6 +220,10 @@ impl Pack for ManifestPack {
 
     fn record_types(&self) -> &'static [&'static str] {
         self.record_types
+    }
+
+    fn record_type_decls(&self) -> &'static [RecordTypeDecl] {
+        self.record_type_decls
     }
 
     fn fields(&self) -> &'static [&'static str] {

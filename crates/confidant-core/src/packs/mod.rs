@@ -144,7 +144,7 @@ pub const CORE_EDGE_KINDS_0_2: &[EdgeKind] = &[
 pub fn core_edge_kinds(spec: SpecVersion) -> &'static [EdgeKind] {
     match spec {
         SpecVersion::V01 => CORE_EDGE_KINDS_0_1,
-        SpecVersion::V02 => CORE_EDGE_KINDS_0_2,
+        SpecVersion::V02 | SpecVersion::V03 => CORE_EDGE_KINDS_0_2,
     }
 }
 
@@ -184,6 +184,13 @@ pub trait Pack: Send + Sync {
     /// Core kinds (`person`, `org`, `deal`, `interaction`, `note`, `edge`)
     /// are never claimed; a pack that introduces a new kind claims it here.
     fn record_types(&self) -> &'static [&'static str];
+
+    /// Full declarations for the types this pack owns (spec 0.3). The default
+    /// keeps compiled packs that only claim names (none today) source
+    /// compatible.
+    fn record_type_decls(&self) -> &'static [crate::record_type::RecordTypeDecl] {
+        &[]
+    }
     /// Front-matter fields this pack owns on shared records (flat names,
     /// e.g. `birthday`). Namespace only on conflict (#177 Q1).
     fn fields(&self) -> &'static [&'static str];
@@ -428,9 +435,11 @@ pub fn session_billing_tags_for_vault(vault: &Vault) -> Vec<String> {
     tags
 }
 
-/// A claim two packs make on the same verb, record type, field, balance
-/// metric, or edge kind. `kind` is one of `"verb"`, `"record type"`,
-/// `"field"`, `"balance metric"`, `"edge kind"`.
+/// A claim two packs make on the same verb, record type, record-type prefix,
+/// record-type collection, field, balance metric, or edge kind. `kind` is one
+/// of `"verb"`, `"record type"`, `"record type prefix"`,
+/// `"record type collection"`, `"field"`, `"balance metric"`,
+/// `"edge kind"`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackConflict {
     pub kind: &'static str,
@@ -449,6 +458,8 @@ pub fn find_conflict(packs: &[&dyn Pack]) -> Option<PackConflict> {
     let mut seen_metrics: HashMap<&'static str, &'static str> = HashMap::new();
     let mut seen_edge_kinds: HashMap<&'static str, &'static str> = HashMap::new();
     let mut seen_codes: HashMap<&'static str, &'static str> = HashMap::new();
+    let mut seen_type_prefixes: HashMap<&'static str, &'static str> = HashMap::new();
+    let mut seen_type_collections: HashMap<&'static str, &'static str> = HashMap::new();
     for pack in packs {
         for (kind, claims, seen) in [
             ("verb", pack.verbs(), &mut seen_verbs),
@@ -457,6 +468,30 @@ pub fn find_conflict(packs: &[&dyn Pack]) -> Option<PackConflict> {
             ("balance metric", pack.balance_metrics(), &mut seen_metrics),
         ] {
             for claim in claims {
+                if let Some(first) = seen.get(claim) {
+                    return Some(PackConflict {
+                        kind,
+                        name: claim,
+                        first,
+                        second: pack.name(),
+                    });
+                }
+                seen.insert(claim, pack.name());
+            }
+        }
+        for decl in pack.record_type_decls() {
+            for (kind, claim, seen) in [
+                (
+                    "record type prefix",
+                    decl.id_prefix,
+                    &mut seen_type_prefixes,
+                ),
+                (
+                    "record type collection",
+                    decl.collection,
+                    &mut seen_type_collections,
+                ),
+            ] {
                 if let Some(first) = seen.get(claim) {
                     return Some(PackConflict {
                         kind,

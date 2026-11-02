@@ -25,13 +25,13 @@ interoperating vaults, not one shared vault.
 
 Read before changing behaviour:
 
-- [`spec/0.1.md`](spec/0.1.md) (frozen) and [`spec/0.2.md`](spec/0.2.md)
-  (current): the vault file format. **The spec is the contract**; the code
-  implements it. The spec version and the CLI version are independent
-  (ADR-1).
+- [`spec/0.1.md`](spec/0.1.md) and [`spec/0.2.md`](spec/0.2.md) (frozen)
+  and [`spec/0.3.md`](spec/0.3.md) (current): the vault file format. **The
+  spec is the contract**; the code implements it. The spec version and the
+  CLI version are independent (ADR-1).
 - [`spec/findings.md`](spec/findings.md): stable `check` finding codes.
 - [`docs/architecture.md`](docs/architecture.md): privacy and threat model,
-  ADR-1 to ADR-17, milestones (section 8), and risk decisions (section 9b,
+  ADR-1 to ADR-18, milestones (section 8), and risk decisions (section 9b,
   binding).
 - [`testdata/packs/example-pack/`](testdata/packs/example-pack/): the neutral external-pack fixture used by tests, the QA smoke, and the benchmark generator.
 - [`packs/personal/0.2.md`](packs/personal/0.2.md): the personal
