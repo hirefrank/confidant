@@ -1,6 +1,6 @@
 ---
 name: "qmd-search"
-description: "Semantic + keyword search over a Confidant vault via a local QMD index (BM25, vectors, rerank). Honors the spec §12 fail-closed allowlist including no-ai; falls back to `confidant find` when no index exists."
+description: "Semantic + keyword search over a Confidant vault via a local QMD index (BM25, vectors, rerank). Honors the spec §12 fail-closed allowlist including no-ai, superseded ledger lines, and retired records; falls back to `confidant find` when no index exists."
 ---
 
 # QMD Search
@@ -45,6 +45,17 @@ truth for the search allowlist.
 - **`no-ai` records never enter the corpus.** The CLI does not list them as
   cleared, so they are excluded by construction, not just by the query-time
   filter.
+- **Superseded lines and retired records never enter the corpus either.**
+  A `retract` correction removes its target from the CLI's cleared ledger
+  lines, and a `retired: true` record is not in the cleared set (nor are
+  records/lines that name it). The corpus is staged from
+  `confidant allowlist --json`, so both are excluded by construction; the
+  query-time allowlist check drops a stale hit as well. A retraction line
+  itself is listed only when its target line is allowed, so a hidden
+  target's ref cannot leak through the corpus. Rebuild after a correction or
+  retirement: the old chunk/snippet is no longer cleared and a stale corpus
+  can mislabel line numbers or return an outdated excerpt until
+  `qmd-index.py` reruns.
 
 ## Setup
 
@@ -96,8 +107,9 @@ npm install -g @tobilu/qmd        # or: bun install -g @tobilu/qmd
 ```
 
 `qmd-index` is idempotent: rebuilding replaces the corpus and re-adds the
-collection. Re-run it after pulls, merges, or anything that changes vault
-content — hits are verified against the live cleared set at query time
+collection. Re-run it after pulls, merges, corrections/retirements, or
+anything that changes vault content — hits are verified against the live
+cleared set at query time
 (record paths, ledger lines), so a stale index cannot surface a record the
 CLI does not clear. It can, however, miss a hit, mislabel a line number, or
 return a **stale snippet of a still-cleared record**: the excerpt comes from

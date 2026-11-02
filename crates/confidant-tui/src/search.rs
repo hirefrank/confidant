@@ -71,6 +71,7 @@ pub fn find_result_to_search(result: FindResult) -> SearchResult {
                 path: hit.path,
                 line: hit.line,
                 excerpt: hit.excerpt,
+                line_ref: hit.line_ref,
                 via: "find".to_owned(),
                 score: 0.0,
             })
@@ -90,6 +91,7 @@ mod tests {
             path: "people/p-01.cfd".to_owned(),
             line: 3,
             excerpt: "Ada Example".to_owned(),
+            line_ref: None,
             via: via.to_owned(),
             score: 0.9,
         }

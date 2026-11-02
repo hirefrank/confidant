@@ -463,9 +463,31 @@ registry, no signing in v1. External packs affect `check` only.
 
 **Consequences.** The edge format gains one key in 0.3. The allowlist's existing own-flag rule hides the edge; `context` filters it out and the operator bundle carries the badge. `find`/`allowlist`/QMD never see it. Edge tests cover agent vs operator, a note naming a hidden edge, both endpoints staying visible, and 0.2 rejection.
 
+### ADR-20. Corrections are compensating ledger entries; retirement is record state (spec 0.4).
+
+**Door:** One-way (content-hash line refs and `retired` become format).
+
+**Context.** #746 found that append-only had no correction path: an agent's backfill re-added 41 touches, a wrong ledger line could not be voided, and a wrongly-created record had no non-destructive remedy. Append-only is a trust property; "cannot be silently rewritten" and "cannot be corrected" are different claims. Rewriting pushed git history breaks every other clone and the audit story.
+
+**Decision.**
+
+- **A correction is a new fact.** `DATE retract SUBJECT-ID line:<64 hex> [occurrence:<n>] reason:<token> [replace:<64 hex>]` voids a prior parsed line without editing or deleting it. The original line and the retraction stay in the ledger and in git history.
+- **Line identity is content-addressed.** The ref is the SHA-256 of the canonical `format_entry` bytes with the `confidant-line-ref/v1` domain, plus a 1-based occurrence for byte-identical lines. It survives appends, renames, and line-number shifts, and fails loudly (`E_RETRACT_TARGET`) after a hand edit. The canonical form and pinned vectors are part of spec 0.4; a future formatter change needs a `v2` domain and dual-read.
+- **One on-disk verb, `retract`.** The closed reason vocabulary is `duplicate`, `wrong-date`, `wrong-kind`, `wrong-person`, `wrong-amount`, `wrong-note`, `wrong-record`, `typo`, `other`. `replace:` links a replacement line with the same subject and a date on or before the retraction's. `confidant correct` appends the replacement and the retraction in one commit; there is no separate `correct` grammar. A `merge` or `retract` line cannot be retracted, and a correction cannot move a fact between subjects.
+- **Readers use an effective view.** Current-state rules (`check`, `find`/`allowlist`, `context`, roster, resolve, cadence/duplicate rules) apply every valid retraction; a `balance` assertion dated D applies only retractions dated on or before D. Findings on a retracted target are suppressed, so a correction is a remedy; the retraction line's own findings still stand.
+- **Record retirement is front-matter state.** `retired: true` with `confidant record retire|unretire` keeps the file and history but removes the record and its dependents from agent reads, `context`, `resolve`, and `alias resolve`. The operator path still sees it (`record list --for-operator` badges it; `record show --for-edit` reads it); `context` returns no bundle for a retired target. `check` still validates the file. Before 0.4 the key is ignored.
+- **0.4 is the version gate.** 0.1–0.3 remain frozen. A 0.3 binary would otherwise keep counting a voided line (or treat a retired record as live), so 0.4 is a new spec version, not a 0.3 addendum.
+- **Guardrails.** Corrections are attributed commits; no history rewrite; no silent retarget; `retract` is core-owned and no pack may claim it; a retraction line is visible to agents only when its target line is, and refs are opaque; no MCP tool was added (CLI-only, operator path). A pack used in a 0.4 vault lists `"0.4"` in `requires_spec`.
+
+**Alternatives considered.** (a) Rewrite or delete ledger lines and rely on git history: breaks every other clone, loses the visible mistake, and makes readers infer corrections from diffs. (b) Per-line ULIDs in a trailing comment: requires a backfill/rewrite of existing lines. (c) A `path:line` reference: shifts after appends and merges. (d) A ledger `retire` verb: adds a second read-time map and date semantics to every reader, while retirement is record lifecycle state. (e) A separate on-disk `correct` verb: duplicates target/ref/reason parsing and the chain model for no reader benefit.
+
+**Consequences.** Spec 0.4 is current; 0.3 is frozen. `init` writes 0.4 and an existing 0.3 vault opts in with one `spec` change. Every reader must use the effective view; the QMD corpus must be rebuilt after a correction or retirement; external packs used in a 0.4 vault must list `"0.4"`. Suppressing a target's findings is a deliberate trust choice: a retraction can clear a check error, but it is attributed and visible. Unmerging a `merge` line remains a separate identity problem.
+
+**Follow-up (unresolved).** `record retire` is a normal check-gated write, not a repairing write: it does not suppress record-level findings. A record that itself causes a `check` error must be fixed before it can be retired, so retirement is a remedy for a valid-but-unwanted record, not for a malformed one. Whether retirement should become a repairing write (and which findings it may suppress) is left open for the #746 correction review.
+
 ## 8. v0 scope and milestones
 
-1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18), and edge-level `no-ai` (ADR-19); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
+1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18) and edge-level `no-ai` (ADR-19), and 0.4 corrections and record retirement (ADR-20); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
 2. **Vault safety and sync.** `confidant doctor` (git repo and identity, transport, spec, `check`, staleness, skills links), `confidant sync` as the explicit git boundary, and the §12 `no-ai` allowlist. Done when a fresh clone on a clean machine reads and writes the vault with no extra setup.
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
 4. **Import skills.** Agent skills that pull events and transcripts from outside systems into the vault, with dry runs and safe retries.

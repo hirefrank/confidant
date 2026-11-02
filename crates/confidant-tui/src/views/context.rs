@@ -260,6 +260,8 @@ fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
         lines.extend(body_lines(ixn.body.as_deref(), "    "));
     }
 
+    // Superseded ledger lines are omitted by the CLI's effective view; the
+    // TUI renders exactly the touchpoints it receives and never re-adds one.
     lines.push(Line::from(Span::styled(
         format!("touchpoints ({})", ctx.touchpoints.len()),
         theme::muted().bold(),
