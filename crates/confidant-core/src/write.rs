@@ -6,13 +6,17 @@
 //! 2. If `--request-id` was given, look for a previous commit carrying its
 //!    domain-separated hash. Same canonical content → idempotent no-op.
 //!    Different content → [`ErrorKind::IdempotencyConflict`].
-//! 3. `--dry-run` shows the LOGICAL change (ledger lines / file content) and
-//!    stops.
-//! 4. Files are applied atomically ([`crate::paths::write_replace`]); any file
+//! 3. `check` runs before the change and fails fast on an already-broken
+//!    vault (skipped for a repairing write). A dry run runs this same
+//!    read-only pre-check.
+//! 4. `--dry-run` shows the LOGICAL change (ledger lines / file content) and
+//!    stops. It cannot run the post-write check without writing, so its
+//!    outcome says explicitly which checks ran ([`DryRunChecks`]).
+//! 5. Files are applied atomically ([`crate::paths::write_replace`]); any file
 //!    containing merge-conflict markers fails closed with [`ErrorKind::Conflict`].
-//! 5. `check` runs after the change; a failing check rolls the files back and
-//!    blocks the commit. A pre-check also fails fast on an already-broken vault.
-//! 6. One `git add` + `git commit`. The message and trailers carry ONLY opaque
+//! 6. `check` runs after the change; a failing check rolls the files back and
+//!    blocks the commit.
+//! 7. One `git add` + `git commit`. The message and trailers carry ONLY opaque
 //!    IDs, verbs, and hashes. Free-text reasons/intent are never in the
 //!    commit message.
 //!
@@ -87,6 +91,41 @@ pub struct DryRunFile {
     pub content: String,
 }
 
+/// The status of one write-pipeline check in a dry run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DryRunCheck {
+    /// The check ran and the vault passed it.
+    Passed,
+    /// The check did not gate this dry run. See [`DryRunChecks`].
+    Skipped,
+}
+
+impl DryRunCheck {
+    /// Stable lowercase label used in the JSON and text contract.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DryRunCheck::Passed => "passed",
+            DryRunCheck::Skipped => "skipped",
+        }
+    }
+}
+
+/// The checks a dry run actually performed (#770).
+///
+/// Apply runs a read-only pre-check before writing and a post-check after.
+/// A dry run runs the same pre-check, so an already-broken vault blocks the
+/// preview exactly as it blocks the apply. It cannot run the post-check
+/// without applying the change, and a dry run never writes. Reporting both
+/// statuses keeps that gap explicit instead of implying full validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DryRunChecks {
+    /// The pre-write check. `Skipped` for a repairing write, whose apply
+    /// path skips the same gate.
+    pub pre: DryRunCheck,
+    /// The post-write check. Always `Skipped`: it needs the applied tree.
+    pub post: DryRunCheck,
+}
+
 /// What [`apply_write`] did.
 #[derive(Clone, Debug)]
 pub enum WriteOutcome {
@@ -95,8 +134,12 @@ pub enum WriteOutcome {
     /// bytes already matched the file on disk is not listed, so the list and
     /// the commit diff agree (#425).
     Applied { commit: String, files: Vec<String> },
-    /// Nothing touched; the logical change is in `preview`.
-    DryRun { preview: Vec<DryRunFile> },
+    /// Nothing touched; the logical change is in `preview`, and `checks`
+    /// says which write-pipeline checks the dry run could run.
+    DryRun {
+        preview: Vec<DryRunFile>,
+        checks: DryRunChecks,
+    },
     /// `--request-id` matched a previous identical write; `commit` is its SHA.
     Idempotent { commit: String },
     /// Every change already matched what was on disk for that path: nothing
@@ -524,7 +567,20 @@ fn apply_write_inner(
         }
     }
 
-    // 2. Dry run: show the logical change, touch nothing.
+    // 2. Pre-check: fail fast on an already-broken vault. This runs for a
+    // dry run too (#770): a preview that passed where apply's pre-check
+    // blocks would be validating less than apply. A repairing write skips
+    // this gate because it exists to fix the reported problem; the
+    // post-check still refuses to commit an unclean result.
+    let vault = load_vault(root).map_err(anyhow::Error::new)?;
+    let pre = check_vault(&vault, &CheckOptions::default());
+    if !pre.ok && !repairing {
+        return Ok(WriteOutcome::CheckBlocked { report: pre });
+    }
+
+    // 3. Dry run: show the logical change, touch nothing. The post-write
+    // check needs the applied tree, and a dry run never writes, so the
+    // outcome reports it skipped rather than implying full validation.
     if opts.dry_run {
         let preview = pending
             .changes
@@ -552,16 +608,17 @@ fn apply_write_inner(
                 },
             })
             .collect();
-        return Ok(WriteOutcome::DryRun { preview });
-    }
-
-    // 3. Pre-check: fail fast on an already-broken vault. A repairing write
-    // skips this gate because it exists to fix the reported problem; the
-    // post-check below still refuses to commit an unclean result.
-    let vault = load_vault(root).map_err(anyhow::Error::new)?;
-    let pre = check_vault(&vault, &CheckOptions::default());
-    if !pre.ok && !repairing {
-        return Ok(WriteOutcome::CheckBlocked { report: pre });
+        return Ok(WriteOutcome::DryRun {
+            preview,
+            checks: DryRunChecks {
+                pre: if repairing {
+                    DryRunCheck::Skipped
+                } else {
+                    DryRunCheck::Passed
+                },
+                post: DryRunCheck::Skipped,
+            },
+        });
     }
 
     // 3b. Nothing to do: every change already matches the file on disk.

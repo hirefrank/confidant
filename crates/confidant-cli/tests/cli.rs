@@ -2409,6 +2409,8 @@ fn pack_add_yes_dry_run_writes_nothing() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["dry_run"], true, "{v}");
+    assert_eq!(v["checks"]["pre"], "passed", "{v}");
+    assert_eq!(v["checks"]["post"], "skipped", "{v}");
     assert!(v["commit"].is_null(), "{v}");
     assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), "1\n");
     assert!(!vault.path().join("packs").exists());

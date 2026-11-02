@@ -281,7 +281,7 @@ pub fn contract_schema() -> Value {
             },
             "writeResponse": {
                 "title": "log touch / import / note add --json",
-                "description": "One commit per write. Commit messages carry only opaque IDs, verbs, hashes. --request-id must be unguessable (at least 22 characters; use a ULID or UUIDv4): the Request-Hash trailer HMACs the canonical request with the raw id as key, and trailers are permanent, so a guessable id is an offline guessing oracle even after shredding.",
+                "description": "One commit per write. Commit messages carry only opaque IDs, verbs, hashes. --request-id must be unguessable (at least 22 characters; use a ULID or UUIDv4): the Request-Hash trailer HMACs the canonical request with the raw id as key, and trailers are permanent, so a guessable id is an offline guessing oracle even after shredding. A dry run runs the same read-only pre-write check as apply (skipped for a repairing write), never writes, and reports the post-write check as skipped because it needs the applied tree.",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "command"],
                 "properties": {
@@ -290,6 +290,15 @@ pub fn contract_schema() -> Value {
                     "vault": {"type": "string"},
                     "command": {"type": "string", "enum": ["log-touch", "import", "note-add", "record-add", "record-edit", "retract", "correct", "record-retire", "record-unretire"]},
                     "dry_run": {"type": "boolean"},
+                    "checks": {
+                        "type": "object",
+                        "description": "Dry-run only: which write-pipeline checks ran. `pre` is `passed` after the same read-only pre-check apply runs, or `skipped` for a repairing write (whose apply path skips it too). `post` is always `skipped`: the post-write check needs the applied tree, and a dry run never writes. Do not treat a dry run as validating the result.",
+                        "required": ["pre", "post"],
+                        "properties": {
+                            "pre": {"type": "string", "enum": ["passed", "skipped"]},
+                            "post": {"type": "string", "const": "skipped", "description": "Always `skipped`: the post-write check needs the applied tree, and a dry run never writes."}
+                        }
+                    },
                     "idempotent": {"type": "boolean"},
                     "unchanged": {"type": "boolean", "description": "The write would not change any file (for example re-saving a record with identical content). No commit is reported with it; exit status is success."},
                     "commit": {"type": ["string", "null"], "description": "Full commit SHA; null on dry-run."},
@@ -537,6 +546,33 @@ mod tests {
         assert!(s["$defs"]["edgeView"]["properties"]["direction"]["enum"].is_array());
         assert!(s["$defs"]["edgeView"]["properties"]["no_ai"].is_object());
         assert_eq!(s["properties"]["schema_version"]["const"], "1");
+    }
+
+    /// #770: a dry run must say which write-pipeline checks it ran. The
+    /// pre-check can be `passed` (normal) or `skipped` (repairing write);
+    /// the post-check needs the applied tree, so dry runs always skip it.
+    #[test]
+    fn write_schema_documents_dry_run_checks() {
+        let s = contract_schema();
+        assert_eq!(s["properties"]["schema_version"]["const"], "1");
+        let checks = &s["$defs"]["writeResponse"]["properties"]["checks"];
+        assert_eq!(
+            checks["required"],
+            serde_json::json!(["pre", "post"]),
+            "{checks}"
+        );
+        assert_eq!(
+            checks["properties"]["pre"]["enum"],
+            serde_json::json!(["passed", "skipped"])
+        );
+        assert_eq!(checks["properties"]["post"]["const"], "skipped");
+        assert!(
+            checks["description"]
+                .as_str()
+                .unwrap()
+                .contains("always `skipped`"),
+            "{checks}"
+        );
     }
 
     /// #813/#814: the roster shape documents the `all` default, dynamic

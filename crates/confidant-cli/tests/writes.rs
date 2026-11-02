@@ -82,6 +82,19 @@ fn commits(root: &Path) -> usize {
     String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
 }
 
+/// Porcelain status, so a dry-run regression test can prove the tree is
+/// untouched (not just uncommitted).
+fn git_status(root: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git status failed: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 fn run_json(args: &[&str]) -> (bool, Value) {
     // Hermetic HOME: Windows CI runners don't set HOME, and `doctor` needs
     // a config dir. A fresh tempdir per call is fine — no test here
@@ -178,10 +191,11 @@ fn log_session_is_no_longer_a_subcommand() {
 /// pack-lock §5), so the gate must pass them. Tampering a vendored file
 /// makes the listed example pack a hash problem while its manifest
 /// still sells `session`; the dry run must therefore not refuse the
-/// verb (apply still blocks, but on the pack hash, not the verb).
+/// verb. #770: both dry-run and apply then block on the shared pre-check
+/// (the pack hash), so the dry run must report the same findings.
 /// #799 step 2: the pack verb is written through `import --file`.
 #[test]
-fn import_pack_verb_dry_run_passes_for_problem_pack_verb() {
+fn import_problem_pack_verb_dry_run_matches_apply() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     install_example_pack(root);
@@ -219,7 +233,7 @@ fn import_pack_verb_dry_run_passes_for_problem_pack_verb() {
     let file = scratch.path().join("session.cfd");
     std::fs::write(&file, format!("2026-10-23 session {PERSON} 60m paid\n")).unwrap();
 
-    let (ok, v) = run_json(&[
+    let (dry_ok, dry) = run_json(&[
         "import",
         "--file",
         &file.display().to_string(),
@@ -229,10 +243,21 @@ fn import_pack_verb_dry_run_passes_for_problem_pack_verb() {
         &vroot,
         "--dry-run",
     ]);
-    assert!(ok, "{v}");
-    assert_eq!(v["dry_run"], true);
+    // Not a verb refusal: the gate passes the problem pack's verb, and the
+    // shared pre-check then blocks on the pack problem exactly as apply does.
+    assert!(!dry_ok, "{dry}");
+    assert_eq!(dry["ok"], false, "{dry}");
+    assert!(
+        dry.get("error").is_none(),
+        "blocked by the pre-check, not the verb gate: {dry}"
+    );
+    assert!(
+        !dry["findings"].as_array().unwrap().is_empty(),
+        "the pre-check findings must be reported: {dry}"
+    );
+    assert_eq!(git_status(root), "", "dry run must write nothing");
 
-    // Apply is blocked by the pack problem, but not by the verb gate.
+    // Apply is blocked by the same pack problem, not by the verb gate.
     let (ok, v) = run_json(&[
         "import",
         "--file",
@@ -244,6 +269,10 @@ fn import_pack_verb_dry_run_passes_for_problem_pack_verb() {
     ]);
     assert!(!ok, "{v}");
     assert_ne!(v["error"]["code"], "E_INVALID", "{v}");
+    assert_eq!(
+        dry["findings"], v["findings"],
+        "dry run and apply must agree on the pre-check"
+    );
     assert_eq!(commits(root), 1, "no commit on blocked apply");
 }
 
@@ -449,13 +478,44 @@ fn failing_check_blocks_write_and_rolls_back() {
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);
-    // Break the vault directly: a session line with a bad id.
+    // Break the vault directly: a session line with a bad id. Commit the
+    // breakage so the fixture tree starts clean and a dry run's write-free
+    // guarantee is observable.
     std::fs::write(
         root.join("ledger/2026/10.cfd"),
         "2026-10-01 open x package y 4 sessions\n",
     )
     .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "break vault"]);
     let ledger_before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+
+    // #770: a dry run runs the same read-only pre-check as apply. It must
+    // not report ok for a write apply blocks, and it must not touch the
+    // vault (no file change, no commit, no queue).
+    let (dry_ok, dry) = run_json(&[
+        "log",
+        "touch",
+        PERSON,
+        "meal",
+        "--dry-run",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!dry_ok, "{dry}");
+    assert_eq!(
+        dry["ok"], false,
+        "dry run returns the same check report as apply"
+    );
+    assert_eq!(commits(root), 2, "dry run must not commit");
+    assert_eq!(
+        std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
+        ledger_before,
+        "dry run must not append"
+    );
+    assert_eq!(git_status(root), "", "dry run must leave the tree clean");
 
     let (ok, v) = run_json(&[
         "log",
@@ -470,11 +530,65 @@ fn failing_check_blocks_write_and_rolls_back() {
     assert!(!ok);
     assert_eq!(v["ok"], false, "check report, not an error envelope");
     assert!(v["summary"]["errors"].as_u64().unwrap() > 0);
-    assert_eq!(commits(root), 1, "nothing committed");
+    assert_eq!(
+        dry["findings"], v["findings"],
+        "dry run and apply must agree on the pre-check"
+    );
+    assert_eq!(commits(root), 2, "nothing committed");
 
     // The pre-check fails fast, so the file is untouched.
     let ledger_after = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
     assert_eq!(ledger_before, ledger_after);
+
+    // A record write on the same broken vault agrees too (#770): the
+    // pre-check is shared, not per-command.
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("person.md");
+    let new_person = "p-01J9Z3K4QF0000000000000003";
+    std::fs::write(
+        &file,
+        format!("---\nid: {new_person}\ntype: person\nname: \"Ada Example\"\n---\n\nFake bio.\n"),
+    )
+    .unwrap();
+    let file_arg = file.display().to_string();
+    let record_path = root.join(format!("people/{new_person}/profile.md"));
+    let mut args = vec![
+        "record",
+        "add",
+        "--file",
+        file_arg.as_str(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ];
+    args.push("--dry-run");
+    let (dry_ok, dry_record) = run_json(&args);
+    assert!(!dry_ok, "{dry_record}");
+    assert_eq!(
+        dry_record["findings"], v["findings"],
+        "record dry run uses the same pre-check"
+    );
+    assert!(!record_path.exists(), "record dry run wrote a file");
+    assert_eq!(
+        git_status(root),
+        "",
+        "record dry run must leave the tree clean"
+    );
+
+    args.pop();
+    let (ok, applied) = run_json(&args);
+    assert!(!ok, "{applied}");
+    assert_eq!(
+        applied["findings"], dry_record["findings"],
+        "record dry run and apply must agree on the pre-check"
+    );
+    assert!(!record_path.exists(), "blocked record apply wrote a file");
+    assert_eq!(
+        commits(root),
+        2,
+        "record apply was blocked by the pre-check"
+    );
 }
 
 #[test]
@@ -1608,10 +1722,32 @@ fn record_add_deal_and_dry_run() {
     assert!(ok, "{v}");
     assert_eq!(v["command"], "record-add");
     assert_eq!(v["dry_run"], true);
+    // #770: the dry run ran apply's read-only pre-check and says plainly
+    // that it could not run the post-write check.
+    assert_eq!(v["checks"]["pre"], "passed", "{v}");
+    assert_eq!(v["checks"]["post"], "skipped", "{v}");
     assert!(!root
         .join("deals/d-01J9Z3K4QF0000000000000002/deal.md")
         .exists());
     assert_eq!(commits(root), 1);
+    assert_eq!(git_status(root), "", "dry run must write nothing");
+
+    // The human output states the skipped post-check too, not just JSON.
+    let (ok, text, _) = run_raw(&[
+        "record",
+        "add",
+        "--file",
+        &file.display().to_string(),
+        "--dry-run",
+        "--request-id",
+        rid,
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{text}");
+    assert!(text.contains("pre-check passed"), "{text}");
+    assert!(text.contains("post-check skipped"), "{text}");
 }
 
 /// #604: a `record add` whose post-check refuses must not leave the record
@@ -3981,6 +4117,10 @@ fn retract_dry_run_apply_request_id_and_find_output() {
     ]);
     assert!(ok, "{dry}");
     assert_eq!(dry["dry_run"], true, "{dry}");
+    // #770: `retract` is a repairing write, so apply skips the pre-check;
+    // the dry run skips it too. The post-write check still cannot run.
+    assert_eq!(dry["checks"]["pre"], "skipped", "{dry}");
+    assert_eq!(dry["checks"]["post"], "skipped", "{dry}");
     assert_eq!(commits(root), before, "dry run must not commit");
     assert!(!root.join("ledger/2026/11.cfd").exists());
 
