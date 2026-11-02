@@ -33,14 +33,17 @@ use confidant_core::id::{Prefix, RecordId};
 use confidant_core::ledger::{parse_duration_minutes, parse_strict_date};
 use confidant_core::packs::dir::read_pack_dir;
 use confidant_core::packs::lock::read_lockfile;
-use confidant_core::record::{main_record_path, Record, RecordKind};
-use confidant_core::schema::contract_schema;
+use confidant_core::record::{main_record_path_with, Record, RecordKind};
+use confidant_core::record_type::{RecordSchema, TypeRegistry};
+use confidant_core::schema::{contract_schema, record_types_json};
 use confidant_core::scope::{owner_labels, parse_pack_list, resolve_scope, PackScope};
 use confidant_core::write::{
     apply_write, apply_write_repairing, require_git_repo, FileChange, PendingWrite, WriteOptions,
     WriteOutcome,
 };
-use confidant_core::{check_vault, load_vault, search, search_for_operator, CheckOptions};
+use confidant_core::{
+    check_vault, load_vault, search, search_for_operator, CheckOptions, SpecVersion,
+};
 use serde_json::Value;
 
 /// Attach a `DomainError` fix hint to an `anyhow::Error`.
@@ -192,14 +195,16 @@ enum Command {
         #[command(subcommand)]
         action: PackAction,
     },
-    /// Context bundle for one person or org (honors no-ai).
+    /// Context bundle for one entity: a person, org, or declared entity type
+    /// (honors no-ai).
     ///
     /// Operator-only flag: `--for-operator` includes `no-ai` records the
     /// default (agent) allowlist hides. It is never passed by MCP.
     Context {
-        /// Opaque person or org id (p-… / o-…) or an exact person display
-        /// name (cleared people only; see `confidant resolve`). Org names are
-        /// not resolved by name in phase 1; use `find` for the o- id.
+        /// Opaque entity id (p-…, o-…, or a declared pack type id) or an
+        /// exact person display name (cleared people only; see `confidant
+        /// resolve`). Non-person names are not resolved by name; use `find`
+        /// for the id.
         #[arg(value_name = "ENTITY")]
         person: String,
         /// Strip private data: name, profile, bodies, edge endpoint names,
@@ -519,13 +524,15 @@ enum RecordAction {
     /// `no_ai` (`"true"`, `"notes"`, `"false"`). The resolved vault path
     /// stays in the JSON envelope (ADR-7).
     List {
-        /// Include `no-ai` records, read through the operator path (the same
-        /// mechanism as `record show --for-edit`).
+        /// Include `no-ai` records and orphaned pack-type records, read
+        /// through the operator path (the same mechanism as `record show
+        /// --for-edit`).
         #[arg(long)]
         for_operator: bool,
-        /// Record kind to list: all (default), person, org, or deal.
-        #[arg(long, value_enum, default_value_t = RosterKind::All)]
-        kind: RosterKind,
+        /// Record kind to list: all (default), person, org, deal, or a
+        /// declared pack type name.
+        #[arg(long, default_value = "all")]
+        kind: String,
     },
     /// Print one record's text, to prepare an edit.
     ///
@@ -585,37 +592,21 @@ impl Side {
     }
 }
 
-/// Record kinds `record list --kind` accepts (#558, #813).
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-pub(crate) enum RosterKind {
-    /// Every identity kind: person, org, and deal (the default).
-    All,
-    Person,
-    Org,
-    Deal,
-}
-
-impl RosterKind {
-    /// The core record kind this filter names; `None` means every identity
-    /// kind.
-    pub(crate) fn record_kind(self) -> Option<RecordKind> {
-        match self {
-            RosterKind::All => None,
-            RosterKind::Person => Some(RecordKind::Person),
-            RosterKind::Org => Some(RecordKind::Org),
-            RosterKind::Deal => Some(RecordKind::Deal),
-        }
-    }
-}
-
 #[derive(Subcommand, Debug)]
 enum NoteAction {
-    /// Create a note record under people/<person>/notes/.
+    /// Create a note record under people/<person>/notes/ or notes/<id>/note.md.
+    #[command(group(
+        clap::ArgGroup::new("note_subject").required(true).multiple(false)
+    ))]
     Add {
         /// Opaque person id (p-…) or an exact display name (cleared people
         /// only; see `confidant resolve`).
-        #[arg(long)]
-        person: String,
+        #[arg(long, group = "note_subject")]
+        person: Option<String>,
+        /// Opaque entity id (p-…, o-…, or a declared entity). Writes a
+        /// top-level note with `entity:` so it can attach to any entity.
+        #[arg(long, group = "note_subject")]
+        entity: Option<String>,
         /// Note date YYYY-MM-DD (default today).
         #[arg(long)]
         date: Option<String>,
@@ -1002,6 +993,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             match action {
                 NoteAction::Add {
                     person,
+                    entity,
                     date,
                     no_ai,
                     id,
@@ -1009,7 +1001,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 } => cmd_note_add(
                     &cli,
                     &root,
-                    person,
+                    person.as_deref(),
+                    entity.as_deref(),
                     date.clone(),
                     *no_ai,
                     id.as_deref(),
@@ -1072,7 +1065,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 RecordAction::Add { file } => cmd_record_add(&cli, &root, file),
                 RecordAction::Edit { id, file } => cmd_record_edit(&cli, &root, id, file),
                 RecordAction::List { for_operator, kind } => {
-                    cmd_record_list(&cli, &root, kind.record_kind(), *for_operator)
+                    cmd_record_list(&cli, &root, kind, *for_operator)
                 }
                 RecordAction::Show { id, for_edit } => cmd_record_show(&cli, &root, id, *for_edit),
                 RecordAction::Resolve {
@@ -3736,18 +3729,18 @@ fn cmd_import(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_note_add(
     cli: &Cli,
     root: &Path,
-    person_raw: &str,
+    person_raw: Option<&str>,
+    entity_raw: Option<&str>,
     date_raw: Option<String>,
     no_ai: bool,
     forced_id: Option<&str>,
     body_file: &Path,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
-    let person = resolve_person_arg(root, &vault, person_raw)?;
-    announce_resolved_person(cli, &person);
     let date = parse_date_arg(&date_raw)?;
     let body = std::fs::read_to_string(body_file).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
@@ -3755,6 +3748,45 @@ fn cmd_note_add(
             body_file.display()
         )))
     })?;
+    let (subject_id, subject_kind, subject_name) = match (person_raw, entity_raw) {
+        (Some(person_raw), None) => {
+            let person = resolve_person_arg(root, &vault, person_raw)?;
+            announce_resolved_person(cli, &person);
+            (
+                person.id.clone(),
+                "person",
+                Some(person.matched_name.clone()),
+            )
+        }
+        (None, Some(entity_raw)) => {
+            let id = RecordId::parse(entity_raw).map_err(|_| {
+                anyhow::Error::new(DomainError::usage(format!(
+                    "not an entity id: {entity_raw}"
+                )))
+            })?;
+            let Some(decl) = vault.type_registry().get_by_prefix(id.prefix()) else {
+                return Err(anyhow::Error::new(DomainError::invalid(format!(
+                    "no entity with id {entity_raw}"
+                ))));
+            };
+            if !decl.entity || !decl.enabled {
+                return Err(anyhow::Error::new(DomainError::invalid(format!(
+                    "type does not accept entity notes: {entity_raw}"
+                ))));
+            }
+            if !vault.records.contains_key(&id) {
+                return Err(anyhow::Error::new(DomainError::not_found(format!(
+                    "no record with id {id}"
+                ))));
+            }
+            (id, "entity", None)
+        }
+        _ => {
+            return Err(anyhow::Error::new(DomainError::usage(
+                "pass exactly one of --person or --entity",
+            )))
+        }
+    };
 
     // #611: the TUI passes the manifest's own note id so the reviewed
     // dry-run and the commit name the same note. Without `--id` the id is
@@ -3764,9 +3796,18 @@ fn cmd_note_add(
         None => RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
             .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?,
     };
-    let rel = PathBuf::from(format!("people/{}/notes/{nid}.md", person.id));
+    let rel = if subject_kind == "person" {
+        PathBuf::from(format!("people/{subject_id}/notes/{nid}.md"))
+    } else {
+        PathBuf::from(format!("notes/{nid}/note.md"))
+    };
+    let subject_key = if subject_kind == "person" {
+        "person"
+    } else {
+        "entity"
+    };
     let mut fields = BTreeMap::from([
-        ("person".to_owned(), person.id.to_string()),
+        (subject_key.to_owned(), subject_id.to_string()),
         ("date".to_owned(), date.to_string()),
     ]);
     if no_ai {
@@ -3783,10 +3824,8 @@ fn cmd_note_add(
         body_start_line: 0,
         field_lines: BTreeMap::new(),
     };
-    let canonical_request = format!(
-        "note-add/v1\nperson={}\ndate={date}\nno_ai={no_ai}\nbody={body}",
-        person.id
-    );
+    let canonical_request =
+        format!("note-add/v1\n{subject_key}={subject_id}\ndate={date}\nno_ai={no_ai}\nbody={body}");
     // A forced id must not overwrite an existing note. A genuine retry
     // (progress file lost after the commit) is recognized by its
     // request-id trailer, and apply_write reports it idempotent; only an
@@ -3803,7 +3842,7 @@ fn cmd_note_add(
                 path: rel.clone(),
                 contents: confidant_core::format_record(&rec),
             }],
-            summary: format!("note {} {nid}", person.id),
+            summary: format!("note {subject_id} {nid}"),
             canonical_request,
         },
         &write_options(cli),
@@ -3812,8 +3851,12 @@ fn cmd_note_add(
         "id": nid.to_string(),
         "path": rel.display().to_string(),
     });
-    if let Some(echo) = person.echo_json() {
-        extra["person"] = echo;
+    if subject_kind == "person" {
+        if let Some(name) = subject_name {
+            extra["person"] = serde_json::json!({"id": subject_id.to_string(), "name": name});
+        }
+    } else {
+        extra["entity"] = serde_json::json!(subject_id.to_string());
     }
     finish_write(cli, root, "note-add", outcome, extra)
 }
@@ -4098,6 +4141,17 @@ fn cmd_note_edit(
     )
 }
 
+/// Parse with the vault's spec and declared types. Writes use this so a 0.3
+/// vault can author edge `no-ai` and pack-type records; `require_declared`
+/// is true for `record add` and false for edits of an orphaned type.
+fn record_schema(vault: &confidant_core::Vault, require_declared: bool) -> RecordSchema<'_> {
+    RecordSchema {
+        spec: vault.spec_version().unwrap_or(SpecVersion::V02),
+        types: Some(vault.type_registry()),
+        require_declared,
+    }
+}
+
 fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     let text = std::fs::read_to_string(file).map_err(|e| {
@@ -4110,14 +4164,26 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "record.md".to_owned());
-    let rec = confidant_core::parse_record(&text, &provisional)
+    let schema = record_schema(&vault, true);
+    let rec = confidant_core::record::parse_record_with_schema(&text, &provisional, &schema)
         .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
     if rec.kind == RecordKind::Note {
         return Err(anyhow::Error::new(DomainError::usage(
             "record add does not create notes; use `confidant note add --body-file`",
         )));
     }
-    let rel = main_record_path(&rec)
+    if let Some(decl) = vault.type_registry().get(rec.kind.as_str()) {
+        if !decl.enabled {
+            return Err(anyhow::Error::new(
+                DomainError::invalid(format!(
+                    "type '{}' belongs to a disabled or removed pack",
+                    rec.kind.as_str()
+                ))
+                .with_fix("Enable the pack that declares this type, or remove the record"),
+            ));
+        }
+    }
+    let rel = main_record_path_with(&rec, Some(vault.type_registry()))
         .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
     if root.join(&rel).exists() {
         return Err(anyhow::Error::new(
@@ -4288,7 +4354,7 @@ pub(crate) fn reject_unsupported_prefix(id: &RecordId) -> anyhow::Result<()> {
 fn cmd_record_list(
     cli: &Cli,
     root: &Path,
-    kind: Option<RecordKind>,
+    kind: &str,
     for_operator: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = match load_vault_for_reads(root, cli.json, for_operator) {
@@ -4311,7 +4377,15 @@ fn cmd_record_list(
             return Ok(ExitCode::from(err.exit_code() as u8));
         }
     };
-    let roster = confidant_core::build_roster(&vault, kind, &scope, for_operator);
+    if !confidant_core::roster::is_roster_kind(&vault, kind) {
+        let err = DomainError::usage(format!(
+            "unknown record kind '{kind}'; use all, person, org, deal, or a declared type"
+        ));
+        print_error(cli.json, Some(&vault_path), &err)?;
+        return Ok(ExitCode::from(err.exit_code() as u8));
+    }
+    let filter = (kind != "all").then_some(kind);
+    let roster = confidant_core::build_roster(&vault, filter, &scope, for_operator);
     if cli.json {
         print_json(&ok_envelope(
             Some(&vault.root),
@@ -4329,18 +4403,23 @@ fn cmd_record_list(
                 "notes" => "\t[no-ai: notes]",
                 _ => "",
             };
+            let orphan = entry
+                .orphan
+                .as_deref()
+                .map(|reason| format!("\t[orphan: {reason}]"))
+                .unwrap_or_default();
             // Escape the name so a tab, newline, or terminal escape in a
             // display name cannot break the one-entry-per-line layout
             // (`escape_line` also neutralizes bidi/format characters).
             // `--json` is untouched: there the name is a JSON string.
             writeln!(
                 io::stdout(),
-                "{}\t{}{badge}",
+                "{}\t{}{badge}{orphan}",
                 entry.id,
                 confidant_core::packs::untrusted::escape_line(&entry.name)
             )?;
         }
-        let noun = if kind == Some(RecordKind::Person) {
+        let noun = if kind == "person" {
             "people"
         } else {
             "records"
@@ -4464,7 +4543,7 @@ fn cmd_record_resolve(
     // stays untouched, not the scratch dir. (#487 item 1.)
     sweep_stale_scratch(root);
     if show {
-        let sides = load_sides(root, &id)?;
+        let sides = load_sides(root, &vault, &id)?;
         let ours_text = String::from_utf8_lossy(&sides.ours_bytes);
         let theirs_text = String::from_utf8_lossy(&sides.theirs_bytes);
         if cli.json {
@@ -4489,7 +4568,7 @@ fn cmd_record_resolve(
         // #454: install one side byte for byte, stage it, print the next
         // git step. Both sides were read by `load_sides`, so the
         // operator has seen what they discard (CD7).
-        let sides = load_sides(root, &id)?;
+        let sides = load_sides(root, &vault, &id)?;
         // #465: `--dry-run` verifies both sides are readable (same
         // CD7 read the real write needs) but writes nothing.
         if cli.dry_run {
@@ -4537,7 +4616,7 @@ fn cmd_record_resolve(
         // #455: hand-merge from a file outside the vault. The operator's
         // file is validated like `record edit --file` and written
         // through the same path; it is staged, never committed (CD6).
-        let sides = load_sides(root, &id)?;
+        let sides = load_sides(root, &vault, &id)?;
         // CD5: refuse ANY path inside the vault tree, no `.confidant/`
         // exception, so a plaintext merge file cannot be committed by
         // accident.
@@ -4555,6 +4634,10 @@ fn cmd_record_resolve(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "record.md".to_owned());
+        let existing_path = vault
+            .records
+            .get(&id)
+            .map(|record| PathBuf::from(&record.path));
         let prepared = prepare_record_write(
             root,
             PrepareSpec {
@@ -4565,6 +4648,9 @@ fn cmd_record_resolve(
                 summary: format!("record-resolve {id}"),
                 canonical_prefix: "record-resolve/v1",
                 allow_conflict: true,
+                spec: vault.spec_version().unwrap_or(SpecVersion::V02),
+                types: Some(vault.type_registry()),
+                existing_path: existing_path.as_deref(),
             },
         )?;
         // Defense in depth: the merged record must name the conflicted
@@ -4599,7 +4685,7 @@ fn cmd_record_resolve(
         // #465: `--dry-run --edit` creates no scratch and installs nothing;
         // `load_sides` is the same conflict read the real edit would do.
         if cli.dry_run {
-            let sides = load_sides(root, &id)?;
+            let sides = load_sides(root, &vault, &id)?;
             return print_resolve_dry_run(
                 cli,
                 root,
@@ -4747,7 +4833,7 @@ fn cmd_resolve_edit(
     id: &RecordId,
     id_raw: &str,
 ) -> anyhow::Result<ExitCode> {
-    let sides = load_sides(root, id)?;
+    let sides = load_sides(root, _vault, id)?;
     // Fail fast if no editor is configured, before creating any scratch
     // files (which would hold plaintext).
     resolve_editor()?;
@@ -4767,6 +4853,10 @@ fn cmd_resolve_edit(
         &format!("the merged record from {}", merged_path.display()),
     )
     .map_err(anyhow::Error::new)?;
+    let existing_path = _vault
+        .records
+        .get(id)
+        .map(|record| PathBuf::from(&record.path));
     let prepared = prepare_record_write(
         root,
         PrepareSpec {
@@ -4777,6 +4867,9 @@ fn cmd_resolve_edit(
             summary: format!("record-resolve {id}"),
             canonical_prefix: "record-resolve/v1",
             allow_conflict: true,
+            spec: _vault.spec_version().unwrap_or(SpecVersion::V02),
+            types: Some(_vault.type_registry()),
+            existing_path: existing_path.as_deref(),
         },
     )?;
     if prepared.rel != sides.path {
@@ -4812,6 +4905,13 @@ pub(crate) struct PrepareSpec<'a> {
     /// expects them. The check runs before the no-ai restamp planning,
     /// which cannot read a conflicted file (#412 Q6).
     pub allow_conflict: bool,
+    /// Vault spec for edge `no-ai` and other format-version rules.
+    pub spec: SpecVersion,
+    /// Declared types for pack-type records.
+    pub types: Option<&'a TypeRegistry>,
+    /// Existing path, used to edit an orphan/retired type whose declaration
+    /// is no longer in the registry.
+    pub existing_path: Option<&'a Path>,
 }
 
 /// The validated record and its planned write, shared by `record edit` and
@@ -4856,9 +4956,20 @@ fn prepare_record_write(root: &Path, spec: PrepareSpec<'_>) -> anyhow::Result<Pr
         summary,
         canonical_prefix,
         allow_conflict,
+        spec,
+        types,
+        existing_path,
     } = spec;
-    let rec = confidant_core::parse_record(text, provisional)
-        .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
+    let rec = confidant_core::record::parse_record_with_schema(
+        text,
+        provisional,
+        &RecordSchema {
+            spec,
+            types,
+            require_declared: false,
+        },
+    )
+    .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
     if rec.id != *id {
         return Err(anyhow::Error::new(
             DomainError::invalid(format!("the file's id is {}, not {id_raw}", rec.id))
@@ -4904,8 +5015,18 @@ fn prepare_record_write(root: &Path, spec: PrepareSpec<'_>) -> anyhow::Result<Pr
             }
         }
     }
-    let rel = main_record_path(&rec)
-        .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
+    let rel = match main_record_path_with(&rec, types) {
+        Ok(path) => path,
+        Err(err) => {
+            if let Some(existing) = existing_path {
+                existing.to_path_buf()
+            } else {
+                return Err(anyhow::Error::new(
+                    DomainError::invalid(err.message).with_fix(err.fix),
+                ));
+            }
+        }
+    };
     if !root.join(&rel).exists() {
         return Err(anyhow::Error::new(
             DomainError::not_found(format!("no record file at {}", rel.display()))
@@ -4977,6 +5098,10 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
     // Shared validation + write planning (#455). The fail-closed ladder
     // below is edit-specific: the resolve path already verified the
     // conflict and read both sides via `load_sides` (CD7).
+    let existing_path = vault
+        .records
+        .get(&id)
+        .map(|record| PathBuf::from(&record.path));
     let prepared = prepare_record_write(
         root,
         PrepareSpec {
@@ -4987,6 +5112,9 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
             summary: format!("record {id}"),
             canonical_prefix: "record-edit/v1",
             allow_conflict: false,
+            spec: vault.spec_version().unwrap_or(SpecVersion::V02),
+            types: Some(vault.type_registry()),
+            existing_path: existing_path.as_deref(),
         },
     )?;
     let rec = &prepared.rec;
@@ -5054,7 +5182,7 @@ fn cmd_context(
         Some(b) => b,
         None => {
             return Err(anyhow::Error::new(DomainError::not_found(format!(
-                "no person or org with id {person_raw}"
+                "no entity with id {person_raw}"
             )))
             .context("use `confidant find <name>` to look up the id"));
         }
@@ -8157,7 +8285,13 @@ fn cmd_init(cli: &Cli, root: &Path, scaffold: Option<Scaffold>) -> anyhow::Resul
 }
 
 fn cmd_schema(cli: &Cli, vault: Option<&Path>) -> anyhow::Result<ExitCode> {
-    let schema = contract_schema();
+    let mut schema = contract_schema();
+    if let Some(root) = vault {
+        let loaded = load_vault(root).map_err(anyhow::Error::new)?;
+        let (scope, _) =
+            resolve_cli_scope(&loaded, cli.packs.as_deref()).map_err(anyhow::Error::new)?;
+        schema["record_types"] = record_types_json(Some(&loaded), Some(&scope));
+    }
     if cli.json {
         print_json(&ok_envelope(vault, serde_json::json!({"contract": schema})))?;
     } else {
@@ -9158,13 +9292,22 @@ pub(crate) struct LoadedSides {
 ///
 /// The file path is derived from the id (never trusting a caller-supplied
 /// path). Both sides must parse as records naming `id` with equal `type`.
-fn load_sides(root: &Path, id: &RecordId) -> anyhow::Result<LoadedSides> {
+fn load_sides(
+    root: &Path,
+    vault: &confidant_core::Vault,
+    id: &RecordId,
+) -> anyhow::Result<LoadedSides> {
     reject_unsupported_prefix(id)?;
-    let rel = main_path_for(id).ok_or_else(|| {
-        anyhow::Error::new(DomainError::usage(format!(
-            "record resolve does not handle ids like {id}"
-        )))
-    })?;
+    let rel = vault
+        .records
+        .get(id)
+        .map(|record| PathBuf::from(&record.path))
+        .or_else(|| main_path_for(id))
+        .ok_or_else(|| {
+            anyhow::Error::new(DomainError::usage(format!(
+                "record resolve does not handle ids like {id}"
+            )))
+        })?;
     let bytes = std::fs::read(root.join(&rel)).map_err(|_| {
         anyhow::Error::new(DomainError::not_found(format!("no record with id {id}")))
             .context("use `confidant find <name>` to look up the id")
@@ -9187,8 +9330,9 @@ fn load_sides(root: &Path, id: &RecordId) -> anyhow::Result<LoadedSides> {
             rel.display()
         )))
     })?;
-    let ours = parse_side("ours", &sides.ours, &rel, id)?;
-    let theirs = parse_side("theirs", &sides.theirs, &rel, id)?;
+    let schema = record_schema(vault, false);
+    let ours = parse_side("ours", &sides.ours, &rel, id, &schema)?;
+    let theirs = parse_side("theirs", &sides.theirs, &rel, id, &schema)?;
     if ours.kind != theirs.kind {
         return Err(anyhow::Error::new(DomainError::invalid(format!(
             "the two sides of {} have different record types",
@@ -9206,14 +9350,22 @@ fn load_sides(root: &Path, id: &RecordId) -> anyhow::Result<LoadedSides> {
 }
 
 /// Parse one reconstructed side as a record naming `id`.
-fn parse_side(side: &str, text: &str, rel: &Path, id: &RecordId) -> anyhow::Result<Record> {
-    let rec = confidant_core::parse_record(text, &rel.display().to_string()).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "the {side} side of {} is not a readable record: {}",
-            rel.display(),
-            e.message
-        )))
-    })?;
+fn parse_side(
+    side: &str,
+    text: &str,
+    rel: &Path,
+    id: &RecordId,
+    schema: &RecordSchema<'_>,
+) -> anyhow::Result<Record> {
+    let rec =
+        confidant_core::record::parse_record_with_schema(text, &rel.display().to_string(), schema)
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "the {side} side of {} is not a readable record: {}",
+                    rel.display(),
+                    e.message
+                )))
+            })?;
     if rec.id != *id {
         return Err(anyhow::Error::new(DomainError::invalid(format!(
             "the {side} side of {} holds a different record ({})",

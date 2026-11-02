@@ -634,6 +634,21 @@ mod tests {
         assert_eq!(plain.no_ai, None);
     }
 
+    /// #814: the roster schema widened to dynamic pack type names; the TUI
+    /// ignores `orphan`, and People keeps requesting `--kind person` only.
+    #[test]
+    fn roster_accepts_pack_type_names_without_changing_people() {
+        let roster: Roster = serde_json::from_str(
+            r#"{"kind": "place", "for_operator": true, "scope": ["place-pack@0.1"],
+                "records": [{"id": "pl-1", "name": "Example Studio", "no_ai": "false",
+                             "kind": "place", "orphan": "removed"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(roster.kind, "place");
+        assert_eq!(roster.records[0].kind, "place");
+        assert_eq!(roster.records[0].name, "Example Studio");
+    }
+
     #[test]
     fn badge_matches_cli_human_output() {
         assert_eq!(NoAiMode::False.badge(), None);

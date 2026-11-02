@@ -663,7 +663,7 @@ fn context_deal_is_not_found() {
         v["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("no person or org"),
+            .contains("no entity"),
         "{v}"
     );
 }
@@ -2421,6 +2421,16 @@ fn pack_add_yes_dry_run_writes_nothing() {
 #[test]
 fn pack_init_round_trip_review_install_and_update() {
     let vault = git_vault();
+    // The scaffold is a v3 manifest and requires vault spec 0.3.
+    let config_path = vault.path().join("confidant.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        config.replace("spec = \"0.1\"", "spec = \"0.3\""),
+    )
+    .unwrap();
+    git(vault.path(), &["add", "confidant.toml"]);
+    git(vault.path(), &["commit", "-q", "--amend", "--no-edit"]);
     let parent = tempfile::tempdir().unwrap();
     let source = parent.path().join("example-local");
 
@@ -4268,6 +4278,69 @@ fn record_list_kind_filters() {
     assert_eq!(all["kind"], "all");
     assert_eq!(all["kinds"], serde_json::json!(["person", "org", "deal"]));
     assert_eq!(roster_names(&all), vec!["Example Deal", "Example Org"]);
+}
+
+#[test]
+fn record_list_shows_orphan_badges_and_rejects_non_roster_kinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.3\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n[[retired_types]]\nname = \"place\"\nid_prefix = \"pl\"\ncollection = \"places\"\nmain_file = \"place.md\"\nentity = true\nperson_like = false\nno_ai = \"full\"\nroster = true\nremoved_pack = \"place-pack@0.1\"\n",
+    )
+    .unwrap();
+    let place = "pl-01J9Z3K4QF0000000000000001";
+    std::fs::create_dir_all(root.join("places").join(place)).unwrap();
+    std::fs::write(
+        root.join("places").join(place).join("place.md"),
+        format!("---\nid: {place}\ntype: place\nname: Example Studio\n---\n"),
+    )
+    .unwrap();
+
+    // The agent path hides the retired type; the operator path shows it
+    // with an orphan badge.
+    let agent = run_json(&["record", "list", "--kind", "place"], root);
+    assert!(agent["records"].as_array().unwrap().is_empty(), "{agent}");
+    let operator = run_json(
+        &["record", "list", "--kind", "place", "--for-operator"],
+        root,
+    );
+    assert_eq!(operator["records"][0]["kind"], "place");
+    assert_eq!(operator["records"][0]["orphan"], "removed");
+    let human = Command::new(bin())
+        .args([
+            "record",
+            "list",
+            "--kind",
+            "place",
+            "--for-operator",
+            "--no-input",
+            "--vault",
+        ])
+        .arg(root)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("[orphan: removed]"), "{text}");
+
+    for kind in ["note", "interaction", "edge", "nonexistent"] {
+        let out = Command::new(bin())
+            .args([
+                "record",
+                "list",
+                "--kind",
+                kind,
+                "--json",
+                "--no-input",
+                "--vault",
+            ])
+            .arg(root)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{kind}: {out:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["error"]["code"], "usage_error", "{kind}: {v}");
+    }
 }
 
 #[test]

@@ -1,6 +1,7 @@
-//! `context <id>`: one JSON bundle of everything the vault knows about a
-//! person or an org (#813) — profile, notes, interactions, edges,
-//! pack-derived facts, aliases.
+//! `context <id>`: one JSON bundle of everything the vault knows about an
+//! entity (#813, #814) — a core person or org, or a record of a
+//! pack-declared type with `entity = true`: profile, notes, interactions,
+//! edges, pack-derived facts, aliases.
 //!
 //! Privacy: PII (name, profile body, note and interaction bodies, the other
 //! endpoint's name) is shown only for records in the §12 cleared set
@@ -184,7 +185,7 @@ pub struct InteractionView {
 // is grouped by pack in PersonContext::packs; a pack's `ledger-sessions`
 // view is that pack's entry in the map.
 
-/// The full bundle returned by `context` for a person or org (#813).
+/// The full bundle returned by `context` for an entity (#813, #814).
 #[derive(Clone, Debug, Serialize)]
 pub struct PersonContext {
     /// Deprecated person-only alias, present only for a person target.
@@ -275,17 +276,42 @@ pub fn build_context(
     for_operator: bool,
 ) -> Option<PersonContext> {
     let record = vault.records.get(target)?;
-    let is_person = match record.kind {
-        RecordKind::Person => true,
-        RecordKind::Org => false,
-        _ => return None,
-    }; // §12 allowlist. `cleared` is a fixpoint: a cleared id implies all of
-       // its merge-group members are cleared, so `cleared.contains` covers the
-       // "person AND every merge-group member" rule with one lookup. The
-       // operator variant ignores `no-ai` (#572) so an operator-only read
-       // surfaces records the agent path hides. `hidden_by_no_ai` is the
-       // operator-minus-agent difference: the records that are hidden *only*
-       // because of `no-ai`, which each view badges.
+    let decl = vault.type_registry().get(record.kind.as_str())?;
+    if !decl.entity {
+        return None;
+    }
+    // A disabled, retired, or undeclared pack type is an operator-only
+    // bundle; the agent path fails closed rather than revealing an entity
+    // that is not in the enabled type vocabulary.
+    if !for_operator && !decl.enabled {
+        return None;
+    }
+    // The type's owner must be in the read scope. Core types are always
+    // visible; a retired type is visible only to an unscoped operator read.
+    match decl.owner {
+        crate::record_type::TypeOwner::Core => {}
+        crate::record_type::TypeOwner::Pack(name) => {
+            if let PackScope::Only(packs) = scope {
+                if !packs.contains(name) {
+                    return None;
+                }
+            }
+        }
+        crate::record_type::TypeOwner::Retired(_) => {
+            if !matches!(scope, PackScope::All) {
+                return None;
+            }
+        }
+    }
+    let is_person = record.kind == RecordKind::Person;
+    let is_person_like = decl.person_like;
+    // §12 allowlist. `cleared` is a fixpoint: a cleared id implies all
+    // of its merge-group members are cleared, so `cleared.contains` covers the
+    // "person AND every merge-group member" rule with one lookup. The
+    // operator variant ignores `no-ai` (#572) so an operator-only read
+    // surfaces records the agent path hides. `hidden_by_no_ai` is the
+    // operator-minus-agent difference: the records that are hidden *only*
+    // because of `no-ai`, which each view badges.
     let agent_cleared = cleared_record_ids(vault);
     let operator_cleared = for_operator.then(|| cleared_record_ids_for_operator(vault));
     let cleared: &HashSet<RecordId> = operator_cleared.as_ref().unwrap_or(&agent_cleared);
@@ -327,13 +353,19 @@ pub fn build_context(
     let linkage = note_linkage_owners(vault, &enabled);
     let scope_names = scope.names(&enabled);
 
-    // Pack state is the whole story for a person: each pack's `[context]`
-    // view is its entry in `packs` (ADR-7, #797). Pack views are
-    // person-keyed, so an org bundle has none.
+    // Pack state is the whole story for a person-like entity: each pack's
+    // `[context]` view is its entry in `packs` (ADR-7, #797). Pack views are
+    // person-keyed, so a non-person-like bundle (org, plain pack type) has
+    // none.
     let mut packs: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-    if is_person {
+    if is_person_like {
         let snapshots = pack_snapshots(vault, as_of);
         for (pack, state) in &snapshots {
+            // The built-in personal view is keyed on core person fields; a
+            // person-like pack type sees only its own pack's view.
+            if !is_person && pack.name().split('@').next() == Some("personal") {
+                continue;
+            }
             // #178: a scoped call sees only its packs' views.
             if !scope.allows(&[OwnerKey::Pack(pack.name())].into_iter().collect()) {
                 continue;
@@ -370,11 +402,11 @@ pub fn build_context(
             if r.kind != RecordKind::Note || !cleared.contains(&r.id) {
                 return false;
             }
-            let attached = if is_person {
-                r.path.starts_with(&person_dir) || r.person().as_ref() == Some(&canonical)
-            } else {
-                r.org().as_ref() == Some(&canonical)
-            };
+            let attached = r.entity().as_ref() == Some(&canonical)
+                || (is_person
+                    && (r.path.starts_with(&person_dir)
+                        || r.person().as_ref() == Some(&canonical)))
+                || (!is_person && r.org().as_ref() == Some(&canonical));
             attached && scope.allows(&record_owners(r, &linkage, &enabled, spec))
         })
         .map(|r| NoteView {
@@ -393,11 +425,9 @@ pub fn build_context(
             if r.kind != RecordKind::Interaction || !cleared.contains(&r.id) {
                 return false;
             }
-            let attached = if is_person {
-                r.person().as_ref() == Some(&canonical)
-            } else {
-                r.org().as_ref() == Some(&canonical)
-            };
+            let attached = r.entity().as_ref() == Some(&canonical)
+                || (is_person && r.person().as_ref() == Some(&canonical))
+                || (!is_person && r.org().as_ref() == Some(&canonical));
             attached && scope.allows(&record_owners(r, &linkage, &enabled, spec))
         })
         .map(|r| InteractionView {
@@ -425,7 +455,7 @@ pub fn build_context(
     }
 
     let mut touchpoints: Vec<TouchpointView> = Vec::new();
-    if is_person {
+    if is_person_like {
         // #179: mirrored touchpoints — the participant's own `touch` lines.
         // Like aliases, these are ledger-derived metadata (not record PII),
         // so they carry no cleared-set gate; scope-filtered by verb ownership

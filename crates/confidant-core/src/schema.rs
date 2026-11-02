@@ -7,6 +7,56 @@
 
 use serde_json::{json, Value};
 
+use crate::record_type::{TypeOwner, CORE_TYPES};
+use crate::scope::PackScope;
+use crate::vault::Vault;
+
+/// Resolved record types for `schema --json`. Without a vault this is the
+/// six core types; with one it follows the same scope rules as `find`/
+/// `context` (core always, pack types in scope, retired only unscoped).
+pub fn record_types_json(vault: Option<&Vault>, scope: Option<&PackScope>) -> Value {
+    let mut out = Vec::new();
+    let types: Vec<&crate::record_type::RecordTypeDecl> = match vault {
+        Some(vault) => vault.type_registry().all().collect(),
+        None => CORE_TYPES.iter().collect(),
+    };
+    for decl in types {
+        if vault.is_some() {
+            let in_scope = match decl.owner {
+                TypeOwner::Core => true,
+                TypeOwner::Pack(name) => match scope {
+                    None | Some(PackScope::All) => true,
+                    Some(PackScope::Only(packs)) => packs.contains(name),
+                },
+                TypeOwner::Retired(_) => matches!(scope, None | Some(PackScope::All)),
+            };
+            if !in_scope {
+                continue;
+            }
+        }
+        out.push(json!({
+            "name": decl.name,
+            "id_prefix": decl.id_prefix,
+            "collection": decl.collection,
+            "main_file": decl.main_file,
+            "entity": decl.entity,
+            "person_like": decl.person_like,
+            "no_ai": decl.no_ai.as_str(),
+            "roster": decl.roster,
+            "owner": match decl.owner {
+                TypeOwner::Core => "core",
+                TypeOwner::Pack(name) => name,
+                TypeOwner::Retired(_) => "removed",
+            },
+            "enabled": decl.enabled,
+            "retired": decl.retired,
+            "required_fields": decl.required_fields,
+            "optional_fields": decl.optional_fields,
+        }));
+    }
+    Value::Array(out)
+}
+
 /// The full contract schema document.
 pub fn contract_schema() -> Value {
     json!({
@@ -15,9 +65,10 @@ pub fn contract_schema() -> Value {
         "title": "Confidant agent contract",
         "description": "Machine-readable shapes for every `confidant --json` output. Callers classify by `code`, never by message text.",
         "type": "object",
-        "required": ["schema_version", "shapes"],
+        "required": ["schema_version", "shapes", "record_types"],
         "properties": {
             "schema_version": {"type": "string", "const": "1"},
+            "record_types": record_types_json(None, None),
             "shapes": {
                 "type": "object",
                 "required": ["error", "check", "find", "allowlist", "write", "context", "roster", "doctor", "sync", "help"],
@@ -36,6 +87,27 @@ pub fn contract_schema() -> Value {
             }
         },
         "$defs": {
+            "recordType": {
+                "title": "record type",
+                "description": "One resolved record type (core or pack-declared).",
+                "type": "object",
+                "required": ["name", "id_prefix", "collection", "main_file", "entity", "person_like", "no_ai", "roster", "owner", "enabled", "retired"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "id_prefix": {"type": "string"},
+                    "collection": {"type": "string"},
+                    "main_file": {"type": "string"},
+                    "entity": {"type": "boolean"},
+                    "person_like": {"type": "boolean"},
+                    "no_ai": {"type": "string", "enum": ["none", "full", "notes"]},
+                    "roster": {"type": "boolean"},
+                    "owner": {"type": "string", "description": "core or a pack name@version."},
+                    "enabled": {"type": "boolean"},
+                    "retired": {"type": "boolean"},
+                    "required_fields": {"type": "array", "items": {"type": "string"}},
+                    "optional_fields": {"type": "array", "items": {"type": "string"}}
+                }
+            },
             "error": {
                 "title": "Error envelope",
                 "description": "Every failure prints this on stdout in `--json` mode. `error.code` is stable; `error.message` is human-only.",
@@ -63,12 +135,12 @@ pub fn contract_schema() -> Value {
             },
             "entityView": {
                 "title": "context entity",
-                "description": "The context target: a person or an org (#813). `no_ai` is a boolean on the agent path; the operator-only path reports the tri-state string instead.",
+                "description": "The context target: a core person/org or a pack-declared entity (#813, #814). `no_ai` is a boolean on the agent path; the operator-only path reports the tri-state string instead.",
                 "type": "object",
                 "required": ["id", "kind", "no_ai"],
                 "properties": {
                     "id": {"type": "string"},
-                    "kind": {"type": "string", "enum": ["person", "org"]},
+                    "kind": {"type": "string", "description": "A core type (person, org) or a declared pack type name."},
                     "name": {"type": ["string", "null"]},
                     "no_ai": {
                         "type": ["boolean", "string"],
@@ -91,7 +163,7 @@ pub fn contract_schema() -> Value {
                         "required": ["id", "kind"],
                         "properties": {
                             "id": {"type": "string"},
-                            "kind": {"type": "string", "enum": ["person", "org"]},
+                            "kind": {"type": "string", "description": "A core type (person, org) or a declared pack type name."},
                             "name": {"type": ["string", "null"]},
                             "no_ai": {
                                 "type": ["string", "boolean"],
@@ -249,7 +321,7 @@ pub fn contract_schema() -> Value {
             },
             "contextBundle": {
                 "title": "context --json",
-                "description": "Everything the vault knows about one entity: a person or an org (#813). `entity` is the canonical target view; `person` is a deprecated person-only alias, present only when the target is a person. PII fields (name/profile/bodies/edge endpoint names) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions/edges are omitted entirely, never nulled. An edge is visible only when both endpoints are cleared and the edge itself is not no-ai: true, so a no-ai endpoint or no-ai edge omits the edge from the other endpoint's bundle with no count or hint; an operator bundle badges it instead. --exclude-private strips PII regardless; ledger facts and opaque edge ids/kinds/dates are kept. The `packs[\"personal@0.2\"]` entry (core: context::personal) carries the personal pack's declared fields (birthday, dates, relationship, location, emails, phones, links, tags, …) plus cadence_days, cadence_never, snooze_until, last_touch, days_since_touch, overdue and recent_touches. cadence_never is true only when the declared cadence is the literal `never` (and is omitted otherwise), so it distinguishes a deliberate never-nudge from no cadence set: both omit cadence_days. --exclude-private removes the PII fields by name; title, company, cadence_days and snooze_until stay. For a person outside the cleared set (no-ai) the declared fields are denied by default: only snooze_until and the derived cadence/touch metadata (cadence_days, cadence_never, last_touch, days_since_touch, overdue, recent_touches) remain. An org bundle has empty `touchpoints`, `aliases`, and `packs`; its notes/interactions are those linked by `org:`.",
+                "description": "Everything the vault knows about one entity: a core person or org, or a record of a pack-declared type with entity = true (#813, #814). `entity` is the canonical target view; `person` is a deprecated person-only alias, present only when the target is a core person. PII fields (name/profile/bodies/edge endpoint names) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions/edges are omitted entirely, never nulled. An edge is visible only when both endpoints are cleared and the edge itself is not no-ai: true, so a no-ai endpoint or no-ai edge omits the edge from the other endpoint's bundle with no count or hint; an operator bundle badges it instead. --exclude-private strips PII regardless; ledger facts and opaque edge ids/kinds/dates are kept. The `packs[\"personal@0.2\"]` entry (core: context::personal) carries the personal pack's declared fields (birthday, dates, relationship, location, emails, phones, links, tags, …) plus cadence_days, cadence_never, snooze_until, last_touch, days_since_touch, overdue and recent_touches. cadence_never is true only when the declared cadence is the literal `never` (and is omitted otherwise), so it distinguishes a deliberate never-nudge from no cadence set: both omit cadence_days. --exclude-private removes the PII fields by name; title, company, cadence_days and snooze_until stay. For a person outside the cleared set (no-ai) the declared fields are denied by default: only snooze_until and the derived cadence/touch metadata (cadence_days, cadence_never, last_touch, days_since_touch, overdue, recent_touches) remain. A non-person-like bundle (an org, or a pack type without person_like) has empty `touchpoints`, `aliases`, and `packs`; its notes/interactions are those linked by `org:` or `entity:`. A pack-declared type is a target only when it is enabled and its declaring pack is in scope; a disabled, retired, or undeclared type is operator-only.",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "entity", "notes", "interactions", "edges", "packs", "aliases"],
                 "properties": {
@@ -303,25 +375,25 @@ pub fn contract_schema() -> Value {
                     },
                     "packs": {
                         "type": "object",
-                        "description": "Pack state grouped by pack name (the built-in personal pack is \"personal@0.2\"; an enabled external pack may add its own view). Each pack decides its own view shape. Empty for an org target."
+                        "description": "Pack state grouped by pack name (the built-in personal pack is \"personal@0.2\"; an enabled external pack may add its own view). Each pack decides its own view shape. Empty for an org or a non-person-like target; a person-like pack type sees its own pack's view, not the core personal view."
                     },
                     "scope": {"type": "array", "description": "Resolved pack scope that filtered the bundle (issue #178); all enabled packs when unscoped.", "items": {"type": "string"}},
-                    "aliases": {"type": "array", "items": {"type": "string"}, "description": "Contact values from the person's front-matter emails, phones, and handles (empty under --exclude-private and for uncleared records)."}
+                    "aliases": {"type": "array", "items": {"type": "string"}, "description": "Contact values from a core person's front-matter emails, phones, and handles (empty for pack types, under --exclude-private, and for uncleared records)."}
                 }
             },
             "rosterResponse": {
                 "title": "record list --json",
-                "description": "Operator-only roster (#558, #813). `record list` is never exposed over MCP. `kind` is the requested filter; the default is `all`, which covers the three identity kinds person, org, and deal (deals are listable but never edge endpoints). `kinds` lists the kinds included by this call. Without --for-operator entries are the section-12 cleared set; with it, records hidden only by their own no-ai are added and every entry carries the tri-state no_ai string the #559 ruling specifies.",
+                "description": "Operator-only roster (#558, #813, #814). `record list` is never exposed over MCP. `kind` is the requested filter; the default is `all`, which covers the core identity kinds plus declared types with roster = true. `kinds` lists the kinds included by this call. Without --for-operator entries are the section-12 cleared set; with it, records hidden only by their own no-ai and orphaned types are added and every entry carries the tri-state no_ai string the #559 ruling specifies.",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "kind", "kinds", "for_operator", "records", "scope"],
                 "properties": {
                     "ok": {"type": "boolean", "const": true},
                     "schema_version": {"type": "string"},
                     "vault": {"type": "string"},
-                    "kind": {"type": "string", "enum": ["all", "person", "org", "deal"]},
+                    "kind": {"type": "string", "description": "all, a core identity kind, or a declared/known type name."},
                     "kinds": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["person", "org", "deal"]}
+                        "items": {"type": "string"}
                     },
                     "for_operator": {"type": "boolean"},
                     "records": {
@@ -339,7 +411,8 @@ pub fn contract_schema() -> Value {
                     "id": {"type": "string"},
                     "name": {"type": "string", "description": "Display name, falling back to the opaque id."},
                     "no_ai": {"type": "string", "enum": ["true", "notes", "false"]},
-                    "kind": {"type": "string", "enum": ["person", "org", "deal"]}
+                    "kind": {"type": "string"},
+                    "orphan": {"type": "string", "description": "Operator path only: the disabled pack name, removed, or unknown."}
                 }
             },
             "doctorReport": {
@@ -450,14 +523,17 @@ mod tests {
             context["properties"]["edges"]["items"]["$ref"],
             "#/$defs/edgeView"
         );
-        assert!(s["$defs"]["entityView"]["properties"]["kind"]["enum"].is_array());
+        assert_eq!(
+            s["$defs"]["entityView"]["properties"]["kind"]["type"],
+            "string"
+        );
         assert!(s["$defs"]["edgeView"]["properties"]["direction"]["enum"].is_array());
         assert!(s["$defs"]["edgeView"]["properties"]["no_ai"].is_object());
         assert_eq!(s["properties"]["schema_version"]["const"], "1");
     }
 
-    /// #813: the roster shape documents the `all` default and the three
-    /// identity kinds; `record list` stays an operator-only command.
+    /// #813/#814: the roster shape documents the `all` default, dynamic
+    /// kind names, and orphan badges; `record list` stays operator-only.
     #[test]
     fn roster_schema_has_all_default_and_identity_kinds() {
         let s = contract_schema();
@@ -475,16 +551,37 @@ mod tests {
         for field in ["kind", "kinds", "records", "for_operator"] {
             assert!(required.contains(&field), "{field}: {required:?}");
         }
-        assert!(roster["properties"]["kind"]["enum"]
+        assert_eq!(roster["properties"]["kind"]["type"], "string");
+        assert_eq!(
+            s["$defs"]["rosterEntry"]["properties"]["kind"]["type"],
+            "string"
+        );
+        assert!(s["$defs"]["rosterEntry"]["properties"]["orphan"].is_object());
+        assert!(s["properties"]["record_types"].is_array());
+        assert_eq!(
+            s["$defs"]["recordType"]["properties"]["enabled"]["type"],
+            "boolean"
+        );
+        assert_eq!(s["properties"]["schema_version"]["const"], "1");
+    }
+
+    #[test]
+    fn record_types_without_a_vault_are_the_core_six() {
+        let types = record_types_json(None, None);
+        let names: Vec<&str> = types
             .as_array()
             .unwrap()
             .iter()
-            .any(|value| value == "all"));
+            .map(|decl| decl["name"].as_str().unwrap())
+            .collect();
+        for core in ["person", "org", "deal", "interaction", "note", "edge"] {
+            assert!(names.contains(&core), "{names:?}");
+        }
+        assert!(!names.contains(&"place"));
         assert_eq!(
-            s["$defs"]["rosterEntry"]["properties"]["kind"]["enum"],
-            serde_json::json!(["person", "org", "deal"])
+            types[0]["owner"], "core",
+            "the static document describes core ownership"
         );
-        assert_eq!(s["properties"]["schema_version"]["const"], "1");
     }
 
     #[test]

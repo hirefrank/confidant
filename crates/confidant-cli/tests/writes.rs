@@ -1289,6 +1289,401 @@ fn note_edit_refuses_a_person_that_does_not_match_the_path() {
 // record add
 // ---------------------------------------------------------------------------
 
+const PLACE_PERSON: &str = "p-01M3TC5H00MPJG000000000000";
+const PLACE_ORG: &str = "o-01M3TC5H00MPJG000000000001";
+const PLACE: &str = "pl-01M3TC5H00MPJG000000000002";
+const PLACE_NOTE: &str = "n-01M3TC5H00MPJG000000000003";
+
+/// Vendor the checked-in place pack and pin it, as `pack add` would. The
+/// place pack declares one entity type (`place`) for spec 0.3.
+fn install_place_pack(vault: &Path) {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/packs/place-pack");
+    let dst = vault.join("packs/place-pack@0.1");
+    std::fs::create_dir_all(&dst).unwrap();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+    }
+    let hash = confidant_core::packs::dir::read_pack_dir(&dst)
+        .unwrap()
+        .hash;
+    std::fs::write(
+        vault.join("confidant.lock"),
+        format!(
+            "lock_version = 1\n\n[[pack]]\nname = \"place-pack\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn make_place_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    install_place_pack(root);
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.3\"\npacks = [\"place-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    add_person(root, PLACE_PERSON, "Dana Example", "");
+    dir
+}
+
+#[test]
+fn place_pack_end_to_end_record_add_list_context_note_allowlist_check() {
+    let dir = make_place_vault();
+    let scratch = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let place_file = scratch.path().join("place.md");
+    std::fs::write(
+        &place_file,
+        format!(
+            "---\nid: {PLACE}\ntype: place\nname: Example Studio\naddress: 1 Example Way\n---\n\nFake place.\n"
+        ),
+    )
+    .unwrap();
+
+    let (ok, v) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &place_file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["command"], "record-add");
+    assert_eq!(v["path"], format!("places/{PLACE}/place.md"));
+    assert!(root.join(format!("places/{PLACE}/place.md")).is_file());
+
+    let list = run_json(&[
+        "record",
+        "list",
+        "--kind",
+        "place",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(list.0, "{list:?}");
+    assert_eq!(list.1["kind"], "place");
+    assert_eq!(list.1["kinds"], serde_json::json!(["place"]));
+    assert_eq!(list.1["records"][0]["kind"], "place");
+    assert_eq!(list.1["records"][0]["name"], "Example Studio");
+    assert!(list.1["records"][0].get("orphan").is_none());
+
+    let all = run_json(&["record", "list", "--json", "--no-input", "--vault", &vroot]);
+    assert!(all.0, "{all:?}");
+    assert!(
+        all.1["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind == "place"),
+        "{}",
+        all.1
+    );
+    assert!(all.1["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["id"] == PLACE));
+
+    // People stays core-person-only, as the TUI's People list expects.
+    let people = run_json(&[
+        "record",
+        "list",
+        "--kind",
+        "person",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(people.0, "{people:?}");
+    assert_eq!(people.1["kinds"], serde_json::json!(["person"]));
+    assert!(
+        !people.1["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["id"] == PLACE),
+        "{}",
+        people.1
+    );
+
+    // The edit path also parses with the vault's spec and declared types.
+    std::fs::write(
+        &place_file,
+        format!(
+            "---\nid: {PLACE}\ntype: place\nname: Example Studio Annex\naddress: 1 Example Way\n---\n\nFake place, edited.\n"
+        ),
+    )
+    .unwrap();
+    let (ok, edited) = run_json(&[
+        "record",
+        "edit",
+        PLACE,
+        "--file",
+        &place_file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{edited}");
+    assert_eq!(edited["command"], "record-edit");
+    assert_eq!(edited["path"], format!("places/{PLACE}/place.md"));
+
+    let context = run_json(&["context", PLACE, "--json", "--no-input", "--vault", &vroot]);
+    assert!(context.0, "{context:?}");
+    assert_eq!(context.1["entity"]["kind"], "place");
+    assert_eq!(context.1["entity"]["name"], "Example Studio Annex");
+
+    let body = scratch.path().join("body.md");
+    std::fs::write(&body, "Liked the back room.\n").unwrap();
+    let (ok, note) = run_json(&[
+        "note",
+        "add",
+        "--entity",
+        PLACE,
+        "--id",
+        PLACE_NOTE,
+        "--date",
+        "2026-10-13",
+        "--body-file",
+        &body.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{note}");
+    assert_eq!(note["command"], "note-add");
+    assert_eq!(note["path"], format!("notes/{PLACE_NOTE}/note.md"));
+    let note_text =
+        std::fs::read_to_string(root.join(format!("notes/{PLACE_NOTE}/note.md"))).unwrap();
+    assert!(
+        note_text.contains(&format!("entity: {PLACE}")),
+        "{note_text}"
+    );
+
+    let context = run_json(&["context", PLACE, "--json", "--no-input", "--vault", &vroot]);
+    assert!(context.0, "{context:?}");
+    assert_eq!(context.1["notes"][0]["id"], PLACE_NOTE);
+
+    let allow = run_json(&["allowlist", "--json", "--no-input", "--vault", &vroot]);
+    assert!(allow.0, "{allow:?}");
+    let files: Vec<&str> = allow.1["cleared_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file.as_str().unwrap())
+        .collect();
+    assert!(
+        files
+            .iter()
+            .any(|file| file.contains(&format!("places/{PLACE}/place.md"))),
+        "{files:?}"
+    );
+    assert!(
+        files
+            .iter()
+            .any(|file| file.contains(&format!("notes/{PLACE_NOTE}/note.md"))),
+        "{files:?}"
+    );
+
+    // Out of scope, the pack-owned place and its note disappear from every
+    // agent read even though the core person remains.
+    let scoped_allow = run_json(&[
+        "allowlist",
+        "--packs",
+        "personal@0.2",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(scoped_allow.0, "{scoped_allow:?}");
+    assert!(
+        !scoped_allow.1["cleared_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| {
+                let file = file.as_str().unwrap();
+                file.contains(&format!("places/{PLACE}/place.md"))
+                    || file.contains(&format!("notes/{PLACE_NOTE}/note.md"))
+            }),
+        "out-of-scope pack files leaked into allowlist: {}",
+        scoped_allow.1
+    );
+    let scoped_list = run_json(&[
+        "record",
+        "list",
+        "--kind",
+        "place",
+        "--packs",
+        "personal@0.2",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(scoped_list.0, "{scoped_list:?}");
+    assert!(scoped_list.1["records"].as_array().unwrap().is_empty());
+    let scoped_find = run_json(&[
+        "find",
+        "Example Studio",
+        "--packs",
+        "personal@0.2",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(scoped_find.0, "{scoped_find:?}");
+    assert!(scoped_find.1["matches"].as_array().unwrap().is_empty());
+
+    let schema = run_json(&["schema", "--json", "--no-input", "--vault", &vroot]);
+    assert!(schema.0, "{schema:?}");
+    assert!(
+        schema.1["contract"]["record_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|decl| decl["name"] == "place" && decl["owner"] == "place-pack@0.1"),
+        "{}",
+        schema.1
+    );
+    let scoped_schema = run_json(&[
+        "schema",
+        "--packs",
+        "personal@0.2",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(scoped_schema.0, "{scoped_schema:?}");
+    assert!(
+        !scoped_schema.1["contract"]["record_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|decl| decl["name"] == "place"),
+        "out-of-scope pack type leaked into schema: {}",
+        scoped_schema.1
+    );
+
+    let (ok, check) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{check}");
+    assert_eq!(check["ok"], true, "{check}");
+}
+
+/// The 0.3 write path gets the spec-aware parser: an edge can be authored
+/// with `no-ai: true`, it is hidden from agent reads, and the operator sees
+/// it with the tri-state badge.
+#[test]
+fn cli_authors_a_0_3_edge_no_ai_that_agent_reads_hide() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.3\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    add_person(root, PLACE_PERSON, "Dana Example", "");
+    std::fs::create_dir_all(root.join("orgs").join(PLACE_ORG)).unwrap();
+    std::fs::write(
+        root.join("orgs").join(PLACE_ORG).join("org.md"),
+        format!("---\nid: {PLACE_ORG}\ntype: org\nname: Example Studio\n---\n"),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let edge = "e-01M3TC5H00MPJG000000000004";
+    let edge_file = scratch.path().join("edge.md");
+    std::fs::write(
+        &edge_file,
+        format!(
+            "---\nid: {edge}\ntype: edge\na: {PLACE_PERSON}\nb: {PLACE_ORG}\nkind: works_at\nsince: 2024-01-01\nno-ai: true\n---\n"
+        ),
+    )
+    .unwrap();
+
+    let (ok, added) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &edge_file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{added}");
+    assert_eq!(added["path"], format!("edges/{edge}/edge.md"));
+
+    let allow = run_json(&["allowlist", "--json", "--no-input", "--vault", &vroot]);
+    assert!(allow.0, "{allow:?}");
+    assert!(
+        !allow.1["cleared_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file.as_str().unwrap().contains(edge)),
+        "hidden edge leaked into the agent allowlist: {}",
+        allow.1
+    );
+
+    let agent = run_json(&[
+        "context",
+        PLACE_PERSON,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(agent.0, "{agent:?}");
+    assert!(
+        agent.1["edges"].as_array().unwrap().is_empty(),
+        "{}",
+        agent.1
+    );
+
+    let operator = run_json(&[
+        "context",
+        PLACE_PERSON,
+        "--for-operator",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(operator.0, "{operator:?}");
+    assert_eq!(operator.1["for_operator"], true);
+    assert_eq!(operator.1["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(operator.1["edges"][0]["id"], edge);
+    assert_eq!(operator.1["edges"][0]["no_ai"], "true");
+
+    let (ok, check) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{check}");
+    assert_eq!(check["ok"], true, "{check}");
+}
+
 #[test]
 fn record_add_creates_person_profile() {
     let dir = make_vault();
@@ -2645,6 +3040,61 @@ fn mcp_context_honors_no_ai_by_default() {
     );
     let body: Value = serde_json::from_str(text).unwrap();
     assert_eq!(body["ok"], true);
+}
+
+#[test]
+fn mcp_note_add_entity_and_context_target_a_pack_type() {
+    let dir = make_place_vault();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(format!("places/{PLACE}"))).unwrap();
+    std::fs::write(
+        root.join(format!("places/{PLACE}/place.md")),
+        format!(
+            "---\nid: {PLACE}\ntype: place\nname: Example Studio\naddress: 1 Example Way\n---\n"
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "place fixture"]);
+    let scratch = tempfile::tempdir().unwrap();
+    let body = scratch.path().join("body.md");
+    std::fs::write(&body, "Liked the back room.\n").unwrap();
+    let msg = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"note_add","arguments":{{"entity":"{PLACE}","body_file":{}}}}}}}"#,
+        serde_json::to_string(&body.display().to_string()).unwrap()
+    );
+    let resps = mcp_exchange(root, &[msg.as_str()]);
+    let text = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let note: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(note["ok"], true, "{note}");
+    assert_eq!(note["command"], "note-add");
+    let note_path = root.join(note["path"].as_str().unwrap());
+    let contents = std::fs::read_to_string(&note_path).unwrap();
+    assert!(contents.contains(&format!("entity: {PLACE}")), "{contents}");
+
+    let context_msg = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"context","arguments":{{"person":"{PLACE}"}}}}}}"#
+    );
+    let resps = mcp_exchange(root, &[context_msg.as_str()]);
+    let text = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let context: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(context["ok"], true, "{context}");
+    assert_eq!(context["entity"]["kind"], "place");
+    assert_eq!(context["notes"][0]["id"], note["id"]);
+
+    let schema_msg = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"schema","arguments":{}}}"#;
+    let resps = mcp_exchange(root, &[schema_msg]);
+    let text = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let schema: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(schema["ok"], true, "{schema}");
+    assert!(
+        schema["contract"]["record_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|decl| decl["name"] == "place"),
+        "{schema}"
+    );
 }
 
 #[test]

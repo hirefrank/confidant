@@ -205,6 +205,22 @@ Rules:
   filter by scope. `qmd-query.py --packs LIST` passes the scope to the
   verification and fallback `find` calls; the QMD index itself is
   unscoped and the `find` verification is the enforcement point.
+- **Pack-declared record types are pack-owned (spec 0.3).** A record whose
+  `type:` is declared by a pack is visible only while that type is enabled
+  and its declaring pack is in scope. The type declaration is the gate: an
+  agent read returns nothing for a record of a disabled, retired, or
+  undeclared type, even if the record file itself is readable. There is no
+  per-record field-level split for a pack type; the whole record follows its
+  type's owner. Core person/org/deal remain core-owned. The operator path
+  (`record list --for-operator`, or loading the vault for an operator-only
+  command) surfaces orphans with a badge, so a disabled pack's records do
+  not become invisible to the person who must clean them up.
+- **`context` targets an entity type.** A pack type is a context target only
+  when its declaration sets `entity = true`; a `person_like` type also gets
+  person read semantics (aliases, touchpoints, and a person-shaped pack
+  view). Notes and interactions attach through `entity:`, `person:`, or
+  `org:`; they keep their own pack ownership, so a scoped agent sees only
+  the attachments its scope allows even when the target entity is visible.
 - **Shared interactions**: the pack that wrote an interaction decides
   its visibility (#179 settled the mechanics).
 - **Edges**: an edge is visible exactly when its kind's pack is in scope
