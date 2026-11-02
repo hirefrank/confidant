@@ -306,7 +306,7 @@ pub struct TypeRegistry {
 
 impl TypeRegistry {
     /// Build from core, every registered pack, and retired config. Pack
-    /// declarations are only included for a 0.3 vault; older specs see core
+    /// declarations are included for 0.3 and newer; older specs see core
     /// types only.
     pub fn build(
         spec: SpecVersion,
@@ -319,7 +319,7 @@ impl TypeRegistry {
         for decl in CORE_TYPES {
             all.push(*decl);
         }
-        if spec == SpecVersion::V03 {
+        if spec >= SpecVersion::V03 {
             for source in sources {
                 for decl in source.decls {
                     let mut decl = *decl;

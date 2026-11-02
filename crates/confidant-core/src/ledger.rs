@@ -1,8 +1,233 @@
 //! Dated one-line ledger grammar (ADR-2).
 
 use chrono::NaiveDate;
+use sha2::{Digest, Sha256};
 
 use crate::id::{strip_ignorable, RecordId};
+
+/// Domain separator for [`line_fingerprint`]. The version suffix is part of
+/// the published format: a future canonical-form change needs a `v2` domain
+/// and dual-read, never a silent redefinition.
+const LINE_REF_DOMAIN: &[u8] = b"confidant-line-ref/v1\0";
+
+/// Stable reference to one parsed ledger line (#746).
+///
+/// The fingerprint is the SHA-256 of the canonical `format_entry` bytes.
+/// `occurrence` disambiguates byte-identical lines: it is 1-based, ordered by
+/// `(file, line)`, and defaults to 1. Because identical lines are
+/// indistinguishable, choosing a different occurrence among them leaves the
+/// effective ledger unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct LineRef {
+    hash: [u8; 32],
+    occurrence: u32,
+}
+
+impl LineRef {
+    pub fn new(hash: [u8; 32], occurrence: u32) -> Self {
+        debug_assert!(occurrence > 0, "line occurrence is 1-based");
+        Self { hash, occurrence }
+    }
+
+    /// The fingerprint bytes.
+    pub fn hash(&self) -> &[u8; 32] {
+        &self.hash
+    }
+
+    /// The 1-based occurrence.
+    pub fn occurrence(&self) -> u32 {
+        self.occurrence
+    }
+
+    /// First 12 hex characters, for operator-facing messages and dry runs.
+    pub fn short(&self) -> String {
+        hex(&self.hash)[..12].to_owned()
+    }
+}
+
+impl std::fmt::Display for LineRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "line:{}", hex(&self.hash))?;
+        if self.occurrence != 1 {
+            write!(f, "#{}", self.occurrence)?;
+        }
+        Ok(())
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(CHARS[(b >> 4) as usize] as char);
+        out.push(CHARS[(b & 15) as usize] as char);
+    }
+    out
+}
+
+/// The canonical content fingerprint of one parsed line.
+pub fn line_fingerprint(entry: &LedgerEntry) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(LINE_REF_DOMAIN);
+    h.update(format_entry(entry).as_bytes());
+    h.finalize().into()
+}
+
+/// Fingerprint plus occurrence; occurrence 1 is omitted when rendered.
+pub fn line_ref(entry: &LedgerEntry, occurrence: u32) -> LineRef {
+    LineRef::new(line_fingerprint(entry), occurrence)
+}
+
+/// The closed `reason:` vocabulary for `retract` (#746). Lowercase only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetractReason {
+    Duplicate,
+    WrongDate,
+    WrongKind,
+    WrongPerson,
+    WrongAmount,
+    WrongNote,
+    WrongRecord,
+    Typo,
+    Other,
+}
+
+impl RetractReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Duplicate => "duplicate",
+            Self::WrongDate => "wrong-date",
+            Self::WrongKind => "wrong-kind",
+            Self::WrongPerson => "wrong-person",
+            Self::WrongAmount => "wrong-amount",
+            Self::WrongNote => "wrong-note",
+            Self::WrongRecord => "wrong-record",
+            Self::Typo => "typo",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "duplicate" => Self::Duplicate,
+            "wrong-date" => Self::WrongDate,
+            "wrong-kind" => Self::WrongKind,
+            "wrong-person" => Self::WrongPerson,
+            "wrong-amount" => Self::WrongAmount,
+            "wrong-note" => Self::WrongNote,
+            "wrong-record" => Self::WrongRecord,
+            "typo" => Self::Typo,
+            "other" => Self::Other,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for RetractReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A parsed, syntactically valid `retract` line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetractSpec {
+    pub target: LineRef,
+    pub reason: RetractReason,
+    pub replacement: Option<LineRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetractParse {
+    Ok(RetractSpec),
+    Malformed,
+}
+
+fn parse_hash(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in value.as_bytes().chunks(2).enumerate() {
+        let [hi, lo] = chunk else {
+            return None;
+        };
+        out[i] = (hex_val(*hi)? << 4) | hex_val(*lo)?;
+    }
+    Some(out)
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Parse a `retract` entry. The caller has already checked `entry.verb`.
+///
+/// Closed grammar:
+/// `DATE retract SUBJECT-ID line:<64 lowercase hex> [occurrence:<n>]
+///  reason:<closed token> [replace:<64 lowercase hex>]`
+pub fn parse_retract(entry: &LedgerEntry) -> RetractParse {
+    if entry.verb != "retract" {
+        return RetractParse::Malformed;
+    }
+    let mut target = None;
+    let mut occurrence = 1u32;
+    let mut occurrence_seen = false;
+    let mut reason = None;
+    let mut replacement = None;
+    for arg in &entry.args {
+        let Some((key, value)) = arg.pair() else {
+            return RetractParse::Malformed;
+        };
+        match key {
+            "line" if target.is_none() => {
+                let Some(hash) = parse_hash(value) else {
+                    return RetractParse::Malformed;
+                };
+                target = Some(LineRef::new(hash, 1));
+            }
+            "occurrence" if !occurrence_seen => {
+                let Ok(n) = value.parse::<u32>() else {
+                    return RetractParse::Malformed;
+                };
+                if n == 0 {
+                    return RetractParse::Malformed;
+                }
+                occurrence = n;
+                occurrence_seen = true;
+            }
+            "reason" if reason.is_none() => {
+                let Some(r) = RetractReason::parse(value) else {
+                    return RetractParse::Malformed;
+                };
+                reason = Some(r);
+            }
+            "replace" if replacement.is_none() => {
+                let Some(hash) = parse_hash(value) else {
+                    return RetractParse::Malformed;
+                };
+                replacement = Some(LineRef::new(hash, 1));
+            }
+            _ => return RetractParse::Malformed,
+        }
+    }
+    let (Some(mut target), Some(reason)) = (target, reason) else {
+        return RetractParse::Malformed;
+    };
+    target.occurrence = occurrence;
+    // A `replace:` ref may itself carry an occurrence, but the grammar has
+    // only one `occurrence:` pair. Accept `replace:<hash>` for the first
+    // occurrence; the CLI emits a replacement that is unique in practice.
+    RetractParse::Ok(RetractSpec {
+        target,
+        reason,
+        replacement,
+    })
+}
 
 /// One argument after the record ID.
 #[derive(Clone, Debug, Eq, PartialEq)]

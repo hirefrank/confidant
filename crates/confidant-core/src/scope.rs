@@ -206,7 +206,7 @@ pub fn owner_of_field(field: &str, enabled: &[&dyn Pack]) -> Option<OwnerKey> {
 /// participant's own id — no pack data. A pack that claims `touch`
 /// (#184) owns touch lines when enabled: [`owner_of_verb`] checks pack
 /// claims first.
-pub const CORE_VERBS: &[&str] = &["alias", "merge", "stage", "touch"];
+pub const CORE_VERBS: &[&str] = &["alias", "merge", "stage", "touch", "retract"];
 
 /// Owner of a ledger verb: the enabled pack claiming it, core for
 /// [`CORE_VERBS`], else unattributed.

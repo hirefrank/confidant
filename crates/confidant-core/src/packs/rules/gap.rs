@@ -198,6 +198,7 @@ impl RuleKind for ActivityGapKind {
                 ctx.vault
                     .entries
                     .iter()
+                    .filter(|s| !ctx.vault.is_voided(s))
                     .filter(|s| s.entry.verb == verb)
                     .filter(|s| s.entry.date <= ctx.as_of && members.contains(&s.entry.id))
                     .map(|s| s.entry.date)

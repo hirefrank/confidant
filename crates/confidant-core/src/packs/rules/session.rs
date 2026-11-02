@@ -231,6 +231,9 @@ impl RuleKind for SessionChecksKind {
             .then(|| note_coverage(ctx.vault, ctx.merges, ctx.as_of));
 
         for sourced in &ctx.vault.entries {
+            if ctx.vault.is_voided(sourced) {
+                continue;
+            }
             let entry = &sourced.entry;
             if entry.verb != params.verb {
                 continue;

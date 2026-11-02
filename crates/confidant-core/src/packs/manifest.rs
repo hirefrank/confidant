@@ -613,8 +613,11 @@ impl PackManifest {
         // built-in is trusted as core (#504 decision 3) and legitimately
         // claims `touch`, for example.
         if !self.is_compiled_in() {
+            let claims_spec_04 = self.pack.requires_spec.iter().any(|spec| spec == "0.4");
             for verb in &self.verbs {
-                if CORE_VERBS_V2.contains(&verb.name.as_str()) {
+                let core = CORE_VERBS_V2.contains(&verb.name.as_str())
+                    || (claims_spec_04 && verb.name == "retract");
+                if core {
                     return Err(manifest_err(format!(
                         "verb '{}' is a core verb and cannot be claimed by an external pack",
                         verb.name
@@ -987,7 +990,14 @@ impl PackManifest {
         check_unique(&verb_names, "verb")?;
         let field_names: Vec<String> = self.fields.iter().map(|f| f.name.clone()).collect();
         check_unique(&field_names, "field")?;
+        let claims_spec_04 = self.pack.requires_spec.iter().any(|spec| spec == "0.4");
         for field in &self.fields {
+            if claims_spec_04 && field.name == "retired" {
+                return Err(manifest_err(
+                    "field 'retired' is reserved by the core record format (spec 0.4)".to_owned(),
+                )
+                .with_fix("Rename the pack field; `retired` marks a retired record"));
+            }
             if !KNOWN_GRAMMARS.contains(&field.grammar.as_str()) {
                 return Err(manifest_err(format!(
                     "field '{}' names unknown grammar '{}'; expected one of: {}",

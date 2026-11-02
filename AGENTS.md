@@ -25,10 +25,10 @@ interoperating vaults, not one shared vault.
 
 Read before changing behaviour:
 
-- [`spec/0.1.md`](spec/0.1.md) and [`spec/0.2.md`](spec/0.2.md) (frozen)
-  and [`spec/0.3.md`](spec/0.3.md) (current): the vault file format. **The
-  spec is the contract**; the code implements it. The spec version and the
-  CLI version are independent (ADR-1).
+- [`spec/0.1.md`](spec/0.1.md), [`spec/0.2.md`](spec/0.2.md), and
+  [`spec/0.3.md`](spec/0.3.md) (frozen) and [`spec/0.4.md`](spec/0.4.md)
+  (current): the vault file format. **The spec is the contract**; the code
+  implements it. The spec version and the CLI version are independent (ADR-1).
 - [`spec/findings.md`](spec/findings.md): stable `check` finding codes.
 - [`docs/architecture.md`](docs/architecture.md): privacy and threat model,
   ADR-1 to ADR-19, milestones (section 8), and risk decisions (section 9b,
@@ -62,6 +62,7 @@ Read before changing behaviour:
 | `crates/confidant-cli/pack-skills/`, `crates/confidant-core/pack-manifests/` | In-crate vendored pack skill/manifest copies the binary embeds; regenerate with `python3 .github/scripts/sync-packs.py` (drift tests guard them) |
 | `examples/demo-vault/` | Fake-data 0.2 vault used by tests, docs, and CI |
 | `testdata/vaults/place-0.3/` | Checked-in 0.3 fixture for pack-declared types, entity notes, and edge `no-ai` |
+| `testdata/vaults/corrections-0.4/` | Checked-in 0.4 fixture for retractions, superseded lines, and retirement |
 | `testdata/golden/` | Golden `check --json` outputs |
 | `docs/` | Architecture, privacy, sync, benchmarks, research |
 | `contrib/` | Opt-in systemd/launchd timer templates for `confidant sync` (#665) |
