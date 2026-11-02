@@ -194,6 +194,13 @@ pub trait Pack: Send + Sync {
     /// Front-matter fields this pack owns on shared records (flat names,
     /// e.g. `birthday`). Namespace only on conflict (#177 Q1).
     fn fields(&self) -> &'static [&'static str];
+    /// The grammar a declared field uses (spec §6), when the pack is
+    /// declarative. `context` uses it to emit a non-person-like entity's
+    /// fields with the same typed shapes as validation (#745). Defaults to
+    /// no grammar for packs that only claim field names.
+    fn field_grammar(&self, _field: &str) -> Option<&'static str> {
+        None
+    }
     /// Balance metrics this pack verifies on `balance` lines.
     fn balance_metrics(&self) -> &'static [&'static str];
     /// Ledger verbs this pack's `ledger-balance` rules use to open units

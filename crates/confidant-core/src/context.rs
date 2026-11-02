@@ -33,12 +33,14 @@ pub mod personal;
 use std::collections::{BTreeMap, HashSet};
 
 use serde::{Serialize, Serializer};
+use serde_json::Value;
 
 use crate::check::{canonical_on, check_aliases_and_merges, pack_snapshots, resolve_as_of_date};
 use crate::config::SpecVersion;
 use crate::id::{Prefix, RecordId};
+use crate::packs::grammars::{parse_field_grammar, FieldValue};
 use crate::packs::{core_edge_kinds, EdgeKind, Pack};
-use crate::record::RecordKind;
+use crate::record::{Record, RecordKind};
 use crate::scope::{
     note_linkage_owners, owners_of_ledger_entry, record_owners, OwnerKey, PackScope,
 };
@@ -89,7 +91,7 @@ impl Serialize for PersonView {
 #[derive(Clone, Debug)]
 pub struct EntityView {
     pub id: String,
-    /// `"person"` or `"org"`.
+    /// A core type (`"person"`, `"org"`) or a declared pack type.
     pub kind: &'static str,
     pub name: Option<String>,
     pub no_ai: bool,
@@ -97,12 +99,16 @@ pub struct EntityView {
     /// caller passed `--for-operator`.
     pub no_ai_mode: Option<&'static str>,
     pub profile: Option<String>,
+    /// Declared fields for a non-person-like pack entity (#745). Empty for
+    /// a person, org, or a type that declares no fields; omitted in JSON.
+    pub fields: BTreeMap<String, Value>,
 }
 
 impl Serialize for EntityView {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("EntityView", 6)?;
+        let count = 6 + usize::from(!self.fields.is_empty());
+        let mut st = serializer.serialize_struct("EntityView", count)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("kind", &self.kind)?;
         st.serialize_field("name", &self.name)?;
@@ -111,6 +117,9 @@ impl Serialize for EntityView {
             None => st.serialize_field("no_ai", &self.no_ai)?,
         }
         st.serialize_field("profile", &self.profile)?;
+        if !self.fields.is_empty() {
+            st.serialize_field("fields", &self.fields)?;
+        }
         st.end()
     }
 }
@@ -227,6 +236,78 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// The declared fields of a non-person-like pack entity, in the shape their
+/// grammars produce (#745). Empty for a person-like target, a core type, or a
+/// pack whose declaration is no longer registered. `include_private` is the
+/// `--exclude-private` switch: false strips the same private names the
+/// personal view strips, including a place's `address`.
+fn entity_fields(
+    vault: &Vault,
+    record: &Record,
+    decl: &crate::record_type::RecordTypeDecl,
+    include_private: bool,
+) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    if decl.person_like {
+        return fields;
+    }
+    let crate::record_type::TypeOwner::Pack(owner) = decl.owner else {
+        return fields;
+    };
+    let Some(pack) = vault
+        .pack_registry()
+        .all()
+        .iter()
+        .find(|pack| pack.name() == owner)
+    else {
+        return fields;
+    };
+    for name in decl.required_fields.iter().chain(decl.optional_fields) {
+        if *name == "name" {
+            continue;
+        }
+        let Some(raw) = record.field(name) else {
+            continue;
+        };
+        let Some(grammar) = pack.field_grammar(name) else {
+            continue;
+        };
+        let Some(value) = parse_field_grammar(grammar, *name, raw) else {
+            continue;
+        };
+        fields.insert((*name).to_owned(), field_value_json(value));
+    }
+    if !include_private {
+        fields.retain(|name, _| !personal::PRIVATE_CONTEXT_FIELDS.contains(&name.as_str()));
+    }
+    fields
+}
+
+/// Convert a parsed declared-field value to the JSON shape `context` uses.
+fn field_value_json(value: FieldValue) -> Value {
+    match value {
+        FieldValue::RecurringDate(date) => Value::String(date.raw),
+        FieldValue::Cadence(cadence) => Value::String(match cadence {
+            crate::packs::grammars::Cadence::Days(days) => format!("{days}d"),
+            crate::packs::grammars::Cadence::Never => "never".to_owned(),
+        }),
+        FieldValue::DatesList(dates) => Value::Array(
+            dates
+                .into_iter()
+                .map(|date| serde_json::json!({"label": date.label, "date": date.raw}))
+                .collect(),
+        ),
+        FieldValue::List(list) => Value::Array(list.into_iter().map(Value::String).collect()),
+        FieldValue::LabeledList(list) => Value::Array(
+            list.into_iter()
+                .map(|(label, value)| serde_json::json!({"label": label, "value": value}))
+                .collect(),
+        ),
+        FieldValue::Date(date) => Value::String(date.to_string()),
+        FieldValue::Text(text) => Value::String(text),
+    }
+}
+
 /// Resolve an edge kind for a read view (#813): an enabled pack's kind,
 /// this spec's core kinds, or a registered pack's kind (a disabled pack's
 /// kind is an orphan, visible only unscoped). An unknown kind returns
@@ -250,7 +331,8 @@ fn resolve_edge_kind(
         })
 }
 
-/// Build the context bundle for `target`, a person or an org (#813).
+/// Build the context bundle for `target`: a person, an org, or a
+/// pack-declared entity (#813, #814).
 ///
 /// Returns `None` when no record with that id exists, or when it is not an
 /// entity (a deal, note, interaction, or edge). `include_private` controls
@@ -325,6 +407,16 @@ pub fn build_context(
     };
     let no_ai = record.no_ai();
     let show_pii = include_private && cleared.contains(target);
+    // #745: a non-person-like pack entity has no derived ledger metadata to
+    // justify revealing its existence. Unlike a person, an uncleared place or
+    // thing returns no agent bundle at all. The operator path still sees it.
+    if !for_operator
+        && !decl.person_like
+        && matches!(decl.owner, crate::record_type::TypeOwner::Pack(_))
+        && !cleared.contains(target)
+    {
+        return None;
+    }
 
     let as_of = resolve_as_of_date(vault);
     let spec = vault.spec_version().unwrap_or(SpecVersion::V01);
@@ -342,6 +434,7 @@ pub fn build_context(
     }
 
     let no_ai_mode = for_operator.then(|| operator_no_ai_badge(record, &hidden_by_no_ai));
+    let fields = entity_fields(vault, record, decl, include_private);
     let entity = EntityView {
         id: target.to_string(),
         kind: record.kind.as_str(),
@@ -349,6 +442,7 @@ pub fn build_context(
         no_ai,
         no_ai_mode,
         profile: show_pii.then(|| record.body.clone()),
+        fields,
     };
     let person = is_person.then(|| PersonView {
         id: target.to_string(),

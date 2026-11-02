@@ -119,7 +119,8 @@ use crate::vault::Vault;
 ///
 /// `title`, `company`, `cadence`, and `snooze_until` are deliberately
 /// absent: they stay so an agent can still see the cadence state that drove a
-/// nudge.
+/// nudge. `address` is a place field (#745), included here so the same
+/// `--exclude-private` switch strips it from `entity.fields`.
 ///
 /// `relationship` is the 0.2 name (#509). `relationship_to_me` is kept in the
 /// list too: it is harmless (no view carries it after the #551 cutover) and
@@ -134,6 +135,7 @@ pub const PRIVATE_CONTEXT_FIELDS: &[&str] = &[
     "dates",
     "relationship",
     "relationship_to_me",
+    "address",
 ];
 
 /// Declared fields a person outside the §12 cleared set still exposes: the

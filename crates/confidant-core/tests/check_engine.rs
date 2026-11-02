@@ -214,6 +214,21 @@ fn place_03_fixture_hides_only_the_no_ai_edge_and_its_note() {
     assert!(operator.contains(&hidden_note));
 }
 
+/// The checked-in spec 0.4 personal fixture (#745): the default
+/// `personal@0.3` types, their fields and edges, an `entity:` note, and a
+/// no-ai place. Fake data only.
+fn personal_04_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/personal-0.4")
+}
+
+#[test]
+fn personal_04_fixture_matches_golden() {
+    let json = report_json(&personal_04_fixture(), None);
+    assert_eq!(json["ok"], true, "{json}");
+    assert_eq!(codes(&json), Vec::<String>::new(), "{json}");
+    assert_golden("personal-0.4.json", &json);
+}
+
 /// The checked-in spec 0.4 corrections fixture (#746): a duplicate touch, a
 /// corrected touch, a malformed touch that is retracted, a retired person
 /// with a note, and a no-ai person with a hidden retraction.
