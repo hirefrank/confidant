@@ -3761,6 +3761,30 @@ mod tests {
         assert!(compact.ends_with("demo-vault"));
     }
 
+    /// #814: pack-declared types are listable through the CLI, but the TUI
+    /// People list stays core-person-only by asking for `--kind person`.
+    #[test]
+    fn people_roster_requests_only_core_people() {
+        use crate::runner::FakeRunner;
+
+        let json = r#"{"ok": true, "schema_version": "1", "vault": "/fake/vault",
+            "kind": "person", "for_operator": false, "scope": [],
+            "records": []}"#;
+        let mut app = App::new(FakeRunner::from_json(0, json));
+        app.load_roster();
+        assert_eq!(
+            app.runner.recorded_calls()[0],
+            vec!["record", "list", "--kind", "person"]
+        );
+        assert_eq!(
+            app.people
+                .roster
+                .as_ref()
+                .map(|roster| roster.kind.as_str()),
+            Some("person")
+        );
+    }
+
     #[test]
     fn qmd_available_needs_qmd_on_path_and_corpus() {
         let tmp = tempfile::tempdir().unwrap();

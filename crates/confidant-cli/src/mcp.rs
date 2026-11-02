@@ -156,11 +156,11 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "context",
-            "Context bundle for one person or org. Honors no-ai; private data is stripped by default. Honors the connection's pack scope; an optional packs list can only narrow it.",
+            "Context bundle for one entity: a person, an org, or a record of a pack-declared entity type. Honors no-ai; private data is stripped by default. Honors the connection's pack scope; an optional packs list can only narrow it.",
             obj(
                 &["person"],
                 json!({
-                    "person": str_prop("Opaque person or org id (p-… or o-…)."),
+                    "person": str_prop("Opaque entity id (p-…, o-…, or a declared pack type id)."),
                     "exclude_private": {"type": "boolean", "description": "Strip name, profile, and bodies. Default true: private data is stripped unless explicitly set to false."},
                     "packs": {"type": "array", "items": {"type": "string"}, "description": "Pack scope for this call (subset of the connection's scope). Unset = the connection's scope."},
                 }),
@@ -215,18 +215,21 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "note_add",
-            "Create a note record under people/<person>/notes/. One commit; check-gated.",
-            obj(
-                &["person", "body_file"],
-                json!({
+            "Create a note record under people/<person>/notes/ or notes/<id>/note.md. One commit; check-gated.",
+            json!({
+                "type": "object",
+                "required": ["body_file"],
+                "oneOf": [{"required": ["person"]}, {"required": ["entity"]}],
+                "properties": {
                     "person": str_prop("Opaque person id (p-…)."),
+                    "entity": str_prop("Opaque entity id (p-…, o-…, or a declared pack type id); writes a top-level entity note."),
                     "body_file": str_prop("Path to a file holding the note body."),
                     "date": str_prop("YYYY-MM-DD; default today."),
                     "no_ai": {"type": "boolean", "description": "Mark the note no-ai."},
                     "request_id": str_prop("Idempotency key."),
                     "dry_run": {"type": "boolean", "description": "Show the logical change only."},
-                }),
-            ),
+                },
+            }),
         ),
         tool(
             "schema",
@@ -387,8 +390,19 @@ fn build_argv(
         "note_add" => {
             cli.push("note".to_owned());
             cli.push("add".to_owned());
-            cli.push("--person".to_owned());
-            cli.push(get_str(args, "person")?);
+            let person = opt_str(args, "person");
+            let entity = opt_str(args, "entity");
+            match (person, entity) {
+                (Some(person), None) => {
+                    cli.push("--person".to_owned());
+                    cli.push(person);
+                }
+                (None, Some(entity)) => {
+                    cli.push("--entity".to_owned());
+                    cli.push(entity);
+                }
+                _ => return Err("note_add needs exactly one of `person` or `entity`".to_owned()),
+            }
             cli.push("--body-file".to_owned());
             cli.push(get_str(args, "body_file")?);
             if let Some(d) = opt_str(args, "date") {
@@ -825,6 +839,65 @@ mod tests {
             "{argv:?}"
         );
         assert!(!argv.iter().any(|arg| arg == "--for-operator"), "{argv:?}");
+    }
+
+    /// #814: `note_add` can attach to any entity with `entity:`, while the
+    /// original `person` parameter keeps working unchanged.
+    #[test]
+    fn note_add_argv_accepts_person_or_entity() {
+        let vault = Path::new("/tmp/vault");
+        let person = build_argv(
+            "note_add",
+            &json!({"person": "p-01ABC", "body_file": "/tmp/body.md"}),
+            vault,
+            &None,
+        )
+        .unwrap();
+        assert!(person.iter().any(|arg| arg == "--person"), "{person:?}");
+        assert!(!person.iter().any(|arg| arg == "--entity"), "{person:?}");
+        let entity = build_argv(
+            "note_add",
+            &json!({"entity": "pl-01ABC", "body_file": "/tmp/body.md"}),
+            vault,
+            &None,
+        )
+        .unwrap();
+        assert!(entity.iter().any(|arg| arg == "--entity"), "{entity:?}");
+        assert!(!entity.iter().any(|arg| arg == "--person"), "{entity:?}");
+        for args in [
+            json!({"body_file": "/tmp/body.md"}),
+            json!({"person": "p-01ABC", "entity": "pl-01ABC", "body_file": "/tmp/body.md"}),
+        ] {
+            let err = build_argv("note_add", &args, vault, &None).unwrap_err();
+            assert!(err.contains("exactly one"), "{err}");
+        }
+    }
+
+    /// #814: the exposed note_add schema advertises both subjects and
+    /// requires exactly one; the context description names pack entity types.
+    #[test]
+    fn entity_tools_describe_pack_types() {
+        let listed = tools();
+        let note = listed
+            .iter()
+            .find(|tool| tool["name"] == "note_add")
+            .unwrap();
+        assert!(note["inputSchema"]["properties"]["entity"].is_object());
+        assert_eq!(
+            note["inputSchema"]["oneOf"],
+            json!([{"required": ["person"]}, {"required": ["entity"]}])
+        );
+        let context = listed
+            .iter()
+            .find(|tool| tool["name"] == "context")
+            .unwrap();
+        assert!(
+            context["description"]
+                .as_str()
+                .unwrap()
+                .contains("pack-declared entity type"),
+            "{context}"
+        );
     }
 
     #[test]

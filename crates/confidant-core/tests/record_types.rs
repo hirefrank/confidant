@@ -5,8 +5,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use confidant_core::check::CheckOptions;
+use confidant_core::context::build_context;
 use confidant_core::record_type::{TypeOwner, TypeProblem, TypeRegistry, TypeSource};
-use confidant_core::{check_vault, load_vault, RecordSchema};
+use confidant_core::resolve::{resolve_alias, resolve_person, PersonResolveError};
+use confidant_core::roster::build_roster;
+use confidant_core::{check_vault, load_vault, PackScope, RecordSchema};
 
 const ADA: &str = "p-01M3TC5H00MPJG000000000000";
 const PLACE: &str = "pl-01M3TC5H00MPJG000000000001";
@@ -155,6 +158,14 @@ fn declared_place_loads_and_checks_clean() {
             .len(),
         1
     );
+    assert!(
+        confidant_core::search(&vault, "Example Studio", &place_scope)
+            .unwrap()
+            .hits
+            .iter()
+            .any(|hit| hit.id.as_deref() == Some(PLACE)),
+        "a pack type is searchable as a whole record"
+    );
     let personal_scope =
         confidant_core::PackScope::Only(["personal@0.2".to_owned()].into_iter().collect());
     assert!(
@@ -163,6 +174,105 @@ fn declared_place_loads_and_checks_clean() {
             .hits
             .is_empty(),
         "place notes must not leak into a personal-only scope"
+    );
+}
+
+#[test]
+fn place_context_attaches_entity_notes_and_hides_out_of_scope() {
+    let (dir, _) = place_vault("0.3", "\"place-pack@0.1\"", "");
+    person(dir.path());
+    place(dir.path());
+    let note = "n-01M3TC5H00MPJG000000000003";
+    write(
+        dir.path(),
+        &format!("notes/{note}/note.md"),
+        &format!(
+            "---\nid: {note}\ntype: note\nentity: {PLACE}\ndate: 2026-10-02\n---\n\nLiked the back room.\n"
+        ),
+    );
+    let vault = load_vault(dir.path()).unwrap();
+    let place_id = confidant_core::RecordId::parse(PLACE).unwrap();
+    let bundle = build_context(&vault, &place_id, true, &PackScope::All, false).unwrap();
+    assert_eq!(bundle.entity.kind, "place");
+    assert_eq!(bundle.entity.name.as_deref(), Some("Example Studio"));
+    assert_eq!(bundle.notes.len(), 1, "{:?}", bundle.notes);
+    assert_eq!(
+        bundle.notes[0].body.as_deref(),
+        Some("Liked the back room.\n")
+    );
+
+    let personal = PackScope::Only(["personal@0.2".to_owned()].into_iter().collect());
+    assert!(
+        build_context(&vault, &place_id, true, &personal, false).is_none(),
+        "a place-owned record is hidden under a personal-only scope"
+    );
+    assert!(build_context(
+        &vault,
+        &confidant_core::RecordId::parse("p-01M3TC5H00MPJG000000000099").unwrap(),
+        true,
+        &PackScope::All,
+        false,
+    )
+    .is_none());
+}
+
+#[test]
+fn roster_lists_pack_types_only_in_scope() {
+    let (dir, _) = place_vault("0.3", "\"place-pack@0.1\"", "");
+    person(dir.path());
+    place(dir.path());
+    let vault = load_vault(dir.path()).unwrap();
+    let all = build_roster(&vault, None, &PackScope::All, false);
+    assert_eq!(
+        all.kinds,
+        vec![
+            "person".to_owned(),
+            "org".to_owned(),
+            "deal".to_owned(),
+            "place".to_owned()
+        ]
+    );
+    let place = all
+        .records
+        .iter()
+        .find(|entry| entry.id == PLACE)
+        .expect("place in the default roster");
+    assert_eq!(place.kind, "place");
+    assert!(place.orphan.is_none());
+
+    let only_place = build_roster(&vault, Some("place"), &PackScope::All, false);
+    assert_eq!(only_place.kinds, vec!["place".to_owned()]);
+    assert_eq!(only_place.records.len(), 1);
+
+    let personal = PackScope::Only(["personal@0.2".to_owned()].into_iter().collect());
+    let scoped = build_roster(&vault, Some("place"), &personal, false);
+    assert!(scoped.records.is_empty(), "{:?}", scoped.records);
+}
+
+#[test]
+fn pack_type_names_do_not_resolve_to_people() {
+    let (dir, _) = place_vault("0.3", "\"place-pack@0.1\"", "");
+    person(dir.path());
+    place(dir.path());
+    let vault = load_vault(dir.path()).unwrap();
+    assert_eq!(
+        resolve_person(&vault, "Example Studio"),
+        Err(PersonResolveError::NotFound)
+    );
+    assert_eq!(
+        resolve_person(&vault, PLACE),
+        Err(PersonResolveError::NotFound)
+    );
+    assert_eq!(
+        resolve_alias(&vault, "name", "Example Studio"),
+        Err(PersonResolveError::NotFound)
+    );
+    assert_eq!(
+        resolve_person(&vault, "Dana Example")
+            .unwrap()
+            .id
+            .to_string(),
+        ADA
     );
 }
 
@@ -321,6 +431,17 @@ removed_pack = "place-pack@0.1"
             .is_empty(),
         "operator search must still see the retired record"
     );
+    let place_id = confidant_core::RecordId::parse(PLACE).unwrap();
+    assert!(
+        build_context(&vault, &place_id, true, &PackScope::All, false).is_none(),
+        "retired types are not agent context targets"
+    );
+    let operator =
+        build_context(&vault, &place_id, true, &PackScope::All, true).expect("operator bundle");
+    assert_eq!(operator.entity.kind, "place");
+    let roster = build_roster(&vault, Some("place"), &PackScope::All, true);
+    assert_eq!(roster.records.len(), 1);
+    assert_eq!(roster.records[0].orphan.as_deref(), Some("removed"));
 }
 
 #[test]

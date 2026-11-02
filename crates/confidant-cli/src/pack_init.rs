@@ -1,6 +1,6 @@
 //! `confidant pack init`: scaffold a local external pack (#674).
 //!
-//! The scaffold is deliberately small and valid as written: a v2 manifest
+//! The scaffold is deliberately small and valid as written: a v3 manifest
 //! with no claims, the agent-facing `SKILL.md`, the human contract
 //! (`<version>.md`), and a `README.md` describing the local review loop.
 //! Every example in the manifest is a comment, so a fresh directory parses
@@ -285,7 +285,7 @@ fn readme_text(name: &str, version: &str) -> String {
         .replace("@VERSION@", version)
 }
 
-/// A valid v2 skeleton. Every example is commented out, so the file parses
+/// A valid v3 skeleton. Every example is commented out, so the file parses
 /// exactly as written; each example names real keys from the manifest spec.
 const MANIFEST_TEMPLATE: &str = r#"# Confidant external pack manifest (spec/pack-manifest.md §13).
 #
@@ -293,7 +293,7 @@ const MANIFEST_TEMPLATE: &str = r#"# Confidant external pack manifest (spec/pack
 # kinds; the CLI supplies every parser, fold and finding. Pack text never
 # executes. Unknown keys are an error, and a claim that collides with core
 # or with another enabled pack is refused.
-manifest_version = 2
+manifest_version = 3
 
 # Top-level keys must come before the first [table] header.
 record_types = []
@@ -305,8 +305,9 @@ name = "@NAME@"
 version = "@VERSION@"
 # The skill served to agents from this pack directory.
 skill = "SKILL.md"
-# Exact vault spec versions this pack supports.
-requires_spec = ["0.1", "0.2"]
+# Exact vault spec versions this pack supports. Record type declarations
+# require 0.3; a pack with none may still list 0.1 and 0.2.
+requires_spec = ["0.3"]
 
 # Finding message templates, one table per code ([messages."<CODE>"]). The
 # empty table is required even while no code is declared; see the example
@@ -318,6 +319,22 @@ requires_spec = ["0.1", "0.2"]
 # written. Uncomment only what the pack needs, then review it with:
 #   confidant pack add --from-dir <this-directory>
 # ---------------------------------------------------------------------------
+
+# A record type this pack owns (manifest v3, vault spec 0.3). `entity`
+# opts into context targets and edge endpoints; `person_like` adds person
+# read semantics. `no_ai` is none, full, or notes (notes requires
+# person_like). `roster` includes it in `record list --kind all`.
+# [[record_types]]
+# name = "example"
+# id_prefix = "ex"
+# collection = "examples"
+# main_file = "example.md"
+# entity = true
+# person_like = false
+# no_ai = "full"
+# roster = true
+# required_fields = ["name"]
+# optional_fields = ["example_birthday"]
 
 # A front-matter field this pack owns. `grammar` names a fixed parser from
 # spec/pack-manifest.md §6: recurring-date, cadence, date, non-empty-string,
@@ -535,10 +552,7 @@ mod tests {
         assert_eq!(manifest.pack.name, "example-pack");
         assert_eq!(manifest.pack.version, "0.1");
         assert_eq!(manifest.pack.skill, "SKILL.md");
-        assert_eq!(
-            manifest.pack.requires_spec,
-            vec!["0.1".to_owned(), "0.2".to_owned()]
-        );
+        assert_eq!(manifest.pack.requires_spec, vec!["0.3".to_owned()]);
         assert!(manifest.record_types.is_empty());
         assert!(manifest.balance_metrics.is_empty());
         assert!(manifest.finding_codes.is_empty());
@@ -685,6 +699,10 @@ mod tests {
             expanded.push_str(line);
             expanded.push('\n');
         }
+        // The rendered manifest needs `record_types = []`; the expanded
+        // example instead supplies `[[record_types]]`, and TOML cannot have
+        // both spellings of the same key.
+        let mut expanded = expanded.replace("record_types = []\n", "");
         // A field requires the core front-matter code; the prose says so,
         // but the code table itself is not part of the example set.
         expanded.push_str(
@@ -694,6 +712,7 @@ mod tests {
         );
         let manifest =
             parse_manifest_external(&expanded).expect("every commented example is schema-valid");
+        assert_eq!(manifest.record_types.len(), 1);
         assert_eq!(manifest.fields.len(), 1);
         assert_eq!(manifest.verbs.len(), 1);
         assert_eq!(manifest.rules.len(), 1);
@@ -705,6 +724,15 @@ mod tests {
         const PREFIXES: &[&str] = &[
             "[",
             "name =",
+            "id_prefix =",
+            "collection =",
+            "main_file =",
+            "entity =",
+            "person_like =",
+            "no_ai =",
+            "roster =",
+            "required_fields =",
+            "optional_fields =",
             "grammar =",
             "id_type =",
             "symmetric =",

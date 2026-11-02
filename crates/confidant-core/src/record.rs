@@ -143,6 +143,15 @@ impl Record {
         }
     }
 
+    /// The `entity:` reference, parsed with the same tolerance as `person:`.
+    /// Used by `context` to attach notes/interactions to any entity (#814).
+    pub fn entity(&self) -> Option<RecordId> {
+        match parse_ref_id(self.ref_field("entity")?) {
+            FrontmatterRef::Id(id) => Some(id),
+            FrontmatterRef::Absent | FrontmatterRef::Invalid => None,
+        }
+    }
+
     /// The `org:` reference, parsed with the same tolerance as `person:`.
     /// Used by the org context bundle (#813) to find notes and interactions
     /// attached to an org.
