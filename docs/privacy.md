@@ -23,10 +23,12 @@ mismatch or duplicate on a person's profile unclears that whole person.
 
 ## Finer `no-ai` granularity (issue #181)
 
-`no-ai` has three values: `true`, `false`, and `notes` (person records
-only). There are no field-level flags — the record is the unit. An edge is
-the exception: it accepts only `true` / `false`, and `true` hides the
-relation while both endpoints stay visible (see “Edges and orgs”).
+`no-ai` has three values: `true`, `false`, and `notes` on person records
+and declared `person_like` pack types. Other pack-declared types accept
+`full` only (`true` / `false`): a place or thing cannot use `notes`. There
+are no field-level flags — the record is the unit. An edge is the exception:
+it accepts only `true` / `false`, and `true` hides the relation while both
+endpoints stay visible (see “Edges and orgs”).
 
 - **`no-ai: true`** hides the person's (or record's) content from agents —
   names, bodies, profile fields, notes, and free text — the all-or-nothing
@@ -52,6 +54,16 @@ relation while both endpoints stay visible (see “Edges and orgs”).
   is the person's ID — or a list of IDs containing it — all count (#270).
   This is fail-closed on purpose — a note that mentions a notes-mode
   person is hidden unless it carries an explicit `no-ai: false`.
+- **Places and things** are non-person-like pack entities with
+  `no_ai = "full"`. `no-ai: true` hides the place/thing and every edge that
+  touches it; `no-ai: false` keeps it visible. There is no `notes` mode. An
+  uncleared place or thing returns **no agent `context` bundle at all**, not
+  an empty one: unlike a person, it has no derived ledger metadata that
+  would justify revealing its existence. The operator path still returns the
+  bundle with the tri-state badge and its fields. `context.entity.fields`
+  carries the declared fields; `--exclude-private` strips `address`, `tags`,
+  and `links`, while `kind` stays as the type marker (a place's `address` is
+  PII).
 - **Per-note `no-ai: true`** on an otherwise visible person already works:
   "any `true` wins", so the note is excluded from `find`/`allowlist`/the
   search corpus while the person stays visible. Use this for one-off sensitive
@@ -88,6 +100,13 @@ Orgs cannot be `no-ai` (org-level hiding remains a later privacy decision,
 no inheritance in either direction. An org bundle also selects notes and
 interactions attached by `org:`, under the same cleared-set and pack-scope
 rules as a person bundle.
+
+`context` also accepts a declared `entity = true` pack type. A non-person-like
+pack entity (a place or thing) carries its declared `required_fields` and
+`optional_fields` in `entity.fields`, excluding `name`, with values shaped by
+the manifest grammar. The same `--exclude-private` list strips a place's
+`address` and the `tags`/`links` fields; an uncleared one returns no bundle
+on the agent path at all.
 
 ## Corrections and retirement (#746)
 
@@ -190,7 +209,7 @@ tokens. Near-ULID bare runs are not IDs.
 - Name-only prose.
 - `check`'s location field still shows the paths of invalid files.
 
-`context` honours `no-ai` on the same terms as `find`.
+`context` honours `no-ai` on the same terms as `find`; a non-person-like pack entity that is uncleared gets no agent bundle at all.
 
 ## Pack scoping (issue #178)
 

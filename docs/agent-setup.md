@@ -137,9 +137,10 @@ The command creates the directory and runs `git init` with branch `main`
 the skeleton. There is no secret to store and no enrollment step. Without
 `--remote` it adds no git remote. It never pushes.
 
-Packs are optional. `packs = []` is clean: `personal@0.2` is built in and
-implicit, so `check` starts with birthdays, cadence, and the `touch` verb.
-To add another pack after init:
+Packs are optional. `packs = []` is clean: the active personal pack is built
+in and implicit — `personal@0.3` on a 0.4 vault, `personal@0.2` on 0.1–0.3 —
+so `check` starts with birthdays, cadence, the `touch` verb, and (on 0.4)
+places and things. To add another pack after init:
 
 ```sh
 confidant pack add <https-url> --yes

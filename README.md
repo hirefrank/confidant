@@ -8,8 +8,9 @@ your life — the friend you meant to call, a sibling's birthday, the mentor
 you last saw in March — in one private place your AI agents can read and
 update. Each person is a Markdown file with notes, dates, and a log of every
 touch; `confidant check` turns that into who is overdue and which dates are
-coming up. Spec 0.4 keeps people first, lets a pack declare other entity
-types such as places and things, and adds corrections and record retirement.
+coming up. Spec 0.4 keeps people first, adds built-in **places** and
+**things** to the personal schema, and adds corrections and record
+retirement.
 
 Records are plain-text files in a git repo (the **vault**); the Rust CLI
 `confidant` reads, checks, and writes them. There is no server, and a ledger
@@ -22,8 +23,9 @@ quickstart](#first-five-minutes-the-people-in-your-life).
 
 Starting over, or adopting Confidant in stages? See
 [Starting fresh, and adopting in stages](docs/starting-fresh.md) — personal
-relationships first (`personal@0.2` is built in), extra packs later, in the
-same vault.
+relationships first (the active personal pack is built in: `personal@0.3`
+on spec 0.4, `personal@0.2` on older vaults), extra packs later, in the same
+vault.
 
 ## Install
 
@@ -330,18 +332,20 @@ declare their own endpoint types with `from` / `to` in the pack manifest.
 
 ### Places, things, and pack-declared types
 
-Spec 0.4 is current. A v3 pack manifest can declare a record type with
-`[[record_types]]`: its name, two-letter ID prefix, collection directory,
-main file, entity/person-like flags, `no_ai` policy, roster visibility, and
-required/optional fields. A `place` and a `thing` are the same shape; the
-name is the pack's choice. See
+Spec 0.4 is current. In a 0.4 vault the default `personal@0.3` pack declares
+`place` and `thing`; a 0.3 vault can get the same shape from an external v3
+pack. A v3 pack manifest declares a record type with `[[record_types]]`: its
+name, two-letter ID prefix, collection directory, main file,
+entity/person-like flags, `no_ai` policy, roster visibility, and
+required/optional fields. See
 [`spec/pack-manifest.md`](spec/pack-manifest.md) for the full table and the
 two-letter prefix rules.
 
 The repo's checked-in
-[`testdata/vaults/place-0.3`](testdata/vaults/place-0.3) is a complete fake
-example. In a 0.3 vault with a pack that declares `place`, add one from a
-file and attach a note:
+[`testdata/vaults/personal-0.4`](testdata/vaults/personal-0.4) is the
+built-in default example, and
+[`testdata/vaults/place-0.3`](testdata/vaults/place-0.3) is the external-pack
+version. In a 0.4 vault, add a place from a file and attach a note:
 
 ```sh
 cat > /tmp/place.md <<'PLACE'
@@ -349,6 +353,7 @@ cat > /tmp/place.md <<'PLACE'
 id: pl-01M3TC5H00MPJG000000000201
 type: place
 name: Example Studio
+kind: work
 address: 1 Example Way
 ---
 Fake place.
@@ -373,11 +378,13 @@ still resolves core people only; use the opaque ID for a pack type.
 check-gated commit as every other record.
 
 The demo vault stays on **spec 0.2** on purpose: it demonstrates the
-person/org model without requiring a pack. The 0.3 fixture demonstrates the
-pack-declared model; neither vault is migrated by this release. Run its
-checked-in golden case with:
+person/org model without requiring a pack. The 0.4 fixture demonstrates the
+built-in places/things model, and the 0.3 fixture demonstrates the
+external-pack model; neither vault is migrated by this release. Run their
+checked-in golden cases with:
 
 ```sh
+confidant check --json --no-input --vault testdata/vaults/personal-0.4
 confidant check --json --no-input --vault testdata/vaults/place-0.3
 ```
 
@@ -455,16 +462,22 @@ metrics, and check rules; its manifest
 ([`spec/pack-manifest.md`](spec/pack-manifest.md)) is the machine-readable
 contract.
 
-**`personal@0.2` is built in and always on.** It supplies the relationships
-schema this README describes: birthdays (full dates or year-less `--MM-DD`),
-recurring dates, `relationship`, `cadence` with `snooze_until`, contact
-fields, relationship edges (person↔person; core adds the person→org kinds),
-the `touch` verb, and two warning-level rules (`W_CADENCE_OVERDUE`,
-`W_DATE_UPCOMING`) that never block a write. Contract:
-[`packs/personal/0.2.md`](packs/personal/0.2.md). A vault needs no other pack
-to be useful, and a `personal@…` entry in `packs` is a no-op. Personal stays
-**person-only in spec 0.3**: it declares no record types; places, things, and
-other domain entities are a capability of external packs.
+**The personal pack is built in and always on.** Spec 0.4 selects
+`personal@0.3`; it supplies the relationships schema this README describes —
+birthdays (full dates or year-less `--MM-DD`), recurring dates,
+`relationship`, `cadence` with `snooze_until`, contact fields, relationship
+edges (person↔person; core adds the person→org kinds), the `touch` verb, and
+two warning-level rules (`W_CADENCE_OVERDUE`, `W_DATE_UPCOMING`) that never
+block a write — plus built-in `place` and `thing` types with `kind`,
+`address`, `tags`, `links`, and the `visited` / `lives_at` / `owns` /
+`located_at` edges. Contract:
+[`packs/personal/0.3.md`](packs/personal/0.3.md). Vaults on spec 0.1–0.3
+keep the frozen `personal@0.2`, which is person-only
+([`packs/personal/0.2.md`](packs/personal/0.2.md)). A vault needs no other
+pack to be useful, and a `personal@…` entry in `packs` is a no-op; the vault
+`spec` selects the version. `context` exposes a place/thing's declared fields
+in `entity.fields`; `--exclude-private` strips `address`, `tags`, and
+`links`, and an uncleared place/thing returns no agent bundle at all.
 
 **Extra domains are optional packs in the same vault.** `init --create`
 seeds `packs = []`, and `check` is clean without one.
@@ -562,9 +575,9 @@ That makes the perimeter easy to state, and it is the whole privacy model:
   pushed there stays in history (deleting a file is not erasing it).
 - **`no-ai`.** A record or a person can be marked `no-ai`, which keeps its
   content out of `find`, `context`, the allowlist, MCP, and the search
-  corpus that agents read. Content stays out while `context` still serves
-  derived ledger metadata; the flag itself is visible in the record's front
-  matter.
+  corpus that agents read. A person's `context` bundle still serves derived
+  ledger metadata; a `no-ai` place or thing returns no agent bundle at all.
+  The flag itself is visible in the record's front matter.
 
 `no-ai` is an exposure control, not access control: the operator owns the
 files, and an agent with a shell on the same machine can read them. A stolen
@@ -595,7 +608,7 @@ Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 
 The roadmap is the open issues on GitHub. The current themes:
 
-- **Domain model** — spec 0.3 makes record types pack-declarable and edges entity-aware; follow-ups add personal-pack places/things and richer cross-pack domains ([#796](https://github.com/hirefrank/confidant/issues/796)).
+- **Domain model** — spec 0.4 adds the built-in `personal@0.3` places/things schema; richer cross-pack domains remain ([#796](https://github.com/hirefrank/confidant/issues/796)).
 - **Agent ergonomics** — cheaper reads across MCP calls ([#543](https://github.com/hirefrank/confidant/issues/543)).
 - **TUI** — a new-person modal ([#621](https://github.com/hirefrank/confidant/issues/621)).
 - **First-run setup** — pack selection on `init --create` ([#639](https://github.com/hirefrank/confidant/issues/639)), a safer `init` on a non-empty directory ([#640](https://github.com/hirefrank/confidant/issues/640)).
