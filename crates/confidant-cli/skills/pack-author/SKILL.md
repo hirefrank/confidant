@@ -1,6 +1,6 @@
 ---
 name: "pack-author"
-description: "Author a local Confidant schema pack: decide whether the need is a pack, a skill-only workflow, or a core change; scaffold with `confidant pack init`; review the claims and skill text with the operator; install only after explicit confirmation."
+description: "Author a local Confidant schema pack: decide whether the need is a pack, a skill-only workflow, or a core change; scaffold with `confidant pack init`; declare fields, verbs, edge kinds, or spec 0.3 record types; review the claims and skill text with the operator; install only after explicit confirmation."
 ---
 
 # Author a local pack
@@ -17,13 +17,14 @@ Ask in this order; stop at the first fit.
 
 | Need | Do this |
 |---|---|
-| New front-matter fields, ledger verbs, edge kinds, finding codes, or checks built from an existing rule kind | **Write a pack.** Continue below. |
+| New front-matter fields, ledger verbs, edge kinds, finding codes, checks built from an existing rule kind, or a new domain record type (place, thing, client) | **Write a pack.** Continue below. |
 | A workflow over records and notes that already exist | **Write or adjust an agent skill**, not a pack. Use the CLI's existing verbs and reads. |
 | New logic: a parser, fold, balance rule, date rule, or anything with branching/arithmetic | **Core change.** A pack cannot carry code or define a rule kind; file an upstream issue with the operator. |
 
-Also check the scope: fields a pack declares become available in the vault,
-but a pack cannot widen the §12 allowlist, read `no-ai` content, or change
-core verbs, record types, edge kinds, or finding codes.
+Also check the scope: fields and record types a pack declares become
+available in the vault, but a pack cannot widen the §12 allowlist, read
+`no-ai` content, or claim core verbs, core record types, core edge kinds, or
+core finding codes.
 
 ## 2. Scaffold outside the vault
 
@@ -34,16 +35,22 @@ vault. The vendored copy under `<vault>/packs/` is generated and pinned.
 confidant pack init ~/confidant-packs/<name> --name <name>
 ```
 
-`pack init` writes `manifest.toml`, `SKILL.md`, `<version>.md` and
-`README.md`. It refuses a non-empty directory or a symlink, defaults the
-name to the directory basename and the version to `0.1`, and validates the
-result before it reports success. Use `--dry-run` to see the plan first.
+`pack init` writes a valid **v3** manifest (`manifest_version = 3`,
+`requires_spec = ["0.3"]`), `SKILL.md`, `<version>.md` and `README.md`. The
+template's record-type example is commented out, so the scaffold installs
+before you claim anything. It refuses a non-empty directory or a symlink,
+defaults the name to the directory basename and the version to `0.1`, and
+validates the result before it reports success. Use `--dry-run` to see the
+plan first.
 
 ## 3. Fill in the claims
 
 Edit `manifest.toml` and keep within the declarative vocabulary in
 `spec/pack-manifest.md`:
 
+- `[[record_types]]` — a record type this pack owns (spec 0.3): name,
+  two-letter ID prefix, collection directory, main file, `entity` /
+  `person_like` / `no_ai` / `roster` flags, and required/optional fields;
 - `[[fields]]` — a field name plus one **fixed** grammar (`recurring-date`,
   `cadence`, `date`, `non-empty-string`, `list`, `labeled-list`,
   `dates-list`);
@@ -58,6 +65,19 @@ Edit `manifest.toml` and keep within the declarative vocabulary in
   `activity-gap`).
 
 Do not invent keys or grammar names. Unknown keys are a hard load error.
+
+**Record type rules.** `id_prefix` is exactly two lowercase letters. It
+must not be a core prefix (`p`, `o`, `d`, `i`, `n`, `e`, or `pkg`), and its
+second letter must not be one of the single-letter core prefixes, so the
+scanner cannot confuse `xp-` with a glued `p-`. `collection` and
+`main_file` define the vault layout and must be unique across enabled packs.
+`entity = true` makes the type a `context` target, an edge endpoint, and an
+`entity:` target; `person_like = true` also opts into person read semantics
+and implies `entity`. `no_ai` is `none`, `full`, or `notes` (`notes`
+requires `person_like`). `roster = true` includes the type in the default
+all-types listing; an explicit type view works for any declared type.
+Required/optional fields must be `name` or fields declared in this manifest.
+A manifest that declares record types must list `"0.3"` in `requires_spec`.
 
 Two details come from the kind's own section, not this skill:
 
@@ -167,6 +187,9 @@ editing surface, never the vendored copy.
 - No code runs from a pack; only the CLI's compiled rule kinds do work.
 - A pack cannot widen the §12 allowlist or read `no-ai` content. The CLI
   enforces that; pack text cannot change it.
-- New logic is a core change, not a pack change.
+- A pack may declare record types, fields, verbs, and edge kinds; it cannot
+  claim a core type or verb, and new parser/fold logic is a core change.
+- Installing a pack with a new record type makes that collection writable on
+  a spec 0.3 vault; a 0.2 vault rejects the pack with `E_PACK_VERSION`.
 - The operator reviews the manifest and `SKILL.md` like code. Do not
   install, update, or commit without explicit confirmation.

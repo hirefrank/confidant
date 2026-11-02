@@ -34,12 +34,16 @@ Read before changing behaviour:
   ADR-1 to ADR-19, milestones (section 8), and risk decisions (section 9b,
   binding).
 - [`testdata/packs/example-pack/`](testdata/packs/example-pack/): the neutral external-pack fixture used by tests, the QA smoke, and the benchmark generator.
+- [`testdata/packs/place-pack/`](testdata/packs/place-pack/) and
+  [`testdata/vaults/place-0.3/`](testdata/vaults/place-0.3/): the spec 0.3
+  record-type fixture, its vendored pack pin, and its `check --json` golden.
+  Fake data only; keep the demo vault on 0.2.
 - [`packs/personal/0.2.md`](packs/personal/0.2.md): the personal
   relationships pack (implicit built-in).
 - [`spec/pack-manifest.md`](spec/pack-manifest.md): the pack manifest
   format. The manifest (`packs/<name>/manifest.toml`) is the single
-  source of truth for a pack's claims (verbs, fields, edge kinds,
-  finding codes, `[checks]` keys, message templates); the folds and
+  source of truth for a pack's claims (record types, verbs, fields, edge
+  kinds, finding codes, `[checks]` keys, message templates); the folds and
   findings logic stay in Rust.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) and
   [`docs/borrowing.md`](docs/borrowing.md): contributor setup, and what was
@@ -56,7 +60,8 @@ Read before changing behaviour:
 | `spec/` | Format spec and finding codes |
 | `packs/` | Schema packs (built-in personal; external packs live in the vault) |
 | `crates/confidant-cli/pack-skills/`, `crates/confidant-core/pack-manifests/` | In-crate vendored pack skill/manifest copies the binary embeds; regenerate with `python3 .github/scripts/sync-packs.py` (drift tests guard them) |
-| `examples/demo-vault/` | Fake-data vault used by tests, docs, and CI |
+| `examples/demo-vault/` | Fake-data 0.2 vault used by tests, docs, and CI |
+| `testdata/vaults/place-0.3/` | Checked-in 0.3 fixture for pack-declared types, entity notes, and edge `no-ai` |
 | `testdata/golden/` | Golden `check --json` outputs |
 | `docs/` | Architecture, privacy, sync, benchmarks, research |
 | `contrib/` | Opt-in systemd/launchd timer templates for `confidant sync` (#665) |

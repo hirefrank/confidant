@@ -320,10 +320,16 @@ requires_spec = ["0.3"]
 #   confidant pack add --from-dir <this-directory>
 # ---------------------------------------------------------------------------
 
-# A record type this pack owns (manifest v3, vault spec 0.3). `entity`
+# A record type this pack owns (manifest v3, vault spec 0.3). `id_prefix`
+# is exactly two lowercase letters and must not be a core prefix (`p`, `o`,
+# `d`, `i`, `n`, `e`, or `pkg`); its second letter must not be one of the
+# single-letter core prefixes either. `collection` and `main_file` are the
+# vault layout, and both must be unique across enabled packs. `entity`
 # opts into context targets and edge endpoints; `person_like` adds person
-# read semantics. `no_ai` is none, full, or notes (notes requires
-# person_like). `roster` includes it in `record list --kind all`.
+# read semantics and implies `entity`. `no_ai` is none, full, or notes
+# (notes requires person_like). `roster` includes it in
+# `record list --kind all`. Required fields must be `name` or a field
+# declared below; optional fields follow the same rule.
 # [[record_types]]
 # name = "example"
 # id_prefix = "ex"
@@ -402,10 +408,11 @@ description: "@NAME@ pack for a Confidant vault. Declarative claims only; propos
 
 # @NAME@ pack
 
-This pack extends a Confidant vault's vocabulary (fields, verbs, finding
-codes and checks) through `manifest.toml`. It carries no executable code:
-every parser, fold and finding runs in the CLI, and a pack cannot add Rust
-logic.
+This pack extends a Confidant vault's vocabulary (record types, fields,
+verbs, finding codes and checks) through `manifest.toml`. It carries no
+executable code: every parser, fold and finding runs in the CLI, and a pack
+cannot add Rust logic. Spec 0.3 record types use `[[record_types]]` tables;
+a type must list `"0.3"` in `requires_spec`.
 
 ## When to use it
 
@@ -416,7 +423,7 @@ core behaviour; that needs a Confidant core change.
 ## Propose, then wait
 
 1. Read `manifest.toml` and this file. State the claims in plain language:
-   verbs, fields, finding codes, and each rule's parameters.
+   record types, verbs, fields, finding codes, and each rule's parameters.
 2. Show the operator the exact manifest and SKILL.md diff. Pack text becomes
    agent instructions, so the operator must read it.
 3. Wait for explicit confirmation. Never install, update, or commit a pack
@@ -431,7 +438,9 @@ core behaviour; that needs a Confidant core change.
 - A pack cannot widen the §12 allowlist or read `no-ai` content. The CLI
   enforces that; pack text cannot change it.
 - A pack cannot add code, run scripts, or define a new rule kind. New logic
-  is a core change.
+  is a core change. A pack may declare a record type, but it cannot claim a
+  core type or verb; a type's two-letter prefix must follow the manifest
+  rules.
 - Keep claims namespaced to this pack (`@NAME@.<key>`), and never reuse a
   core verb, record type, edge kind, or finding code.
 "#;
@@ -448,6 +457,9 @@ balance metrics, finding codes, or rules.
 
 `manifest.toml` is the single source of truth. It may claim:
 
+- `[[record_types]]` — a pack-declared record type for spec 0.3: name,
+  two-letter ID prefix, collection and main file, entity/person-like flags,
+  `no_ai`, roster visibility, and required/optional fields;
 - `[[fields]]` — front-matter fields and one of the fixed grammars;
 - `[[verbs]]` — ledger verbs (never a core verb);
 - `[[edge_kinds]]` — relationship kinds and symmetry;
@@ -455,6 +467,11 @@ balance metrics, finding codes, or rules.
 - `finding_codes` plus `[messages.<CODE>]` — the text the pack can emit;
 - `[checks]` — operator-tunable severity and integer keys;
 - `[[rules]]` — parameters for a core rule kind.
+
+A record type's ID prefix is exactly two lowercase letters, must not be a
+core one-letter prefix (`p`, `o`, `d`, `i`, `n`, `e`) or `pkg`, and its second
+letter must not be one of those core letters. A type that declares record
+types must list `"0.3"` in `requires_spec`.
 
 It cannot claim behaviour. `fold`, `findings`, balance math, date math and
 every grammar parser stay in Confidant's Rust core; adding a rule kind is a
@@ -510,7 +527,9 @@ confidant pack verify
 
 ## Iterate
 
-1. Edit `manifest.toml` (and `SKILL.md` / `<version>.md`).
+1. Edit `manifest.toml` (and `SKILL.md` / `<version>.md`). For a new
+   domain record type, add a `[[record_types]]` table and include `"0.3"`
+   in `requires_spec`.
 2. Bump `[pack].version` and rename the contract file to `<new-version>.md`.
 3. Review again: `confidant pack add --from-dir <this-directory>`.
 4. Apply: `confidant pack update @NAME@ --from-dir <this-directory> --yes`.

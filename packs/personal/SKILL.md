@@ -16,6 +16,10 @@ alongside any external pack in one vault — a contact can also be a member
 of another pack's workflow, and each pack's data scopes independently
 (#178).
 
+**Spec 0.3:** this pack stays person-only. It declares no `[[record_types]]`;
+places, things, and other domain entities come from external packs that
+declare their own two-letter prefix, collection, and `entity:` targets.
+
 The pack is **implicit**: every vault has it, whether or not
 `confidant.toml` lists it. A vault that lists an external pack explicitly
 looks like:
@@ -31,7 +35,8 @@ Personal fields are owned by the pack, the personal edge kinds are known, and
 the cadence/date rules always run. A `touch` line is both a core mirror
 touchpoint and the pack's richer form; the pack owns it.
 
-**0.1 history.** This is the 0.2 contract. The compiled `personal@0.1` pack
+**0.1 history.** This is the 0.2 contract, also supported by spec 0.3. The
+compiled `personal@0.1` pack
 (in place until the #551 cutover) kept the 0.1 field set: it named the
 relationship field `relationship_to_me` and claimed only `birthday`,
 `cadence`, `relationship_to_me`, and `dates`. It is gone; `personal@…`

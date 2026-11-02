@@ -176,6 +176,44 @@ fn demo_vault_reports_the_personal_nudges() {
     assert!(report.summary.records >= 9);
 }
 
+/// The checked-in spec 0.3 fixture: a declared `place` pack type, two
+/// places, a visible `visited` edge, a hidden edge, and an `entity:` note.
+fn place_03_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/place-0.3")
+}
+
+#[test]
+fn place_03_fixture_matches_golden() {
+    let json = report_json(&place_03_fixture(), None);
+    assert_eq!(json["ok"], true, "{json}");
+    assert_eq!(codes(&json), Vec::<String>::new(), "{json}");
+    assert_golden("place-0.3.json", &json);
+}
+
+/// The fixture is also the privacy regression case: the hidden `visited`
+/// edge and the note that names it stay out of the agent cleared set, while
+/// both places, the visible edge, and the entity-attached note remain.
+#[test]
+fn place_03_fixture_hides_only_the_no_ai_edge_and_its_note() {
+    let vault = load_vault(&place_03_fixture()).unwrap();
+    let hidden = confidant_core::RecordId::parse("e-01M3TC5H00MPJG000000000105").unwrap();
+    let hidden_note = confidant_core::RecordId::parse("n-01M3TC5H00MPJG000000000107").unwrap();
+    let visible = confidant_core::RecordId::parse("e-01M3TC5H00MPJG000000000104").unwrap();
+    let entity_note = confidant_core::RecordId::parse("n-01M3TC5H00MPJG000000000106").unwrap();
+    let place = confidant_core::RecordId::parse("pl-01M3TC5H00MPJG000000000102").unwrap();
+
+    let cleared = confidant_core::cleared_record_ids(&vault);
+    assert!(!cleared.contains(&hidden));
+    assert!(!cleared.contains(&hidden_note));
+    assert!(cleared.contains(&visible));
+    assert!(cleared.contains(&entity_note));
+    assert!(cleared.contains(&place));
+
+    let operator = confidant_core::cleared_record_ids_for_operator(&vault);
+    assert!(operator.contains(&hidden));
+    assert!(operator.contains(&hidden_note));
+}
+
 /// The `balance_mismatch` golden vault's records and ledger, shared by the
 /// golden test and the #449 fixture parity test.
 fn balance_mismatch_vault(root: &Path) {
