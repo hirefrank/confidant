@@ -8,7 +8,8 @@ your life — the friend you meant to call, a sibling's birthday, the mentor
 you last saw in March — in one private place your AI agents can read and
 update. Each person is a Markdown file with notes, dates, and a log of every
 touch; `confidant check` turns that into who is overdue and which dates are
-coming up.
+coming up. Spec 0.3 keeps people first and lets a pack declare other entity
+types, such as places and things, in the same vault.
 
 Records are plain-text files in a git repo (the **vault**); the Rust CLI
 `confidant` reads, checks, and writes them. There is no server, and a ledger
@@ -242,10 +243,12 @@ explicitly instead of relying on an exported variable — and never
 stale `CONFIDANT_VAULT` can make `check` inspect the wrong vault.
 
 `confidant record list` prints the cleared roster and defaults to every
-identity kind — people, orgs, and deals — so Example Studio appears without
-knowing to pass `--kind org`. Use `--kind person` for the people-only view.
-Records marked `no-ai: true` are absent. `confidant check` lists what needs
-attention:
+identity kind — people, orgs, deals, plus any pack-declared type with
+`roster = true`. On this 0.2 demo that means people, orgs, and deals, so
+Example Studio appears without knowing to pass `--kind org`. Use `--kind
+person` for the people-only view, or `--kind <type>` for a declared pack
+type. Records marked `no-ai: true` are absent. `confidant check` lists what
+needs attention:
 
 ```text
 warning  W_CADENCE_OVERDUE  people/p-01M3TC5H00MPJG000000000101/profile.md  p-01M3TC5H00MPJG000000000101
@@ -309,18 +312,73 @@ has a `works_at` edge to Example Studio:
 confidant context o-01M3TC5H00MPJG000000000901
 ```
 
-`context` accepts a person or org ID. The bundle's `entity` is the target;
-`person` remains a deprecated alias for person targets. `edges` lists the
-relationships visible from that entity, with `direction` (`out` when the
-target is `a`, `in` when it is `b`, `none` for a symmetric kind) and the
-`other` endpoint. An org bundle also includes notes and interactions linked
-by `org:`.
+`context` accepts a person or org ID, or the ID of a pack-declared entity
+type. The bundle's `entity` is the target; `person` remains a deprecated
+alias for person targets. `edges` lists the relationships visible from that
+entity, with `direction` (`out` when the target is `a`, `in` when it is `b`,
+`none` for a symmetric kind) and the `other` endpoint. An org bundle also
+includes notes and interactions linked by `org:`; a pack-declared entity
+bundle includes notes and interactions linked by `entity:`.
 
 An edge is agent-visible only when both endpoints are cleared; a
-`no-ai: true` endpoint removes the whole edge, with no count or hint.
-`--exclude-private` strips names but keeps opaque IDs, kinds, and dates.
-Orgs and edges do not take `no-ai` in this version. Pack kinds can declare
-their own endpoint types with `from` / `to` in the pack manifest.
+`no-ai: true` endpoint removes the whole edge, with no count or hint. In
+spec 0.3 an edge can itself carry `no-ai: true` / `false`; a hidden edge is
+omitted from every agent read while both endpoints stay visible, and the
+operator path badges it. Orgs still do not take `no-ai`. Pack kinds can
+declare their own endpoint types with `from` / `to` in the pack manifest.
+
+### Places, things, and pack-declared types
+
+Spec 0.3 is current. A v3 pack manifest can declare a record type with
+`[[record_types]]`: its name, two-letter ID prefix, collection directory,
+main file, entity/person-like flags, `no_ai` policy, roster visibility, and
+required/optional fields. A `place` and a `thing` are the same shape; the
+name is the pack's choice. See
+[`spec/pack-manifest.md`](spec/pack-manifest.md) for the full table and the
+two-letter prefix rules.
+
+The repo's checked-in
+[`testdata/vaults/place-0.3`](testdata/vaults/place-0.3) is a complete fake
+example. In a 0.3 vault with a pack that declares `place`, add one from a
+file and attach a note:
+
+```sh
+cat > /tmp/place.md <<'PLACE'
+---
+id: pl-01M3TC5H00MPJG000000000201
+type: place
+name: Example Studio
+address: 1 Example Way
+---
+Fake place.
+PLACE
+
+confidant record add --file /tmp/place.md
+confidant record list --kind place
+confidant context pl-01M3TC5H00MPJG000000000201
+
+cat > /tmp/place-note.md <<'NOTE'
+The back room was quiet; we stayed for two hours.
+NOTE
+confidant note add --entity pl-01M3TC5H00MPJG000000000201 --body-file /tmp/place-note.md
+confidant context pl-01M3TC5H00MPJG000000000201   # bundle notes now include it
+```
+
+`--kind <type>` takes the declared type name (for example `place`), not a
+collection name. `--kind all` includes declared types with `roster = true`;
+`--kind person` stays core-person-only. `context` by name
+still resolves core people only; use the opaque ID for a pack type.
+`record add`, `record edit`, and `note add --entity` write the same
+check-gated commit as every other record.
+
+The demo vault stays on **spec 0.2** on purpose: it demonstrates the
+person/org model without requiring a pack. The 0.3 fixture demonstrates the
+pack-declared model; neither vault is migrated by this release. Run its
+checked-in golden case with:
+
+```sh
+confidant check --json --no-input --vault testdata/vaults/place-0.3
+```
 
 ## How your agents use it
 
@@ -394,7 +452,9 @@ fields, relationship edges (person↔person; core adds the person→org kinds),
 the `touch` verb, and two warning-level rules (`W_CADENCE_OVERDUE`,
 `W_DATE_UPCOMING`) that never block a write. Contract:
 [`packs/personal/0.2.md`](packs/personal/0.2.md). A vault needs no other pack
-to be useful, and a `personal@…` entry in `packs` is a no-op.
+to be useful, and a `personal@…` entry in `packs` is a no-op. Personal stays
+**person-only in spec 0.3**: it declares no record types; places, things, and
+other domain entities are a capability of external packs.
 
 **Extra domains are optional packs in the same vault.** `init --create`
 seeds `packs = []`, and `check` is clean without one.
@@ -525,7 +585,7 @@ Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 
 The roadmap is the open issues on GitHub. The current themes:
 
-- **Domain model** — record types and edges defined by packs, so a domain beyond people is first-class ([#796](https://github.com/hirefrank/confidant/issues/796)).
+- **Domain model** — spec 0.3 makes record types pack-declarable and edges entity-aware; follow-ups add personal-pack places/things and richer cross-pack domains ([#796](https://github.com/hirefrank/confidant/issues/796)).
 - **Agent ergonomics** — cheaper reads across MCP calls ([#543](https://github.com/hirefrank/confidant/issues/543)).
 - **TUI** — a new-person modal ([#621](https://github.com/hirefrank/confidant/issues/621)).
 - **First-run setup** — pack selection on `init --create` ([#639](https://github.com/hirefrank/confidant/issues/639)), a safer `init` on a non-empty directory ([#640](https://github.com/hirefrank/confidant/issues/640)).

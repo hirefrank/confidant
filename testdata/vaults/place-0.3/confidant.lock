@@ -1,0 +1,9 @@
+lock_version = 1
+
+[[pack]]
+name = "place-pack"
+version = "0.1"
+source = "dir"
+rev = ""
+subdir = ""
+hash = "sha256:d8068bff662fd9b0ee630f34c2c4e03cacdd804bf79c7e33cd4d29bfdf45aa69"
