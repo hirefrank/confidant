@@ -52,6 +52,7 @@ pub use record_type::{
     NoAiPolicy, RecordSchema, RecordTypeDecl, RetiredTypeConfig, TypeOwner, TypeProblem,
     TypeRegistry, TypeSource,
 };
+pub use resolve::canonical_record_id;
 pub use roster::{build_roster, Roster, RosterEntry};
 pub use scope::{
     intersect_scope, note_linkage_owners, owner_labels, owners_of_ledger_text, parse_pack_list,

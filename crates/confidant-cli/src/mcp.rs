@@ -490,6 +490,13 @@ mod tests {
             "edit",
             "list",
             "resolve",
+            "retract",
+            "correct",
+            "record_retire",
+            "record_unretire",
+            "retract_line",
+            "correct_line",
+            "retire",
         ] {
             assert!(
                 !names.contains(&forbidden),

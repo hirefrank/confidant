@@ -316,7 +316,11 @@ pub fn build_context(
     let operator_cleared = for_operator.then(|| cleared_record_ids_for_operator(vault));
     let cleared: &HashSet<RecordId> = operator_cleared.as_ref().unwrap_or(&agent_cleared);
     let hidden_by_no_ai: HashSet<RecordId> = match &operator_cleared {
-        Some(op) => op.difference(&agent_cleared).cloned().collect(),
+        Some(op) => op
+            .difference(&agent_cleared)
+            .filter(|id| !vault.is_retired(id))
+            .cloned()
+            .collect(),
         None => HashSet::new(),
     };
     let no_ai = record.no_ai();
@@ -331,6 +335,11 @@ pub fn build_context(
     let merges = check_aliases_and_merges(vault, &known_ids, as_of, &mut merge_findings);
     drop(merge_findings);
     let canonical = canonical_on(target, &merges, as_of);
+    // Retirement is evaluated on the merge-canonical record: a retire flag
+    // on a merged-away member must not resurrect or leak the group.
+    if vault.is_retired(&canonical) {
+        return None;
+    }
 
     let no_ai_mode = for_operator.then(|| operator_no_ai_badge(record, &hidden_by_no_ai));
     let entity = EntityView {
@@ -399,7 +408,10 @@ pub fn build_context(
         .records
         .values()
         .filter(|r| {
-            if r.kind != RecordKind::Note || !cleared.contains(&r.id) {
+            if r.kind != RecordKind::Note
+                || !cleared.contains(&r.id)
+                || vault.is_retired(&canonical_on(&r.id, &merges, as_of))
+            {
                 return false;
             }
             let attached = r.entity().as_ref() == Some(&canonical)
@@ -422,7 +434,10 @@ pub fn build_context(
         .records
         .values()
         .filter(|r| {
-            if r.kind != RecordKind::Interaction || !cleared.contains(&r.id) {
+            if r.kind != RecordKind::Interaction
+                || !cleared.contains(&r.id)
+                || vault.is_retired(&canonical_on(&r.id, &merges, as_of))
+            {
                 return false;
             }
             let attached = r.entity().as_ref() == Some(&canonical)
@@ -461,8 +476,7 @@ pub fn build_context(
         // so they carry no cleared-set gate; scope-filtered by verb ownership
         // (core for kind-less touchpoints).
         touchpoints = vault
-            .entries
-            .iter()
+            .effective_entries()
             .filter(|s| {
                 s.entry.verb == "touch"
                     && canonical_on(&s.entry.id, &merges, as_of) == canonical
@@ -493,7 +507,10 @@ pub fn build_context(
     let mut edges: Vec<EdgeView> = Vec::new();
     let mut seen_edges: HashSet<(RecordId, RecordId, String)> = HashSet::new();
     for rec in vault.records.values() {
-        if rec.kind != RecordKind::Edge || !cleared.contains(&rec.id) {
+        if rec.kind != RecordKind::Edge
+            || !cleared.contains(&rec.id)
+            || vault.is_retired(&canonical_on(&rec.id, &merges, as_of))
+        {
             continue;
         }
         let Some(kind_name) = rec.field("kind") else {
@@ -522,6 +539,9 @@ pub fn build_context(
         }
         let canonical_a = canonical_on(&a, &merges, as_of);
         let canonical_b = canonical_on(&b, &merges, as_of);
+        if vault.is_retired(&canonical_a) || vault.is_retired(&canonical_b) {
+            continue;
+        }
         if canonical_a == canonical_b {
             continue;
         }
@@ -1403,5 +1423,39 @@ mod tests {
         let dumped = serde_json::to_string(&bundle).unwrap();
         assert!(!dumped.contains(CTX_CAM), "{dumped}");
         assert!(!dumped.contains("Cam Sample"), "{dumped}");
+    }
+
+    #[test]
+    fn corrections_fixture_hides_superseded_and_retired() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/vaults/corrections-0.4");
+        let vault = crate::vault::load_vault(&root).unwrap();
+        let ada = RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        let bea = RecordId::parse("p-01M3TC5H00MPJG000H24000001").unwrap();
+        let cam = RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
+
+        let ada_bundle = build_context(&vault, &ada, true, &PackScope::All, false).unwrap();
+        assert_eq!(
+            ada_bundle.touchpoints.len(),
+            1,
+            "{:?}",
+            ada_bundle.touchpoints
+        );
+        assert_eq!(ada_bundle.touchpoints[0].kind.as_deref(), Some("call"));
+
+        let bea_bundle = build_context(&vault, &bea, true, &PackScope::All, false).unwrap();
+        assert_eq!(
+            bea_bundle.touchpoints.len(),
+            1,
+            "{:?}",
+            bea_bundle.touchpoints
+        );
+        assert_eq!(bea_bundle.touchpoints[0].kind.as_deref(), Some("meet"));
+        let personal = &bea_bundle.packs["personal@0.2"];
+        assert_eq!(personal["recent_touches"].as_array().unwrap().len(), 1);
+        assert_eq!(personal["recent_touches"][0]["kind"], "meet");
+
+        assert!(build_context(&vault, &cam, true, &PackScope::All, false).is_none());
+        assert!(build_context(&vault, &cam, true, &PackScope::All, true).is_none());
     }
 }

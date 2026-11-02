@@ -113,6 +113,9 @@ pub fn resolve_person(vault: &Vault, query: &str) -> Result<PersonMatch, PersonR
     // `no-ai: true` person — working exactly as before.
     if let Ok(id) = RecordId::parse(query) {
         return match vault.records.get(&id) {
+            // A retired record is not an entity for any read. The miss is
+            // indistinguishable from an absent id (no existence oracle).
+            Some(_record) if vault.is_retired(&id) => Err(PersonResolveError::NotFound),
             Some(record) if record.kind == RecordKind::Person => Ok(PersonMatch {
                 id,
                 matched_by_name: false,
@@ -279,6 +282,13 @@ fn links_field_contains(record: &crate::record::Record, needle: &str) -> bool {
 /// canonicalize, and a name lookup needs a unique display name).
 /// It exposes no merge map and no canonicalization machinery.
 pub fn canonical_person_id(vault: &Vault, id: &RecordId) -> RecordId {
+    canonical_record_id(vault, id)
+}
+
+/// The merge-canonical id for any record type. Used by writes that must
+/// refuse a merged-away member (`record retire`), and by
+/// [`canonical_person_id`].
+pub fn canonical_record_id(vault: &Vault, id: &RecordId) -> RecordId {
     let as_of = resolve_as_of_date(vault);
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
     let mut merge_findings = Vec::new();
@@ -783,6 +793,22 @@ mod tests {
         let vault = load(&root);
         assert_eq!(
             resolve_alias(&vault, "email", "ada@example.com"),
+            Err(PersonResolveError::NotFound)
+        );
+    }
+
+    #[test]
+    fn retired_person_does_not_resolve_by_name_or_id() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/vaults/corrections-0.4");
+        let vault = load(&root);
+        let retired = "p-01M3TC5H00MPJG001248000002";
+        assert_eq!(
+            resolve_person(&vault, "Cam Retired"),
+            Err(PersonResolveError::NotFound)
+        );
+        assert_eq!(
+            resolve_person(&vault, retired),
             Err(PersonResolveError::NotFound)
         );
     }
