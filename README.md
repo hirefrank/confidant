@@ -515,7 +515,7 @@ Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 
 ## Where to go deeper
 
-- [`spec/0.2.md`](spec/0.2.md) — current vault format; [`spec/0.1.md`](spec/0.1.md) — frozen 0.1; [`spec/findings.md`](spec/findings.md) — finding codes; [`spec/pack-manifest.md`](spec/pack-manifest.md) — pack manifests.
+- [`spec/0.3.md`](spec/0.3.md) — current vault format; [`spec/0.2.md`](spec/0.2.md) and [`spec/0.1.md`](spec/0.1.md) — frozen; [`spec/findings.md`](spec/findings.md) — finding codes; [`spec/pack-manifest.md`](spec/pack-manifest.md) — pack manifests.
 - [`docs/architecture.md`](docs/architecture.md) — privacy, threat model, ADRs, milestones.
 - [`docs/privacy.md`](docs/privacy.md) — allowlist, `no-ai`, pack scoping, edges; [`docs/threat-model-agents.md`](docs/threat-model-agents.md) — agent limits and gaps.
 - [`docs/sync.md`](docs/sync.md) — the explicit git boundary and timer; [`docs/tui.md`](docs/tui.md) — TUI detail; [`docs/agent-setup.md`](docs/agent-setup.md) — headless hosts and updates.

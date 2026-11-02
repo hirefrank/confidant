@@ -108,7 +108,7 @@ fn init_create_makes_the_vault_shape_and_a_fallback_identity() {
 
     let config = std::fs::read_to_string(vault.join("confidant.toml")).unwrap();
     assert!(!config.contains("[crypto]"), "{config}");
-    assert!(config.contains("spec = \"0.2\""), "{config}");
+    assert!(config.contains("spec = \"0.3\""), "{config}");
 
     assert_eq!(git(&vault, &["branch", "--show-current"]).trim(), "main");
     assert_eq!(

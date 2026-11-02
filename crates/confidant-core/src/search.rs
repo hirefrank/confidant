@@ -9,8 +9,7 @@ use crate::check::{sort_findings, Finding, FindingCode, Severity};
 use crate::config::SpecVersion;
 use crate::error::DomainError;
 use crate::id::{
-    add_bare_ulid_windows, person_id_from_path, scan_ids, scan_prefixed_line, IdToken, Prefix,
-    PrefixedScan, RecordId,
+    add_bare_ulid_windows, scan_ids, scan_prefixed_line, IdToken, Prefix, PrefixedScan, RecordId,
 };
 use crate::ledger::ledger_line_verb;
 use crate::record::{parse_ref_id, parse_with_list, unquote, FrontmatterRef, RecordKind};
@@ -55,7 +54,7 @@ struct RecordFacts {
     fm_malformed: bool,
     fm_bad_ref: bool,
     fm_bare_ulids: Vec<String>,
-    path_person: Option<RecordId>,
+    path_entity: Option<RecordId>,
     body_start_line: u32,
     /// Tokenized once from BOM-stripped source; 1-based line numbers.
     line_tokens: Vec<(u32, Vec<IdToken>)>,
@@ -289,6 +288,15 @@ pub fn allowlist_is_fixed_point(vault: &Vault) -> bool {
 }
 
 impl<'a> Allowlist<'a> {
+    /// A record type is enabled when it is core or declared by an enabled
+    /// pack. Disabled, retired, and undeclared types fail closed for agents.
+    fn type_enabled(&self, rec: &crate::record::Record) -> bool {
+        self.vault
+            .type_registry()
+            .get(rec.kind.as_str())
+            .is_some_and(|decl| decl.enabled)
+    }
+
     /// The §12 agent allowlist: `no-ai` records are excluded.
     fn build(vault: &'a Vault, scope: &PackScope) -> Self {
         Self::build_with(vault, scope, false)
@@ -358,7 +366,10 @@ impl<'a> Allowlist<'a> {
             let lines = record_prefixed
                 .remove(&rec.id)
                 .expect("prefixed scan for every record");
-            facts.insert(rec.id.clone(), record_facts(rec, lines, &vault_ulids));
+            facts.insert(
+                rec.id.clone(),
+                record_facts(rec, lines, &vault_ulids, vault.type_registry()),
+            );
         }
         let ledger_tokens: Vec<Vec<IdToken>> = vault
             .ledger_lines
@@ -462,6 +473,7 @@ fn compute_cleared(allow: &Allowlist<'_>) -> HashSet<RecordId> {
         .records
         .values()
         .filter(|rec| (allow.operator || !rec.no_ai()) && !tainted.contains(&rec.id))
+        .filter(|rec| allow.operator || allow.type_enabled(rec))
         .filter(|rec| rec.person().is_none_or(|person| !tainted.contains(&person)))
         .filter(|rec| allow.operator || !inherits_notes_no_ai(rec, allow, &components))
         .map(|rec| rec.id.clone())
@@ -531,11 +543,14 @@ fn still_cleared(
         return false;
     }
     if let Some(rec) = allow.vault.records.get(id) {
+        if !allow.operator && !allow.type_enabled(rec) {
+            return false;
+        }
         if !allow.operator && inherits_notes_no_ai(rec, allow, components) {
             return false;
         }
     }
-    if let Some(person) = &facts.path_person {
+    if let Some(person) = &facts.path_entity {
         if !cleared.contains(person) {
             return false;
         }
@@ -597,7 +612,7 @@ fn inherits_notes_no_ai(
         }
     }
     if let Some(facts) = allow.facts.get(&rec.id) {
-        if let Some(ref person) = facts.path_person {
+        if let Some(ref person) = facts.path_entity {
             if person_has_notes_mode(person) {
                 return true;
             }
@@ -854,7 +869,12 @@ fn pkg_open_lines(allow: &Allowlist<'_>) -> Vec<OpenLine> {
                 Prefix::Package => {
                     pkgs.insert(id.clone());
                 }
-                Prefix::Org | Prefix::Deal | Prefix::Interaction | Prefix::Note | Prefix::Edge => {}
+                Prefix::Org
+                | Prefix::Deal
+                | Prefix::Interaction
+                | Prefix::Note
+                | Prefix::Edge
+                | Prefix::Pack(_) => {}
             }
         }
         if !people.is_empty() || !pkgs.is_empty() {
@@ -889,7 +909,7 @@ fn reverse_deps(
                     }
                 }
             }
-            if let Some(person) = &facts.path_person {
+            if let Some(person) = &facts.path_entity {
                 link(person.clone(), rec.id.clone());
             }
         }
@@ -919,6 +939,7 @@ fn record_facts(
     rec: &crate::record::Record,
     mut lines: Vec<(u32, PrefixedScan)>,
     vault_ulids: &HashSet<Arc<str>>,
+    types: &crate::record_type::TypeRegistry,
 ) -> RecordFacts {
     let text = rec.source.trim_start_matches('\u{feff}');
     let mut fm_ids = Vec::new();
@@ -950,7 +971,7 @@ fn record_facts(
         fm_malformed,
         fm_bad_ref,
         fm_bare_ulids,
-        path_person: person_id_from_path(&rec.path),
+        path_entity: crate::id::entity_id_from_path(&rec.path, types),
         body_start_line: rec.body_start_line,
         line_tokens,
     }
@@ -962,7 +983,7 @@ fn ledger_named_prefix(prefix: Prefix) -> bool {
         // An edge id named in a ledger line does not uncleared the edge:
         // §12's named-line rule covers notes, interactions, and deals
         // only. Edge linkage lives in front matter (`a` / `b`).
-        Prefix::Person | Prefix::Org | Prefix::Package | Prefix::Edge => false,
+        Prefix::Person | Prefix::Org | Prefix::Package | Prefix::Edge | Prefix::Pack(_) => false,
     }
 }
 
@@ -1153,7 +1174,7 @@ fn scan_record(
     // to filter.
     if matches!(
         rec.kind,
-        RecordKind::Note | RecordKind::Interaction | RecordKind::Edge
+        RecordKind::Note | RecordKind::Interaction | RecordKind::Edge | RecordKind::Pack { .. }
     ) && !body_visible
     {
         return;

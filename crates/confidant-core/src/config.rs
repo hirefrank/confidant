@@ -12,28 +12,31 @@ use crate::ledger::parse_strict_date;
 /// The spec version new vaults are written with (`confidant init`).
 /// Vaults declare their own version in `confidant.toml`; this binary reads
 /// every version in [`SpecVersion`].
-pub const SPEC_VERSION: &str = "0.2";
+pub const SPEC_VERSION: &str = "0.3";
 pub const MAX_GAP_DAYS: u64 = 3650;
 
 /// A vault spec version this binary can read.
 ///
 /// The spec version and the CLI version are independent (ADR-1). 0.1
 /// vaults keep the original, person-only edge rules; 0.2 adds entity
-/// endpoints. A version not listed here is `E_SPEC_UNSUPPORTED`.
+/// endpoints; 0.3 adds pack-declared record types. A version not listed
+/// here is `E_SPEC_UNSUPPORTED`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum SpecVersion {
     V01,
     V02,
+    V03,
 }
 
 impl SpecVersion {
     /// The newest version, written by `confidant init`.
-    pub const LATEST: Self = Self::V02;
+    pub const LATEST: Self = Self::V03;
 
     pub fn parse(spec: &str) -> Option<Self> {
         match spec {
             "0.1" => Some(Self::V01),
             "0.2" => Some(Self::V02),
+            "0.3" => Some(Self::V03),
             _ => None,
         }
     }
@@ -42,6 +45,7 @@ impl SpecVersion {
         match self {
             Self::V01 => "0.1",
             Self::V02 => "0.2",
+            Self::V03 => "0.3",
         }
     }
 
@@ -101,6 +105,10 @@ pub struct VaultConfig {
     pub vault_id: String,
     #[serde(default)]
     pub checks: ChecksConfig,
+    /// Types whose pack was removed (spec 0.3). Defined here so orphaned
+    /// records stay parseable; `pack remove` starts writing these with #699.
+    #[serde(default)]
+    pub retired_types: Vec<crate::record_type::RetiredTypeConfig>,
 }
 
 /// `[checks]` table. Unknown keys are `E_CONFIG` findings.
@@ -514,14 +522,16 @@ mod tests {
     fn spec_versions_parse_and_gate() {
         assert_eq!(SpecVersion::parse("0.1"), Some(SpecVersion::V01));
         assert_eq!(SpecVersion::parse("0.2"), Some(SpecVersion::V02));
-        assert_eq!(SpecVersion::parse("0.3"), None);
+        assert_eq!(SpecVersion::parse("0.3"), Some(SpecVersion::V03));
         assert_eq!(SpecVersion::parse(""), None);
-        assert_eq!(SpecVersion::LATEST, SpecVersion::V02);
+        assert_eq!(SpecVersion::LATEST, SpecVersion::V03);
         assert_eq!(SpecVersion::V01.as_str(), "0.1");
         assert_eq!(SpecVersion::V02.as_str(), "0.2");
+        assert_eq!(SpecVersion::V03.as_str(), "0.3");
         assert!(SpecVersion::is_supported("0.1"));
         assert!(SpecVersion::is_supported("0.2"));
-        assert!(!SpecVersion::is_supported("0.3"));
+        assert!(SpecVersion::is_supported("0.3"));
+        assert!(!SpecVersion::is_supported("0.4"));
     }
 
     /// Run config validation with the neutral external example-pack manifest
@@ -957,7 +967,7 @@ example-pack.require_duration = "error"
         // Proves the [checks] machinery is generic, not per-pack.
         let example_manifest = PackManifest {
             manifest_version: 1,
-            record_types: Vec::new(),
+            record_types: Default::default(),
             balance_metrics: Vec::new(),
             finding_codes: Vec::new(),
             pack: PackInfo {

@@ -337,11 +337,11 @@ pub(crate) fn run(
     }
 }
 
-/// Field grammar validation for an external pack (#441): every declared
-/// `[[fields]]` entry is validated on every `person` record, exactly
-/// like the built-in personal pack does. Messages come from the pack's
-/// own `[messages."E_FRONTMATTER"]` template (loader guarantees the
-/// pack declares it when it declares fields).
+/// Field grammar validation for a pack (#441): every declared `[[fields]]`
+/// entry is validated on core `person` records and on records of the pack's
+/// own declared types (spec 0.3). Messages come from the pack's own
+/// `[messages."E_FRONTMATTER"]` template (loader guarantees the pack
+/// declares it when it declares fields).
 fn validate_declared_fields(vault: &Vault, manifest: &PackManifest, out: &mut Vec<Finding>) {
     if manifest.fields.is_empty() {
         return;
@@ -349,7 +349,12 @@ fn validate_declared_fields(vault: &Vault, manifest: &PackManifest, out: &mut Ve
     let mut records: Vec<&crate::record::Record> = vault.records.values().collect();
     records.sort_by(|a, b| a.id.cmp(&b.id));
     for rec in records {
-        if rec.kind != crate::record::RecordKind::Person {
+        let own_type = rec.kind.as_str() == "person"
+            || manifest
+                .record_types
+                .iter()
+                .any(|name| name == rec.kind.as_str());
+        if !own_type {
             continue;
         }
         for field in &manifest.fields {

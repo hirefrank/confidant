@@ -309,6 +309,28 @@ pub fn note_linkage_owners(
             }
         }
     }
+    // Spec 0.3: a note or interaction attached with `entity:` inherits the
+    // owning pack of a pack-type entity. Core entities (person/org) add no
+    // pack owner; core stays visible under every scope.
+    for rec in vault.records.values() {
+        let Some(raw) = rec.field("entity") else {
+            continue;
+        };
+        let crate::record::FrontmatterRef::Id(target) = crate::record::parse_ref_id(raw) else {
+            continue;
+        };
+        let Some(target_rec) = vault.records.get(&target) else {
+            continue;
+        };
+        if let Some(pack) = enabled
+            .iter()
+            .find(|pack| pack.record_types().contains(&target_rec.kind.as_str()))
+        {
+            out.entry(rec.id.clone())
+                .or_default()
+                .insert(OwnerKey::Pack(pack.name()));
+        }
+    }
     out
 }
 
@@ -346,8 +368,20 @@ pub fn record_owners(
                     owners.insert(OwnerKey::Pack(name));
                 }
             }
+            if let Some(linked) = linkage.get(&record.id) {
+                owners.extend(linked.iter().copied());
+            }
             owners
         }
+        // A pack-declared type is pack-owned. A disabled/retired type is
+        // unattributed: visible only unscoped, and the type gate keeps it
+        // out of agent reads entirely.
+        RecordKind::Pack { .. } => enabled
+            .iter()
+            .find(|pack| pack.record_types().contains(&record.kind.as_str()))
+            .map(|pack| OwnerKey::Pack(pack.name()))
+            .into_iter()
+            .collect(),
         // #179: an edge is visible exactly when its kind's pack is in
         // scope. The edge's front matter has no pack-owned fields to
         // filter, so kind ownership is the whole story; a missing or

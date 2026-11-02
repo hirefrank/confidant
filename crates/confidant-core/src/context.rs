@@ -273,14 +273,13 @@ pub fn build_context(
         RecordKind::Person => true,
         RecordKind::Org => false,
         _ => return None,
-    };
-    // §12 allowlist. `cleared` is a fixpoint: a cleared id implies all of
-    // its merge-group members are cleared, so `cleared.contains` covers the
-    // "person AND every merge-group member" rule with one lookup. The
-    // operator variant ignores `no-ai` (#572) so an operator-only read
-    // surfaces records the agent path hides. `hidden_by_no_ai` is the
-    // operator-minus-agent difference: the records that are hidden *only*
-    // because of `no-ai`, which each view badges.
+    }; // §12 allowlist. `cleared` is a fixpoint: a cleared id implies all of
+       // its merge-group members are cleared, so `cleared.contains` covers the
+       // "person AND every merge-group member" rule with one lookup. The
+       // operator variant ignores `no-ai` (#572) so an operator-only read
+       // surfaces records the agent path hides. `hidden_by_no_ai` is the
+       // operator-minus-agent difference: the records that are hidden *only*
+       // because of `no-ai`, which each view badges.
     let agent_cleared = cleared_record_ids(vault);
     let operator_cleared = for_operator.then(|| cleared_record_ids_for_operator(vault));
     let cleared: &HashSet<RecordId> = operator_cleared.as_ref().unwrap_or(&agent_cleared);
@@ -475,7 +474,9 @@ pub fn build_context(
             // declaration is ignored.
             a.prefix() == Prefix::Person && b.prefix() == Prefix::Person
         } else {
-            a.prefix().is_entity() && b.prefix().is_entity() && kind.allows(a.prefix(), b.prefix())
+            vault.type_registry().is_entity(a.prefix())
+                && vault.type_registry().is_entity(b.prefix())
+                && kind.allows(a.prefix(), b.prefix())
         };
         if !endpoints_ok {
             continue;
