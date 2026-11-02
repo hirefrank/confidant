@@ -22,7 +22,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use confidant_core::check::parse_fail_on;
 use confidant_core::config::parse_iso_date;
 use confidant_core::config::UserConfig;
@@ -69,10 +69,11 @@ impl FixExt for anyhow::Error {
     disable_help_subcommand = true,
     about = "Relationship memory you own: plain-text records in a git repo.",
     after_help = "Examples:\n  \
-        confidant check --vault ./examples/demo-vault\n  \
-        confidant log session p-01H… 60m paid --json --no-input\n  \
-        confidant context p-01H… --json\n  \
-        CONFIDANT_VAULT=./examples/demo-vault confidant find goals --json"
+        Start here:        confidant setup --agent auto\n  \
+        Everyday:          confidant log session p-01H… 60m paid --json --no-input\n  \
+        Integrations:      confidant mcp\n  \
+        Advanced / rare:   confidant schema --json\n  \
+        Demo vault:        confidant check --vault ./examples/demo-vault"
 )]
 struct Cli {
     /// Vault directory.
@@ -667,9 +668,19 @@ enum NoteAction {
     },
 }
 
+/// Parse argv with the journey-grouped top-level help attached (#721).
+///
+/// `Cli::try_parse()` builds the derive command directly; this keeps the
+/// same parse path but swaps in the human help template. `help --json` and
+/// `help <command>` still read `Cli::command()` and are unchanged.
+fn parse_cli() -> Result<Cli, clap::Error> {
+    let mut matches = grouped_help_command().try_get_matches()?;
+    Cli::from_arg_matches_mut(&mut matches)
+}
+
 fn main() -> ExitCode {
     let json_hint = std::env::args_os().any(|a| a == "--json");
-    let cli = match Cli::try_parse() {
+    let cli = match parse_cli() {
         Ok(cli) => cli,
         Err(err) => {
             if json_hint && err.use_stderr() {
@@ -8737,6 +8748,102 @@ fn cmd_tui(cli: &Cli, args: &[String]) -> anyhow::Result<ExitCode> {
     })
 }
 
+/// Human `--help` groups (#721): where an operator meets each command, not
+/// the order clap stores them in. Every visible command appears exactly
+/// once; hidden commands (`bench-gen`) stay hidden, and `help --json` keeps
+/// its flat, complete command list.
+const JOURNEYS: &[(&str, &[&str])] = &[
+    ("Start here", &["setup", "init", "doctor", "status", "sync"]),
+    (
+        "Everyday",
+        &[
+            "check", "context", "find", "log", "note", "record", "alias", "resolve",
+        ],
+    ),
+    ("Integrations", &["agents", "mcp", "routing"]),
+    (
+        "Advanced / rare",
+        &[
+            "pack",
+            "import",
+            "allowlist",
+            "schema",
+            "update",
+            "which",
+            "help",
+            "tui",
+        ],
+    ),
+];
+
+/// The top-level command with human help grouped by journey (#721).
+///
+/// Only the human top-level screen changes: subcommand help, parse rules,
+/// and `help --json` all still use `Cli::command()`.
+fn grouped_help_command() -> clap::Command {
+    // Use `{options}` rather than `{all-args}`: the latter appends clap's
+    // flat command list, and the journey block is the human command list.
+    // Keeping the subcommands visible also keeps `<COMMAND>` in the usage.
+    Cli::command()
+        .help_template(
+            "{about-with-newline}\n{usage-heading} {usage}\n\n{before-help}Options:\n{options}{after-help}",
+        )
+        .before_help(journey_commands())
+}
+
+/// Render the grouped command list. clap's `before_help` adds the blank
+/// lines after the block, so blocks are joined by one blank line here.
+fn journey_commands() -> String {
+    let cmd = Cli::command();
+    let visible: Vec<&clap::Command> = cmd
+        .get_subcommands()
+        .filter(|sc| !sc.is_hide_set())
+        .collect();
+    let grouped: BTreeSet<&str> = JOURNEYS
+        .iter()
+        .flat_map(|(_, names)| names.iter().copied())
+        .collect();
+    let width = visible
+        .iter()
+        .map(|sc| sc.get_name().len())
+        .max()
+        .unwrap_or(0);
+
+    let line = |sc: &clap::Command| {
+        let name = sc.get_name();
+        let about = sc.get_about().map(ToString::to_string).unwrap_or_default();
+        format!("    {name:<width$}  {about}")
+    };
+
+    let mut blocks: Vec<String> = Vec::new();
+    for (heading, names) in JOURNEYS {
+        let mut lines = vec![format!("  {heading}")];
+        for name in *names {
+            if let Some(sc) = visible.iter().find(|sc| sc.get_name() == *name) {
+                lines.push(line(sc));
+            }
+        }
+        blocks.push(lines.join("\n"));
+    }
+
+    // Never drop a visible command from human help if it was added without a
+    // journey: list it under Other. The unit test keeps JOURNEYS current.
+    let ungrouped: Vec<&clap::Command> = visible
+        .iter()
+        .copied()
+        .filter(|sc| !grouped.contains(sc.get_name()))
+        .collect();
+    if !ungrouped.is_empty() {
+        let mut lines = vec![String::from("  Other")];
+        for sc in ungrouped {
+            lines.push(line(sc));
+        }
+        blocks.push(lines.join("\n"));
+    }
+
+    format!("Commands:\n{}", blocks.join("\n\n"))
+}
+
 fn help_json_value() -> serde_json::Value {
     let commands: Vec<serde_json::Value> = Cli::command()
         .get_subcommands()
@@ -8773,7 +8880,7 @@ fn cmd_help(cli: &Cli, vault: Option<&Path>, topic: Option<String>) -> anyhow::R
         print_json(&ok_envelope(vault, help_json_value()))?;
         return Ok(ExitCode::SUCCESS);
     }
-    let mut cmd = Cli::command();
+    let mut cmd = grouped_help_command();
     match topic {
         None => {
             cmd.print_help()?;
@@ -9625,9 +9732,31 @@ mod tests {
     use super::{
         confirm_yn, detect_install_method, git_version_check_from, offerable_update,
         parse_ahead_behind, parse_git_remotes, parse_git_version, parse_tui_version,
-        reject_unsupported_prefix, sync_push_refspec, AheadBehind, InstallMethod, MIN_GIT_VERSION,
+        reject_unsupported_prefix, sync_push_refspec, AheadBehind, Cli, InstallMethod, JOURNEYS,
+        MIN_GIT_VERSION,
     };
+    use clap::CommandFactory;
     use std::path::Path;
+
+    /// #721: every visible command sits in exactly one journey, so the
+    /// grouped human help can never silently drop a command (hidden
+    /// `bench-gen` stays out, as it does from clap's own help).
+    #[test]
+    fn journey_groups_cover_every_visible_command() {
+        let command = Cli::command();
+        let mut visible: Vec<&str> = command
+            .get_subcommands()
+            .filter(|sc| !sc.is_hide_set())
+            .map(|sc| sc.get_name())
+            .collect();
+        let mut grouped: Vec<&str> = JOURNEYS
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
+        visible.sort_unstable();
+        grouped.sort_unstable();
+        assert_eq!(grouped, visible);
+    }
 
     /// #659: the TUI `--version` probe accepts a prefixed, `v`-prefixed,
     /// bare, and suffix-bearing version, and refuses garbage.

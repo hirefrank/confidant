@@ -1372,6 +1372,132 @@ fn tui_help_lists_subcommand() {
     assert!(help.contains("tui"), "{help}");
 }
 
+/// Every visible top-level command (#721). Hidden `bench-gen` is left out of
+/// human help but stays in `help --json`.
+const VISIBLE_COMMANDS: &[&str] = &[
+    "setup",
+    "init",
+    "doctor",
+    "status",
+    "sync",
+    "check",
+    "context",
+    "find",
+    "log",
+    "note",
+    "record",
+    "alias",
+    "resolve",
+    "agents",
+    "mcp",
+    "routing",
+    "pack",
+    "import",
+    "allowlist",
+    "schema",
+    "update",
+    "which",
+    "help",
+    "tui",
+];
+
+/// #721: the human top level groups commands by journey instead of one flat
+/// list, keeps the required `<COMMAND>` in usage, and never drops a visible
+/// command. `help --json` is a separate contract and stays flat.
+#[test]
+fn help_groups_commands_by_journey() {
+    let out = Command::new(bin()).arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+
+    let groups = ["Start here", "Everyday", "Integrations", "Advanced / rare"];
+    let mut last = 0;
+    for group in groups {
+        let at = help
+            .find(group)
+            .unwrap_or_else(|| panic!("missing group {group}\n{help}"));
+        assert!(at >= last, "group out of order: {group}\n{help}");
+        last = at;
+    }
+
+    for command in VISIBLE_COMMANDS {
+        assert!(
+            help.lines()
+                .any(|line| line.starts_with(&format!("    {command}  "))),
+            "missing grouped command {command}\n{help}"
+        );
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.starts_with(&format!("  {command}  "))),
+            "command {command} still appears in a flat list\n{help}"
+        );
+    }
+    assert!(
+        help.contains("Usage: confidant [OPTIONS] <COMMAND>"),
+        "{help}"
+    );
+}
+
+#[test]
+fn help_examples_cover_each_journey() {
+    let out = Command::new(bin()).arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for example in [
+        "Start here:        confidant setup --agent auto",
+        "Everyday:          confidant log session p-01H… 60m paid --json --no-input",
+        "Integrations:      confidant mcp",
+        "Advanced / rare:   confidant schema --json",
+        "Demo vault:        confidant check --vault ./examples/demo-vault",
+    ] {
+        assert!(help.contains(example), "missing example: {example}\n{help}");
+    }
+}
+
+/// `confidant help` with no topic prints the same human screen as
+/// `confidant --help`; `-h` keeps the short option summary.
+#[test]
+fn help_subcommand_uses_grouped_journeys() {
+    let out = Command::new(bin()).arg("help").output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for group in ["Start here", "Everyday", "Integrations", "Advanced / rare"] {
+        assert!(help.contains(group), "missing group {group}\n{help}");
+    }
+    assert!(
+        help.lines().any(|line| line.starts_with("    setup  ")),
+        "{help}"
+    );
+}
+
+/// #721 / ADR-7: grouping is human help only. `help --json` stays one flat,
+/// ordered list with the hidden `bench-gen` entry and no journey metadata.
+#[test]
+fn help_json_stays_flat() {
+    let out = Command::new(bin())
+        .args(["help", "--json"])
+        .env_remove("CONFIDANT_VAULT")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema_version"], "1");
+    assert!(v["vault"].is_null());
+    assert!(v.get("journeys").is_none());
+    let names: Vec<&str> = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.first(), Some(&"check"));
+    assert_eq!(names.last(), Some(&"bench-gen"));
+    for name in VISIBLE_COMMANDS {
+        assert!(names.contains(name), "help --json lost {name}: {names:?}");
+    }
+}
+
 #[test]
 fn tui_subcommand_help_describes_passthrough() {
     let out = Command::new(bin())
