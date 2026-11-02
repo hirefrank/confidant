@@ -688,12 +688,13 @@ mod tests {
     }
 
     #[test]
-    fn context_ignores_the_additive_entity_and_retired_shapes() {
+    fn context_ignores_additive_entity_fields_and_retired_shapes() {
         // Core 0.4 adds `entity` and omits retired targets; the TUI keeps
         // rendering the deprecated `person` alias unchanged.
         let ctx: Context = serde_json::from_str(
             r#"{"person": {"id": "p-1", "name": "Ada Example", "no_ai": false},
-                "entity": {"id": "p-1", "kind": "person", "name": "Ada Example"},
+                "entity": {"id": "p-1", "kind": "person", "name": "Ada Example",
+                           "fields": {"kind": "work"}},
                 "touchpoints": [{"date": "2026-10-01", "kind": "call"}],
                 "packs": {}, "aliases": [], "scope": []}"#,
         )

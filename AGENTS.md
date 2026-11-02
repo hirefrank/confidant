@@ -38,6 +38,10 @@ Read before changing behaviour:
   [`testdata/vaults/place-0.3/`](testdata/vaults/place-0.3/): the spec 0.3
   record-type fixture, its vendored pack pin, and its `check --json` golden.
   Fake data only; keep the demo vault on 0.2.
+- [`testdata/vaults/personal-0.4/`](testdata/vaults/personal-0.4/): the
+  checked-in 0.4 default fixture for `personal@0.3` places, things, edges,
+  context fields, and the no-ai place; its golden is
+  [`testdata/golden/personal-0.4.json`](testdata/golden/personal-0.4.json).
 - [`packs/personal/0.3.md`](packs/personal/0.3.md) is the 0.4 personal
   pack, which adds places and things (ADR-21); the frozen
   [`packs/personal/0.2.md`](packs/personal/0.2.md) is the 0.1–0.3

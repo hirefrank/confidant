@@ -569,6 +569,51 @@ fn entity_vault() -> tempfile::TempDir {
     dir
 }
 
+fn personal_04() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/personal-0.4")
+}
+
+#[test]
+fn context_personal_04_fields_and_no_ai_bundle() {
+    let vault = personal_04();
+    let place = "pl-01M3TC5H00MPJG000000000201";
+    let v = run_json(&["context", place], &vault);
+    assert_eq!(v["entity"]["kind"], "place");
+    assert_eq!(v["entity"]["fields"]["kind"], "work");
+    assert_eq!(v["entity"]["fields"]["address"], "1 Example Way");
+    assert_eq!(
+        v["entity"]["fields"]["tags"],
+        serde_json::json!(["studio", "work"])
+    );
+    assert_eq!(
+        v["entity"]["fields"]["links"],
+        serde_json::json!([{"label": "map", "value": "https://example.test/map"}])
+    );
+
+    let private = run_json(&["context", place, "--exclude-private"], &vault);
+    assert_eq!(private["entity"]["fields"]["kind"], "work");
+    assert!(private["entity"]["fields"].get("address").is_none());
+    assert!(private["entity"]["fields"].get("tags").is_none());
+    assert!(private["entity"]["fields"].get("links").is_none());
+    assert!(private["entity"]["name"].is_null());
+    assert!(private["entity"]["profile"].is_null());
+
+    let hidden = "pl-01M3TC5H00MPJG000000000202";
+    let out = Command::new(bin())
+        .args(["context", hidden, "--json", "--vault"])
+        .arg(&vault)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(err["error"]["code"], "E_NOT_FOUND", "{err}");
+
+    let operator = run_json(&["context", hidden, "--for-operator"], &vault);
+    assert_eq!(operator["entity"]["no_ai"], "true");
+    assert_eq!(operator["entity"]["fields"]["kind"], "home");
+    assert_eq!(operator["entity"]["fields"]["address"], "2 Example Lane");
+}
+
 #[test]
 fn context_org_json_shape() {
     let dir = entity_vault();

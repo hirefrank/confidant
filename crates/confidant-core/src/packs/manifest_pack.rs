@@ -230,6 +230,14 @@ impl Pack for ManifestPack {
         self.fields
     }
 
+    fn field_grammar(&self, field: &str) -> Option<&'static str> {
+        self.manifest
+            .fields
+            .iter()
+            .find(|decl| decl.name == field)
+            .map(|decl| decl.grammar.as_str())
+    }
+
     fn balance_metrics(&self) -> &'static [&'static str] {
         self.balance_metrics
     }

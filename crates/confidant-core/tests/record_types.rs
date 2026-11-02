@@ -4,6 +4,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde_json::json;
+
 use confidant_core::check::CheckOptions;
 use confidant_core::context::build_context;
 use confidant_core::record_type::{TypeOwner, TypeProblem, TypeRegistry, TypeSource};
@@ -613,11 +615,11 @@ fn missing_required_pack_field_is_frontmatter() {
         &format!("places/{PLACE}/place.md"),
         &format!("---\nid: {PLACE}\ntype: place\n---\n\n"),
     );
-    let report = report(dir.path());
+    let second = report(dir.path());
     assert!(
-        codes(&report).contains(&"E_FRONTMATTER"),
+        codes(&second).contains(&"E_FRONTMATTER"),
         "{:?}",
-        report.findings
+        second.findings
     );
 }
 
@@ -765,4 +767,78 @@ fn personal_0_2_stays_the_default_for_spec_0_3() {
         .collect();
     assert!(names.contains(&"personal@0.2"), "{names:?}");
     assert!(!names.contains(&"personal@0.3"), "{names:?}");
+}
+
+fn personal_04_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/personal-0.4")
+}
+
+#[test]
+fn personal_04_context_fields_and_privacy() {
+    let vault = load_vault(&personal_04_fixture()).unwrap();
+    let place = confidant_core::RecordId::parse("pl-01M3TC5H00MPJG000000000201").unwrap();
+
+    let full = build_context(&vault, &place, true, &PackScope::All, false).unwrap();
+    assert_eq!(full.entity.fields["kind"], "work");
+    assert_eq!(full.entity.fields["address"], "1 Example Way");
+    assert_eq!(full.entity.fields["tags"], json!(["studio", "work"]));
+    assert_eq!(
+        full.entity.fields["links"],
+        json!([{"label": "map", "value": "https://example.test/map"}])
+    );
+    assert_eq!(full.notes.len(), 1, "{:?}", full.notes);
+    assert_eq!(full.edges.len(), 3, "{:?}", full.edges);
+
+    let thing = confidant_core::RecordId::parse("th-01M3TC5H00MPJG000000000301").unwrap();
+    let thing_bundle = build_context(&vault, &thing, true, &PackScope::All, false).unwrap();
+    assert_eq!(thing_bundle.entity.fields["kind"], "object");
+    assert_eq!(thing_bundle.entity.fields["tags"], json!(["commute"]));
+    assert!(!thing_bundle.entity.fields.contains_key("address"));
+
+    let private = build_context(&vault, &place, false, &PackScope::All, false).unwrap();
+    assert_eq!(private.entity.fields["kind"], "work");
+    assert!(!private.entity.fields.contains_key("address"));
+    assert!(!private.entity.fields.contains_key("tags"));
+    assert!(!private.entity.fields.contains_key("links"));
+    assert!(private.entity.name.is_none());
+    assert!(private.entity.profile.is_none());
+
+    // A no-ai place returns no agent bundle at all; the operator path still
+    // returns it with the badge and its fields.
+    let hidden = confidant_core::RecordId::parse("pl-01M3TC5H00MPJG000000000202").unwrap();
+    assert!(build_context(&vault, &hidden, true, &PackScope::All, false).is_none());
+    assert!(build_context(&vault, &hidden, false, &PackScope::All, false).is_none());
+    let operator = build_context(&vault, &hidden, true, &PackScope::All, true).unwrap();
+    assert_eq!(operator.entity.no_ai_mode, Some("true"));
+    assert_eq!(operator.entity.fields["kind"], "home");
+    assert_eq!(operator.entity.fields["address"], "2 Example Lane");
+}
+
+#[test]
+fn personal_04_requires_kind_and_rejects_notes_mode() {
+    let dir = personal_04_vault();
+    let place_path = dir.path().join(format!("places/{PERSONAL_PLACE}/place.md"));
+    let text = fs::read_to_string(&place_path)
+        .unwrap()
+        .replace("kind: work\n", "");
+    fs::write(&place_path, text).unwrap();
+    let first = report(dir.path());
+    assert!(
+        codes(&first).contains(&"E_FRONTMATTER"),
+        "{:?}",
+        first.findings
+    );
+
+    let dir = personal_04_vault();
+    let place_path = dir.path().join(format!("places/{PERSONAL_PLACE}/place.md"));
+    let text = fs::read_to_string(&place_path)
+        .unwrap()
+        .replace("kind: work\n", "kind: work\nno-ai: notes\n");
+    fs::write(&place_path, text).unwrap();
+    let second = report(dir.path());
+    assert!(
+        codes(&second).contains(&"E_FRONTMATTER"),
+        "{:?}",
+        second.findings
+    );
 }
