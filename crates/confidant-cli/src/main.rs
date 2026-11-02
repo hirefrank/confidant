@@ -40,8 +40,8 @@ use confidant_core::record_type::{RecordSchema, TypeRegistry};
 use confidant_core::schema::{contract_schema, record_types_json};
 use confidant_core::scope::{owner_labels, parse_pack_list, resolve_scope, PackScope};
 use confidant_core::write::{
-    apply_write, apply_write_repairing, require_git_repo, FileChange, PendingWrite, WriteOptions,
-    WriteOutcome,
+    apply_write, apply_write_repairing, require_git_repo, DryRunCheck, FileChange, PendingWrite,
+    WriteOptions, WriteOutcome,
 };
 use confidant_core::{
     check_vault, load_vault, search, search_for_operator, CheckOptions, SpecVersion,
@@ -3003,7 +3003,7 @@ fn finish_write(
             }
             Ok(ExitCode::SUCCESS)
         }
-        WriteOutcome::DryRun { preview } => {
+        WriteOutcome::DryRun { preview, checks } => {
             if cli.json {
                 let changes: Vec<serde_json::Value> = preview
                     .iter()
@@ -3019,6 +3019,10 @@ fn finish_write(
                     "command": command,
                     "dry_run": true,
                     "commit": serde_json::Value::Null,
+                    "checks": {
+                        "pre": checks.pre.as_str(),
+                        "post": checks.post.as_str(),
+                    },
                     "changes": changes,
                 });
                 if let serde_json::Value::Object(e) = extra {
@@ -3026,7 +3030,13 @@ fn finish_write(
                 }
                 print_json(&ok_envelope(Some(root), obj))?;
             } else {
-                println!("dry run — no files written, no commit:");
+                let pre = match checks.pre {
+                    DryRunCheck::Passed => "pre-check passed",
+                    DryRunCheck::Skipped => "pre-check skipped (repairing write)",
+                };
+                println!(
+                    "dry run — no files written, no commit; {pre}, post-check skipped (it needs the applied tree):"
+                );
                 for p in &preview {
                     println!("--- {} ({})", p.path, p.action);
                     println!("{}", p.content);
