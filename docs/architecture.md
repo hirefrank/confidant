@@ -184,7 +184,7 @@ Ledger arguments carry identifiers and structured values, never prose: a `touch`
 
 **Decision.**
 
-- **Records are plaintext.** A record is YAML front matter plus a Markdown body on disk: readable, greppable, diffable, and mergeable by git. `record add`, `note add`, and `log session --note` write those bytes straight through an atomic temp-file + rename.
+- **Records are plaintext.** A record is YAML front matter plus a Markdown body on disk: readable, greppable, diffable, and mergeable by git. `record add`, `note add`, and `log touch --note` write those bytes straight through an atomic temp-file + rename.
 - **The perimeter is the machine and the repo.** The operator runs Confidant on trusted devices (§3) with full-disk encryption enabled, and syncs to a **private** git remote. `confidant doctor`'s `git-remote` check refuses cleartext transports (`http://`, `git://`) and warns on transports it cannot verify; it does not police whether the host is private.
 - **`no-ai` is the agent boundary.** It is enforced at read time in the allowlist (§12), not by the storage layer, and it applies to `find`, `context`, `allowlist`, MCP, and the QMD corpus.
 - **No second secrecy layer.** There is no key material in a vault, so a vault is self-contained: clone it and read it. That removes key handling from the failure surface — no key to lose, rotate, or fail to unwrap — and it makes every record reviewable with `git diff`.

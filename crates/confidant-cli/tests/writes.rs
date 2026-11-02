@@ -137,253 +137,41 @@ fn add_person(root: &Path, id: &str, name: &str, extra: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// log session
+// log
 // ---------------------------------------------------------------------------
 
+/// #799 step 2: the top-level `log session` command is gone. `session` is a
+/// pack-declared verb now, logged through `import --file`; `log touch`
+/// remains the core personal write.
 #[test]
-fn log_session_creates_one_commit() {
+fn log_session_is_no_longer_a_subcommand() {
     let dir = make_vault();
-    let root = dir.path();
-    let vroot = vault_arg(root);
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "paid",
-        "--date",
-        "2026-10-13",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-        "--request-id",
-        "01J9Z3K4QF0000000000000001",
-    ]);
-    assert!(ok, "{v}");
-    assert_eq!(v["command"], "log-session");
-    assert!(v["commit"].as_str().unwrap().len() >= 8);
-    assert_eq!(v["files"], serde_json::json!(["ledger/2026/10.cfd"]));
-    assert_eq!(commits(root), 2, "exactly one new commit");
-
-    let ledger = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-    assert!(
-        ledger.contains(&format!("session {PERSON} 60m paid")),
-        "{ledger}"
-    );
-
-    // Commit message carries IDs and verbs only — no free text.
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["log", "-1", "--format=%B"])
-        .output()
-        .unwrap();
-    let msg = String::from_utf8_lossy(&out.stdout);
-    assert!(msg.contains(&format!("session {PERSON} 60m paid")));
-    assert!(msg.contains("Request-Id-Hash:"));
-    assert!(msg.contains("Request-Hash:"));
-}
-
-#[test]
-fn log_session_dry_run_touches_nothing() {
-    let dir = make_vault();
-    let root = dir.path();
-    let vroot = vault_arg(root);
-    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "paid",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-        "--dry-run",
-    ]);
-    assert!(ok, "{v}");
-    assert_eq!(v["dry_run"], true);
-    assert_eq!(v["commit"], Value::Null);
-    assert_eq!(commits(root), 1, "no commit on dry run");
-    let after = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-    assert_eq!(before, after, "no file change on dry run");
-    // The logical change is shown as plaintext record text.
-    let content = v["changes"][0]["content"].as_str().unwrap();
-    assert!(content.contains(&format!("session {PERSON} 60m paid")));
-}
-
-/// #732: a `packs = []` vault owns no `session` verb, so both the
-/// dry run and the apply must refuse up front instead of the dry run
-/// reporting `ok:true` for a write apply's post-check blocks with
-/// `E_UNKNOWN_VERB`. The fixture ledger holds only a core `touch`
-/// line, so the vault is otherwise check-clean, and a `touch` apply
-/// still succeeds afterwards (the gate is verb-specific, not a blanket
-/// write refusal).
-#[test]
-fn log_session_dry_run_fails_when_verb_not_enabled() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    std::fs::write(
-        root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
-    )
-    .unwrap();
-    let person_dir = root.join(format!("people/{PERSON}"));
-    std::fs::create_dir_all(&person_dir).unwrap();
-    std::fs::write(
-        person_dir.join("profile.md"),
-        format!("---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n---\n\nTest bio.\n"),
-    )
-    .unwrap();
-    let ledger_dir = root.join("ledger/2026");
-    std::fs::create_dir_all(&ledger_dir).unwrap();
-    std::fs::write(
-        ledger_dir.join("10.cfd"),
-        format!("2026-10-01 touch {PERSON} call\n"),
-    )
-    .unwrap();
-    git(root, &["init", "-q"]);
-    git(root, &["config", "user.email", "test@example.com"]);
-    git(root, &["config", "user.name", "Test"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "init"]);
-    let vroot = vault_arg(root);
-    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-
-    // Dry run refuses with the same up-front error apply gets.
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "--date",
-        "2026-10-23",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-        "--dry-run",
-    ]);
-    assert!(!ok, "{v}");
-    assert_eq!(v["ok"], false);
-    assert_eq!(v["error"]["code"], "E_INVALID");
-    assert!(
-        v["error"]["message"].as_str().unwrap().contains("session"),
-        "{v}"
-    );
-    assert_eq!(commits(root), 1, "no commit on refused dry run");
-    assert_eq!(
-        std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
-        before,
-        "no file change on refused dry run"
-    );
-
-    // Apply refuses identically (no CheckBlocked report, no commit).
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "--date",
-        "2026-10-23",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ]);
-    assert!(!ok, "{v}");
-    assert_eq!(v["ok"], false);
-    assert_eq!(v["error"]["code"], "E_INVALID");
-    assert_eq!(commits(root), 1, "no commit on refused apply");
-    assert_eq!(
-        std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
-        before,
-        "no file change on refused apply"
-    );
-
-    // The core `touch` verb is unaffected in the same vault.
-    let (ok, v) = run_json(&[
-        "log",
-        "touch",
-        PERSON,
-        "meal",
-        "--date",
-        "2026-10-23",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ]);
-    assert!(ok, "{v}");
-    assert_eq!(commits(root), 2, "touch apply still commits");
-}
-
-/// #732 fix wave: a vendored-but-unlisted pack is NOT a disabled pack
-/// — the loader only registers listed packs, so its verbs are unknown
-/// and the gate refuses them. (A registered-but-disabled pack can only
-/// arise inside the registry itself; that branch is covered by the
-/// `accepted_verbs_orphan_branch` unit test in `check.rs`, since no
-/// vault config can produce one through `load_vault` today — the last
-/// CLI-reachable orphan case went away when the personal pack became
-/// implicit in #551.)
-#[test]
-fn log_session_refuses_unlisted_pack_verb() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    install_example_pack(root);
-    std::fs::write(
-        root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
-    )
-    .unwrap();
-    let person_dir = root.join(format!("people/{PERSON}"));
-    std::fs::create_dir_all(&person_dir).unwrap();
-    std::fs::write(
-        person_dir.join("profile.md"),
-        format!("---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n---\n\nTest bio.\n"),
-    )
-    .unwrap();
-    let ledger_dir = root.join("ledger/2026");
-    std::fs::create_dir_all(&ledger_dir).unwrap();
-    std::fs::write(
-        ledger_dir.join("10.cfd"),
-        format!("2026-10-01 touch {PERSON} call\n"),
-    )
-    .unwrap();
-    git(root, &["init", "-q"]);
-    git(root, &["config", "user.email", "test@example.com"]);
-    git(root, &["config", "user.name", "Test"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "init"]);
-    let vroot = vault_arg(root);
-    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-
-    for extra in [&["--dry-run"][..], &[][..]] {
-        let mut args: Vec<&str> = vec![
+    let vroot = vault_arg(dir.path());
+    let out = Command::new(bin())
+        .args([
             "log",
             "session",
             PERSON,
             "60m",
-            "--date",
-            "2026-10-23",
+            "paid",
             "--json",
             "--no-input",
             "--vault",
             &vroot,
-        ];
-        args.extend_from_slice(extra);
-        let (ok, v) = run_json(&args);
-        assert!(!ok, "{v}");
-        assert_eq!(v["error"]["code"], "E_INVALID");
-        assert_eq!(commits(root), 1, "no commit on refused log");
-        assert_eq!(
-            std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
-            before,
-            "no file change on refused log"
-        );
-    }
+        ])
+        .env("HOME", tempfile::tempdir().unwrap().path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "usage_error");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("unrecognized subcommand") || message.contains("unexpected argument"),
+        "expected a clap usage error, got: {message}"
+    );
+    assert_eq!(commits(dir.path()), 1, "a refused command writes nothing");
 }
 
 /// #732 fix wave: a problem pack's claimed verbs stay known (spec
@@ -391,8 +179,9 @@ fn log_session_refuses_unlisted_pack_verb() {
 /// makes the listed example pack a hash problem while its manifest
 /// still sells `session`; the dry run must therefore not refuse the
 /// verb (apply still blocks, but on the pack hash, not the verb).
+/// #799 step 2: the pack verb is written through `import --file`.
 #[test]
-fn log_session_dry_run_passes_for_problem_pack_verb() {
+fn import_pack_verb_dry_run_passes_for_problem_pack_verb() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     install_example_pack(root);
@@ -426,14 +215,14 @@ fn log_session_dry_run_passes_for_problem_pack_verb() {
     git(root, &["add", "-A"]);
     git(root, &["commit", "-qm", "init"]);
     let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("session.cfd");
+    std::fs::write(&file, format!("2026-10-23 session {PERSON} 60m paid\n")).unwrap();
 
     let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "--date",
-        "2026-10-23",
+        "import",
+        "--file",
+        &file.display().to_string(),
         "--json",
         "--no-input",
         "--vault",
@@ -445,12 +234,9 @@ fn log_session_dry_run_passes_for_problem_pack_verb() {
 
     // Apply is blocked by the pack problem, but not by the verb gate.
     let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "--date",
-        "2026-10-23",
+        "import",
+        "--file",
+        &file.display().to_string(),
         "--json",
         "--no-input",
         "--vault",
@@ -529,20 +315,19 @@ fn import_refuses_unknown_verb_before_writing() {
 }
 
 #[test]
-fn log_session_with_note_creates_note_record() {
+fn log_touch_with_note_creates_note_record() {
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--date",
         "2026-10-13",
         "--note",
-        "Great session",
+        "Great meal",
         "--json",
         "--no-input",
         "--vault",
@@ -564,7 +349,7 @@ fn log_session_with_note_creates_note_record() {
         .unwrap();
     let note_path = root.join(format!("people/{PERSON}/notes/{note_id}.md"));
     let body = std::fs::read_to_string(&note_path).unwrap();
-    assert!(body.contains("Great session"), "{body}");
+    assert!(body.contains("Great meal"), "{body}");
 }
 
 #[test]
@@ -574,10 +359,11 @@ fn request_id_is_idempotent_then_conflicts() {
     let vroot = vault_arg(root);
     let base = [
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
+        "--date",
+        "2026-10-13",
         "--json",
         "--no-input",
         "--vault",
@@ -596,10 +382,11 @@ fn request_id_is_idempotent_then_conflicts() {
     // Same id, different content -> E_IDEMPOTENCY_CONFLICT.
     let (ok3, v3) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "90m",
-        "paid",
+        "call",
+        "--date",
+        "2026-10-13",
         "--json",
         "--no-input",
         "--vault",
@@ -624,10 +411,9 @@ fn request_id_rejects_low_entropy_ids() {
     // 17 chars: under the unguessability floor.
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--json",
         "--no-input",
         "--vault",
@@ -644,10 +430,9 @@ fn request_id_rejects_low_entropy_ids() {
     // Exactly 22 chars clears the floor.
     let (ok, _) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--dry-run",
         "--json",
         "--no-input",
@@ -674,10 +459,9 @@ fn failing_check_blocks_write_and_rolls_back() {
 
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--json",
         "--no-input",
         "--vault",
@@ -701,10 +485,9 @@ fn write_to_non_git_vault_fails() {
     let vroot = vault_arg(dir.path());
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--json",
         "--no-input",
         "--vault",
@@ -729,10 +512,9 @@ fn conflict_markers_block_write() {
     git(root, &["commit", "-qm", "conflicted"]);
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--json",
         "--no-input",
         "--vault",
@@ -1332,6 +1114,50 @@ fn make_place_vault() -> tempfile::TempDir {
     dir
 }
 
+/// Vendor the place pack with one extra pack-declared verb, `session`, and
+/// pin the modified copy. #799 step 2 removed the core `log session`
+/// command; this fixture proves a coaching/CRM-style pack can still log its
+/// own verb through the shared `import --file` path.
+fn install_place_pack_with_session_verb(vault: &Path) {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/packs/place-pack");
+    let dst = vault.join("packs/place-pack@0.1");
+    std::fs::create_dir_all(&dst).unwrap();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+    }
+    let manifest = dst.join("manifest.toml");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str("\n[[verbs]]\nname = \"session\"\nid_type = \"person\"\n");
+    std::fs::write(&manifest, text).unwrap();
+    let hash = confidant_core::packs::dir::read_pack_dir(&dst)
+        .unwrap()
+        .hash;
+    std::fs::write(
+        vault.join("confidant.lock"),
+        format!(
+            "lock_version = 1\n\n[[pack]]\nname = \"place-pack\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn make_session_verb_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    install_place_pack_with_session_verb(root);
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.3\"\npacks = [\"place-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    add_person(root, PLACE_PERSON, "Dana Example", "");
+    dir
+}
+
 #[test]
 fn place_pack_end_to_end_record_add_list_context_note_allowlist_check() {
     let dir = make_place_vault();
@@ -1581,6 +1407,46 @@ fn place_pack_end_to_end_record_add_list_context_note_allowlist_check() {
             .any(|decl| decl["name"] == "place"),
         "out-of-scope pack type leaked into schema: {}",
         scoped_schema.1
+    );
+
+    let (ok, check) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{check}");
+    assert_eq!(check["ok"], true, "{check}");
+}
+
+/// #799 step 2: `session` is a pack-declared verb, not a core command, but a
+/// 0.3 pack can still append it through the shared `import --file` path.
+/// The fixture is the checked-in place pack plus one `session` verb, so this
+/// pins the capability without restoring a core session write command.
+#[test]
+fn pack_declared_session_verb_is_appended_through_import() {
+    let dir = make_session_verb_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("session.cfd");
+    std::fs::write(
+        &file,
+        format!("2026-10-13 session {PLACE_PERSON} 60m paid\n"),
+    )
+    .unwrap();
+
+    let (ok, v) = run_json(&[
+        "import",
+        "--file",
+        &file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["command"], "import");
+    assert_eq!(v["files"], serde_json::json!(["ledger/2026/10.cfd"]));
+    let ledger = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+    assert!(
+        ledger.contains(&format!("session {PLACE_PERSON} 60m paid")),
+        "{ledger}"
     );
 
     let (ok, check) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
@@ -2493,8 +2359,8 @@ fn resolve_no_ai_true_is_not_name_resolvable_and_leaks_nothing() {
 fn resolve_cleared_name_merged_into_no_ai_person_leaks_nothing() {
     // A cleared person ("Ada Old") merged into a `no-ai: true` person: the
     // cleared name canonicalizes to the hidden id. It must not resolve, or
-    // `log session` / `log touch` / `note add` would print and serialize
-    // the hidden person's name. The by-name query gets the same generic
+    // `log touch` / `note add` would print and serialize the hidden
+    // person's name. The by-name query gets the same generic
     // not-found as a miss, in human and `--json` output, and writes nothing.
     let dir = make_vault();
     let root = dir.path();
@@ -2542,10 +2408,9 @@ fn resolve_cleared_name_merged_into_no_ai_person_leaks_nothing() {
     // The by-name write fails the same way and writes nothing.
     let (ok_w, v_w) = run_json(&[
         "log",
-        "session",
+        "touch",
         "Ada Old",
-        "60m",
-        "paid",
+        "meal",
         "--json",
         "--no-input",
         "--vault",
@@ -2559,10 +2424,9 @@ fn resolve_cleared_name_merged_into_no_ai_person_leaks_nothing() {
     // Human output carries no resolved-person line and no hidden name.
     let (ok_h, stdout, stderr) = run_raw(&[
         "log",
-        "session",
+        "touch",
         "Ada Old",
-        "60m",
-        "paid",
+        "meal",
         "--no-input",
         "--vault",
         &vroot,
@@ -2627,16 +2491,15 @@ fn resolve_merged_away_name_resolves_to_canonical() {
 }
 
 #[test]
-fn log_session_by_name_echoes_resolved_person() {
+fn log_touch_by_name_echoes_resolved_person() {
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         "Test Person",
-        "60m",
-        "paid",
+        "meal",
         "--date",
         "2026-10-13",
         "--json",
@@ -2650,22 +2513,18 @@ fn log_session_by_name_echoes_resolved_person() {
     assert_eq!(v["person"]["name"], "Test Person");
     // The ledger line carries the id, never the display name.
     let ledger = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-    assert!(
-        ledger.contains(&format!("session {PERSON} 60m paid")),
-        "{ledger}"
-    );
+    assert!(ledger.contains(&format!("touch {PERSON} meal")), "{ledger}");
 
     // Human output echoes the pick too. It says "resolving to" because the
     // line prints before the remaining validation (#537 review).
-    // #747: the second call re-logs the same session, so it passes
-    // --force; the refusal for the identical session is covered by the
-    // #747 tests, and this test is about the echo.
+    // #747: the second call re-logs the same touch, so it passes --force;
+    // the refusal for the identical touch is covered by the #747 tests,
+    // and this test is about the echo.
     let (ok, stdout, stderr) = run_raw(&[
         "log",
-        "session",
+        "touch",
         "Test Person",
-        "60m",
-        "paid",
+        "meal",
         "--date",
         "2026-10-13",
         "--force",
@@ -2681,7 +2540,7 @@ fn log_session_by_name_echoes_resolved_person() {
 }
 
 #[test]
-fn log_session_by_id_does_not_echo_a_person_object() {
+fn log_touch_by_id_does_not_echo_a_person_object() {
     // Id writes keep their previous output shape (no `person` echo).
     let dir = make_vault();
     let root = dir.path();
@@ -2689,10 +2548,9 @@ fn log_session_by_id_does_not_echo_a_person_object() {
     let vroot = vault_arg(root);
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--date",
         "2026-10-13",
         "--json",
@@ -2704,7 +2562,7 @@ fn log_session_by_id_does_not_echo_a_person_object() {
     assert!(v.get("person").is_none(), "{v}");
     let after = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
     assert!(after.starts_with(&before));
-    assert!(after.contains(&format!("session {PERSON} 60m paid")));
+    assert!(after.contains(&format!("touch {PERSON} meal")));
 }
 
 #[test]
@@ -2901,18 +2759,22 @@ fn help_json_lists_every_subcommand() {
     ] {
         assert!(names.contains(&expected), "missing subcommand {expected}");
     }
-    // Nested subcommands are visible too (ADR-7 `log session` form).
+    // Nested subcommands are visible too (ADR-7 `log touch` form), and the
+    // removed `log session` command is gone.
     let log = v["commands"]
         .as_array()
         .unwrap()
         .iter()
         .find(|c| c["name"] == "log")
         .unwrap();
-    assert!(log["subcommands"]
+    let log_subs: Vec<&str> = log["subcommands"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|s| s == "session"));
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert!(log_subs.contains(&"touch"), "{log_subs:?}");
+    assert!(!log_subs.contains(&"session"), "{log_subs:?}");
     let alias = v["commands"]
         .as_array()
         .unwrap()
@@ -2978,7 +2840,8 @@ fn mcp_initialize_and_list() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"log_session"));
+    assert!(names.contains(&"log_touch"));
+    assert!(!names.contains(&"log_session"));
     assert!(names.contains(&"context"));
 }
 
@@ -3169,10 +3032,11 @@ fn warnings_never_block_writes() {
     // The write succeeds despite the warnings: exactly one new commit.
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
+        "--date",
+        "2026-10-13",
         "--json",
         "--no-input",
         "--vault",
@@ -3184,7 +3048,7 @@ fn warnings_never_block_writes() {
     assert_eq!(
         commits(root),
         3,
-        "init + untagged session + the new session"
+        "init + untagged session line + the new touch"
     );
 }
 
@@ -3702,7 +3566,7 @@ fn log_touch_rejects_coffee_and_lists_v1_kinds() {
 }
 
 // ---------------------------------------------------------------------------
-// #747: semantic idempotency for `log touch` / `log session`
+// #747: semantic idempotency for `log touch`
 // ---------------------------------------------------------------------------
 
 fn log_touch_args<'a>(kind: &'a str, vroot: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
@@ -3794,98 +3658,6 @@ fn log_touch_refusal_writes_no_note_record() {
     assert_eq!(after, before, "a refused touch must not stage a note");
 }
 
-#[test]
-fn log_session_refuses_identical_session_and_force_logs_it() {
-    let dir = make_vault();
-    let root = dir.path();
-    let vroot = vault_arg(root);
-    enable_personal(root);
-
-    let base = [
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "paid",
-        "--date",
-        "2026-10-05",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ];
-    let (ok, v) = run_json(&base);
-    assert!(ok, "{v}");
-    let before = commits(root);
-
-    // `1h` is the same 60 minutes: refused, not a distinct session.
-    let hour = [
-        "log",
-        "session",
-        PERSON,
-        "1h",
-        "paid",
-        "--date",
-        "2026-10-05",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ];
-    let (ok, v) = run_json(&hour);
-    assert!(!ok, "{v}");
-    assert_eq!(v["error"]["code"], "E_ALREADY_EXISTS");
-    assert_eq!(commits(root), before, "a refused session writes nothing");
-
-    // A different tag the same day is a different session.
-    let other_tag = [
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "pps",
-        "--date",
-        "2026-10-05",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ];
-    let (ok, v) = run_json(&other_tag);
-    assert!(ok, "{v}");
-
-    // --force logs the genuine repeat.
-    let forced = [
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "paid",
-        "--date",
-        "2026-10-05",
-        "--force",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ];
-    let (ok, v) = run_json(&forced);
-    assert!(ok, "{v}");
-
-    // #747 review: `check` flags the forced session repeat as a
-    // warning on the later line, mirroring `W_DUPLICATE_TOUCH`.
-    let (ok, report) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
-    assert!(ok, "{report}");
-    let dups: Vec<&Value> = report["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|f| f["code"] == "W_DUPLICATE_SESSION")
-        .collect();
-    assert_eq!(dups.len(), 1, "{report}");
-    assert_eq!(dups[0]["severity"], "warning");
-}
-
 /// #747 review: when the two identities disagree — same `--request-id`,
 /// same person/date/kind, different `--note` — the input is both a
 /// semantic duplicate (refusal would say `E_ALREADY_EXISTS`) and a
@@ -3913,93 +3685,6 @@ fn log_touch_request_id_conflict_beats_semantic_refusal() {
     assert!(!ok, "{v}");
     assert_eq!(v["error"]["code"], "E_IDEMPOTENCY_CONFLICT");
     assert_eq!(commits(root), before, "a conflict writes nothing");
-}
-
-/// #747 review: the billing tag is a closed vocabulary, so `log session`
-/// rejects anything outside paid/pps/comp — including a correctly
-/// spelled tag in the wrong case.
-#[test]
-fn log_session_rejects_unknown_and_cased_tags() {
-    let dir = make_vault();
-    let root = dir.path();
-    let vroot = vault_arg(root);
-    enable_personal(root);
-    let before = commits(root);
-
-    for tag in ["full", "Paid", "PAID"] {
-        let (ok, v) = run_json(&[
-            "log",
-            "session",
-            PERSON,
-            "60m",
-            tag,
-            "--date",
-            "2026-10-05",
-            "--json",
-            "--no-input",
-            "--vault",
-            &vroot,
-        ]);
-        assert!(!ok, "tag {tag} must be rejected: {v}");
-        assert_eq!(v["error"]["code"], "usage_error");
-        let message = v["error"]["message"].as_str().unwrap();
-        assert!(
-            message.contains("paid, pps, comp"),
-            "the error must list the vocabulary: {message}"
-        );
-    }
-    assert_eq!(commits(root), before, "rejected tags write nothing");
-}
-
-/// #747 review: the session refusal names the normalized duration, not
-/// the raw typed one — re-logging `1h` against a stored `60m` line
-/// reports a `60m` session, so the message points at the line matched.
-#[test]
-fn log_session_refusal_names_normalized_minutes() {
-    let dir = make_vault();
-    let root = dir.path();
-    let vroot = vault_arg(root);
-    enable_personal(root);
-
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "paid",
-        "--date",
-        "2026-10-05",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ]);
-    assert!(ok, "{v}");
-
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "1h",
-        "paid",
-        "--date",
-        "2026-10-05",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ]);
-    assert!(!ok, "{v}");
-    assert_eq!(v["error"]["code"], "E_ALREADY_EXISTS");
-    let message = v["error"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("a 60m paid session"),
-        "refusal must name normalized minutes: {message}"
-    );
-    assert!(
-        !message.contains("a 1h "),
-        "refusal must not echo the raw typed duration: {message}"
-    );
 }
 
 // ---------------------------------------------------------------------------

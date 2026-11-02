@@ -279,7 +279,7 @@ pub fn contract_schema() -> Value {
                 }
             },
             "writeResponse": {
-                "title": "log session / import / note add --json",
+                "title": "log touch / import / note add --json",
                 "description": "One commit per write. Commit messages carry only opaque IDs, verbs, hashes. --request-id must be unguessable (at least 22 characters; use a ULID or UUIDv4): the Request-Hash trailer HMACs the canonical request with the raw id as key, and trailers are permanent, so a guessable id is an offline guessing oracle even after shredding.",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "command"],
@@ -287,7 +287,7 @@ pub fn contract_schema() -> Value {
                     "ok": {"type": "boolean", "const": true},
                     "schema_version": {"type": "string"},
                     "vault": {"type": "string"},
-                    "command": {"type": "string", "enum": ["log-session", "import", "note-add", "record-add", "record-edit"]},
+                    "command": {"type": "string", "enum": ["log-touch", "import", "note-add", "record-add", "record-edit"]},
                     "dry_run": {"type": "boolean"},
                     "idempotent": {"type": "boolean"},
                     "unchanged": {"type": "boolean", "description": "The write would not change any file (for example re-saving a record with identical content). No commit is reported with it; exit status is success."},

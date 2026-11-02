@@ -5,8 +5,8 @@ vault  /fake/demo-vault   scope  personal@0.2   doctor  not run
 ╰─────────│   1 People & Search   2 Review Queue   3 Check   Tab/Shift-Tab cycles        │         │
 ╭ Roster ─│ People & Search                                                              │         │
 │   Needs │   list: j/k move   g/G first/last   / filter   Enter open                    │         │
-│   W_DATE│   f search   s/t/n session/touch/note   a new person                         │         │
-│     birt│   s/t/n pre-fill the selected person; a composes a fresh one                 │         │
+│   W_DATE│   f search   t/n touch/note   a new person                                   │         │
+│     birt│   t/n pre-fill the selected person; a composes a fresh one                   │         │
 │   People│   context: j/k scroll   g top   [ / ] select the context item   e edit it    │         │
 │ › Ada Ex│ Review Queue                                                                 │0008     │
 │   Bea De│   o Proposals   c Conflicts   r refresh   Enter open/detail                  │         │

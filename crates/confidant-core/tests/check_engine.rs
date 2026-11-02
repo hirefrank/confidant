@@ -10247,7 +10247,7 @@ fn shipped_example_note_ref_codes_are_pack_own() {
 fn shipped_example_pack_hash_is_stable() {
     let pack = read_pack_dir(&example_pack_dir()).expect("shipped pack dir must read");
     assert_eq!(
-        pack.hash, "sha256:bc67a54ad6bd84d1f28b727e7407efc00878b4a964bcea48bd59f798678e0c30",
+        pack.hash, "sha256:deff06ac326c0d789e1c8c82f460a3b4978c4d059b9ecabeb2a76d2c864a4749",
         "the example-pack fixture changed; update this pin in the same commit"
     );
     assert_eq!(pack.files.len(), 3);

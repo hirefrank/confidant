@@ -59,7 +59,7 @@ PERSON = "p-01J9Z3K4QF0000000000000001"  # "Ada Example", paid
 NO_AI_PERSON = "p-01J9Z3K4QG0000000000000002"  # "Cam Sample", no-ai
 PACKAGE = "pkg-01J9Z3K4QF0000000000000000"
 VAULT_ID = "01J9Z3K4QF0000000000000000"
-SESSION_DATE = "2026-10-13"
+WRITE_DATE = "2026-10-13"
 ALIAS_DATE = "2026-10-13"
 TOUCH_DATE = "2026-10-15"
 # The neutral external-pack fixture. Installed the way a user installs a
@@ -393,26 +393,25 @@ def plaintext_vault_steps(smoke: Smoke) -> None:
     smoke.ok(step, str(report.get("id", "")).startswith("n-"), f"bad note id: {report}")
     smoke.mark(step)
 
-    step = "log session (plaintext)"
+    step = "log touch (plaintext)"
     report = smoke.cli_ok(
         step,
         [
             "log",
-            "session",
+            "touch",
             PERSON,
-            "60m",
-            "paid",
+            "meet",
             "--date",
-            SESSION_DATE,
+            WRITE_DATE,
             "--note",
-            "Fake session note.",
+            "Fake touchpoint note.",
             "--json",
             "--no-input",
             "--vault",
             str(vault),
         ],
     )
-    smoke.ok(step, report.get("command") == "log-session", f"bad command: {report}")
+    smoke.ok(step, report.get("command") == "log-touch", f"bad command: {report}")
     smoke.mark(step)
 
     smoke.check_clean("check --json (plaintext)", vault)

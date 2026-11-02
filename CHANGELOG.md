@@ -8,6 +8,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Breaking
+- Removed the top-level `confidant log session` command and the MCP `log_session` tool; the TUI's `s` session capture is gone too (#799 step 2). `confidant log touch` remains the core personal write. A pack that declares a `session` verb (a coaching/CRM pack) logs it through `confidant import --file`, the shared pack-verb path, driven by the pack's skill. The pack `session` verb and the `ledger-balance` / `session-checks` / `activity-gap` rule kinds are unchanged. The write-response `command` enum no longer contains `log-session` and now contains `log-touch`.
+
 ### Added
 - Spec 0.3 pack-declared record types (#814): a v3 pack manifest may claim `[[record_types]]` with a two-letter ID prefix, collection, main file, entity/person-like flags, `no_ai` policy, roster visibility, and required/optional fields. `record add`/`edit`/`list`, `context`, `schema`, `allowlist`, `find`, and MCP `note_add` accept these types; `entity:` attaches notes and interactions to any declared entity. The built-in `personal@0.2` pack stays person-only; places, things, and other domains are a pack capability. A checked-in `testdata/vaults/place-0.3` fixture and golden cover a place pack, an `entity:` note, a hidden edge, and the pack pin.
 - Spec 0.3 edge-level `no-ai` (#820): an edge may carry `no-ai: true` / `false`. A hidden edge is omitted from every agent read while both endpoints stay visible; the operator path still sees it and `context` badges it. Orgs remain `no-ai`-free; 0.2 vaults reject the edge key with `E_FRONTMATTER`.
