@@ -11,7 +11,7 @@ use crate::error::DomainError;
 use crate::id::{
     add_bare_ulid_windows, scan_ids, scan_prefixed_line, IdToken, Prefix, PrefixedScan, RecordId,
 };
-use crate::ledger::ledger_line_verb;
+use crate::ledger::{ledger_line_verb, parse_line, parse_retract, RetractParse};
 use crate::record::{parse_ref_id, parse_with_list, unquote, FrontmatterRef, RecordKind};
 use crate::scope::{
     note_linkage_owners, owner_of_field, owners_of_ledger_text, record_owners, OwnerKey, PackScope,
@@ -41,6 +41,10 @@ pub struct SearchHit {
     /// to report.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator_only: Option<bool>,
+    /// Stable line reference for a ledger hit (#746), when the line parsed.
+    /// Absent on record hits and malformed ledger lines.
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub line_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -61,6 +65,12 @@ struct RecordFacts {
 }
 
 /// Indexes built once per search so the allowlist is a worklist, not nested scans.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetractGate {
+    Target(usize),
+    Dangling,
+}
+
 struct Allowlist<'a> {
     vault: &'a Vault,
     cleared: HashSet<RecordId>,
@@ -70,6 +80,10 @@ struct Allowlist<'a> {
     strong_by_ulid: HashMap<Arc<str>, Vec<RecordId>>,
     ledger_at: HashMap<(&'a str, u32), usize>,
     ledger_tokens: Vec<Vec<IdToken>>,
+    /// Per raw ledger line: the target a valid `retract` line points at.
+    /// `None` means "not a retraction (or malformed)", `Dangling` means a
+    /// parsed retraction whose target is missing (fail closed).
+    retract_gates: Vec<Option<RetractGate>>,
     named_ledger_lines: BTreeMap<RecordId, Vec<usize>>,
     ledger_ok: Vec<bool>,
     /// Operator mode only (#593): per ledger line, `true` when the operator
@@ -84,6 +98,10 @@ struct Allowlist<'a> {
     /// the same operator read path as `record show --for-edit` (spec §12). Never
     /// set on an agent path; `false` is the §12 allowlist.
     operator: bool,
+    /// Whether retirement removes a record from the cleared set (#746).
+    /// `true` for the agent path and the "no-ai only" comparison set;
+    /// `false` for the full operator path.
+    honor_retirement: bool,
     /// Operator mode only (#572): ids the agent allowlist hides but the
     /// operator allowlist does not — hidden solely by `no-ai` (their own or
     /// inherited). Used to badge a hit. Empty on the agent path.
@@ -178,6 +196,7 @@ fn search_with(
                     .copied()
                     .unwrap_or(false)
                     .then_some(true),
+                line_ref: line.line_ref.map(|line_ref| line_ref.to_string()),
             });
         }
     }
@@ -305,6 +324,18 @@ impl<'a> Allowlist<'a> {
     /// `operator` ignores `no-ai` in the cleared-set fixpoint (#572). Only
     /// ever `true` for `find --for-operator` / `context --for-operator`.
     fn build_with(vault: &'a Vault, scope: &PackScope, operator: bool) -> Self {
+        Self::build_with_flags(vault, scope, operator, !operator)
+    }
+
+    /// `honor_retirement=false` is the full operator path; `true` is the
+    /// agent path and the intermediate "operator, but retirement still
+    /// applies" set used only to compute the `no-ai` badge.
+    fn build_with_flags(
+        vault: &'a Vault,
+        scope: &PackScope,
+        operator: bool,
+        honor_retirement: bool,
+    ) -> Self {
         let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
         let linkage = note_linkage_owners(vault, &enabled);
         let mut by_path = BTreeMap::new();
@@ -315,6 +346,29 @@ impl<'a> Allowlist<'a> {
         for (idx, line) in vault.ledger_lines.iter().enumerate() {
             ledger_at.insert((line.file.as_str(), line.line), idx);
         }
+        // A retraction line is only searchable when its target line is too:
+        // the ref must not become an oracle for a hidden fact (#746).
+        let retract_gates: Vec<Option<RetractGate>> = vault
+            .ledger_lines
+            .iter()
+            .map(|line| match parse_line(&line.text) {
+                Ok(Some(entry)) if entry.verb == "retract" => match parse_retract(&entry) {
+                    RetractParse::Ok(spec) => {
+                        let target = vault.corrections().retraction_for(&spec.target);
+                        match target.and_then(|r| {
+                            vault.ledger_lines.iter().position(|candidate| {
+                                candidate.file == r.target_file && candidate.line == r.target_line
+                            })
+                        }) {
+                            Some(idx) => Some(RetractGate::Target(idx)),
+                            None => Some(RetractGate::Dangling),
+                        }
+                    }
+                    RetractParse::Malformed => None,
+                },
+                _ => None,
+            })
+            .collect();
 
         let mut strong_by_ulid: HashMap<Arc<str>, Vec<RecordId>> = HashMap::new();
         for id in vault.records.keys() {
@@ -382,6 +436,9 @@ impl<'a> Allowlist<'a> {
             .collect();
         let mut named_ledger_lines: BTreeMap<RecordId, Vec<usize>> = BTreeMap::new();
         for (idx, toks) in ledger_tokens.iter().enumerate() {
+            if vault.is_voided_line(&vault.ledger_lines[idx]) {
+                continue;
+            }
             for tok in toks {
                 for id in ids_named_by(tok, &by_ulid, &strong_by_ulid) {
                     if !ledger_named_prefix(id.prefix()) {
@@ -403,11 +460,13 @@ impl<'a> Allowlist<'a> {
             strong_by_ulid,
             ledger_at,
             ledger_tokens,
+            retract_gates,
             named_ledger_lines,
             ledger_ok: Vec::new(),
             ledger_operator_only: Vec::new(),
             scope: scope.clone(),
             operator,
+            honor_retirement,
             no_ai_hidden: HashSet::new(),
             enabled,
             linkage,
@@ -419,40 +478,53 @@ impl<'a> Allowlist<'a> {
         // here so the ledger badge reuses the operator-minus-agent
         // difference, never a second notion of "hidden by no-ai".
         let mut agent_ledger_ok: Option<Vec<bool>> = None;
-        if operator {
+        let mut no_ai_only_ledger_ok: Option<Vec<bool>> = None;
+        if operator && !honor_retirement {
             // The badge set: everything the operator allowlist adds over
             // the agent allowlist is hidden solely by `no-ai`. The operator
             // rules are a strict relaxation of the agent rules, so the
             // agent set is a subset.
             let agent = Allowlist::build_with(vault, scope, false);
-            let hidden: HashSet<RecordId> =
-                allow.cleared.difference(&agent.cleared).cloned().collect();
+            // Compare against the operator set that still honors
+            // retirement, so a retired record is never mis-badged
+            // `no-ai: "true"` and a retired line is not `operator_only`.
+            let no_ai_only = Allowlist::build_with_flags(vault, scope, true, true);
+            let hidden: HashSet<RecordId> = no_ai_only
+                .cleared
+                .difference(&agent.cleared)
+                .cloned()
+                .collect();
             allow.no_ai_hidden = hidden;
-            agent_ledger_ok = Some(
-                allow
-                    .vault
-                    .ledger_lines
-                    .iter()
-                    .zip(allow.ledger_tokens.iter())
-                    .map(|(line, toks)| {
-                        line.searchable && tokens_allowed_with(toks, &agent.cleared, &allow)
-                    })
-                    .collect(),
-            );
+            agent_ledger_ok = Some(agent.ledger_ok.clone());
+            no_ai_only_ledger_ok = Some(no_ai_only.ledger_ok.clone());
         }
         allow.ledger_ok = allow
             .vault
             .ledger_lines
             .iter()
-            .zip(allow.ledger_tokens.iter())
-            .map(|(line, toks)| line.searchable && tokens_allowed(toks, &allow))
+            .enumerate()
+            .map(|(idx, line)| {
+                let toks = &allow.ledger_tokens[idx];
+                line.searchable
+                    && !allow.vault.is_voided_line(line)
+                    && line_allowed_with(toks, Some(idx), &allow.cleared, &allow)
+            })
             .collect();
         if let Some(agent_ok) = agent_ledger_ok {
             allow.ledger_operator_only = allow
                 .ledger_ok
                 .iter()
                 .zip(agent_ok)
-                .map(|(operator, agent)| *operator && !agent)
+                .enumerate()
+                .map(|(idx, (operator, agent))| {
+                    *operator
+                        && !agent
+                        // A line hidden by retirement is not "hidden solely
+                        // by no-ai"; the no-ai-only set still includes it.
+                        && no_ai_only_ledger_ok
+                            .as_ref()
+                            .is_none_or(|ok| ok.get(idx).copied().unwrap_or(false))
+                })
                 .collect();
         }
         allow
@@ -473,6 +545,7 @@ fn compute_cleared(allow: &Allowlist<'_>) -> HashSet<RecordId> {
         .records
         .values()
         .filter(|rec| (allow.operator || !rec.no_ai()) && !tainted.contains(&rec.id))
+        .filter(|rec| !allow.honor_retirement || !allow.vault.is_retired(&rec.id))
         .filter(|rec| allow.operator || allow.type_enabled(rec))
         .filter(|rec| rec.person().is_none_or(|person| !tainted.contains(&person)))
         .filter(|rec| allow.operator || !inherits_notes_no_ai(rec, allow, &components))
@@ -534,6 +607,9 @@ fn still_cleared(
     if tainted.contains(id) {
         return false;
     }
+    if allow.honor_retirement && allow.vault.is_retired(id) {
+        return false;
+    }
     if facts.fm_malformed || facts.fm_bad_ref {
         return false;
     }
@@ -563,7 +639,7 @@ fn still_cleared(
     if let Some(idxs) = allow.named_ledger_lines.get(id) {
         if idxs
             .iter()
-            .any(|&idx| !tokens_allowed_with(&allow.ledger_tokens[idx], cleared, allow))
+            .any(|&idx| !line_allowed_with(&allow.ledger_tokens[idx], Some(idx), cleared, allow))
         {
             return false;
         }
@@ -846,6 +922,9 @@ fn pkg_open_lines(allow: &Allowlist<'_>) -> Vec<OpenLine> {
         .iter()
         .zip(allow.ledger_tokens.iter())
     {
+        if allow.vault.is_voided_line(line) {
+            continue;
+        }
         // Only a pack's declared `open_verb` opens a package. A line that
         // merely contains `package` (a note reference, a stray argument)
         // must not clear a package ID.
@@ -1032,6 +1111,30 @@ fn tokens_allowed(toks: &[IdToken], allow: &Allowlist<'_>) -> bool {
     tokens_allowed_with(toks, &allow.cleared, allow)
 }
 
+/// A ledger line is allowed only when its own tokens are cleared and, for a
+/// `retract` line, its target line is allowed too (#746 privacy rule).
+fn line_allowed_with(
+    toks: &[IdToken],
+    idx: Option<usize>,
+    cleared: &HashSet<RecordId>,
+    allow: &Allowlist<'_>,
+) -> bool {
+    if !tokens_allowed_with(toks, cleared, allow) {
+        return false;
+    }
+    let Some(gate) = idx.and_then(|idx| allow.retract_gates.get(idx).copied().flatten()) else {
+        return true;
+    };
+    match gate {
+        RetractGate::Target(target_idx) => {
+            let target = &allow.vault.ledger_lines[target_idx];
+            target.searchable
+                && tokens_allowed_with(&allow.ledger_tokens[target_idx], cleared, allow)
+        }
+        RetractGate::Dangling => false,
+    }
+}
+
 fn tokens_allowed_with(
     toks: &[IdToken],
     cleared: &HashSet<RecordId>,
@@ -1216,6 +1319,7 @@ fn scan_record(
                 // `operator_only` is the ledger-line marker; record hits
                 // already carry `no_ai`.
                 operator_only: None,
+                line_ref: None,
             });
         }
     }

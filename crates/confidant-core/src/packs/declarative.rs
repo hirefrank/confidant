@@ -635,6 +635,7 @@ impl RuleKind for CadenceOverdueKind {
                 .vault
                 .entries
                 .iter()
+                .filter(|s| !ctx.vault.is_voided(s))
                 .filter(|s| event_verbs.contains(&s.entry.verb.as_str()))
                 .filter(|s| s.entry.date <= ctx.as_of)
                 .filter(|s| {
@@ -713,6 +714,7 @@ fn vault_persons(vault: &Vault) -> Vec<&crate::record::Record> {
         .records
         .values()
         .filter(|r| r.kind == crate::record::RecordKind::Person)
+        .filter(|r| !vault.is_retired(&r.id))
         .collect();
     records.sort_by(|a, b| a.id.cmp(&b.id));
     records
@@ -1158,6 +1160,9 @@ impl RuleKind for NoteRefKind {
         };
 
         for sourced in &ctx.vault.entries {
+            if ctx.vault.is_voided(sourced) {
+                continue;
+            }
             let entry = &sourced.entry;
             if entry.verb != verb || entry.id.prefix() != Prefix::Person {
                 continue;

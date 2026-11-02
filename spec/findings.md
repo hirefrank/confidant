@@ -1,4 +1,4 @@
-# Stable finding codes (spec 0.1–0.3)
+# Stable finding codes (spec 0.1–0.4)
 
 Callers of `confidant check --json` must branch on `code`, never on message
 text. Codes are stable once published. A new meaning needs a new code.
@@ -20,7 +20,7 @@ present, for CI users who want the stricter gate.
 | `E_PARSE` | error | | A ledger line or record file does not match the grammar. |
 | `E_UNREADABLE` | error | | A file is not valid UTF-8 or a directory cannot be read. |
 | `E_CONFIG` | error | | `confidant.toml` is missing a required field, is not valid TOML, or a `[checks]` key/value is unknown, mistyped, or out of range. |
-| `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1`, `0.2`, or `0.3`. |
+| `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1`, `0.2`, `0.3`, or `0.4`. |
 | `E_VAULT_LEGACY_ENCRYPTED` | error | | The vault matches the ≤0.7 encrypted-vault shell: a `keys/` tree beyond `.gitkeep`, an `enc:` front-matter header, or an `enc:` ledger line. `check` emits this one finding and stops; `find`, `context`, `allowlist`, `resolve`, and `alias resolve` return it as a command error instead of scanning. The message is the whole diagnosis and remedy; the finding carries no file path, id, or record content. |
 | `E_PACK_UNKNOWN` | error | | A listed pack is neither compiled into this CLI nor resolved through `confidant.lock`. The fix hint points at `confidant pack add`. The message may name the failing `name@version` exactly as listed in `confidant.toml`; `file` is `confidant.toml`. Not reported when `spec` is unsupported: external packs are not resolved and `check` stops after `E_SPEC_UNSUPPORTED`. |
 | `E_PACK_VERSION` | error | | A listed pack's pinned version is newer than this binary supports, or (for external packs) the pack's `requires_spec` does not include the vault's `spec`. The message names the failing `name@version` exactly as listed in `confidant.toml`; `file` is `confidant.toml`. |
@@ -58,6 +58,11 @@ present, for CI users who want the stricter gate.
 | `W_CADENCE_OVERDUE` | warning | `personal.cadence_overdue` | A person with `cadence: <N>d` has no touchpoint (`touch`, `session`, or dated `interaction`) on or after `as_of - N days` (built-in personal pack). |
 | `W_DATE_UPCOMING` | warning | `personal.date_upcoming` | A person's `birthday` or an entry in `dates` occurs within `0..=personal.date_upcoming_days` days of `as_of` (built-in personal pack). |
 | `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. The message does not echo the `src:` value. |
+| `E_RETRACT_MALFORMED` | error | | A `retract` line does not match `DATE retract SUBJECT-ID line:<64 lowercase hex> [occurrence:<n>] reason:<closed token> [replace:<64 lowercase hex>]`, including an unknown reason, `occurrence:0`, duplicate/extra pairs, or non-lowercase hex. |
+| `E_RETRACT_TARGET` | error | | A `retract` line names no parsed line for its `line:` ref + `occurrence:`, or its `replace:` ref names no line. |
+| `E_RETRACT_CHAIN` | error | | A retraction chain is invalid: the same target is retracted twice, two retractions name different replacements, a replacement cycle exists, or the replacement is already superseded at the retraction date. |
+| `E_RETRACT_ORDER` | error | | A retraction is dated before its target or replacement line. |
+| `E_RETRACT_NOT_ALLOWED` | error | | The target is a `retract` or `merge` line, or the retraction/replacement subject ID differs from the target line's subject. |
 
 **Retired, not emitted, never reused.** These old built-in names stay
 reserved and must never be reused for a new meaning; nothing emits them in

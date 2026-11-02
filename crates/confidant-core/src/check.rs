@@ -123,6 +123,11 @@ pub enum FindingCode {
     DateUpcoming,
     DuplicateTouch,
     DuplicateSession,
+    RetractMalformed,
+    RetractTarget,
+    RetractChain,
+    RetractOrder,
+    RetractNotAllowed,
     Pack(&'static str),
 }
 
@@ -178,6 +183,11 @@ impl FindingCode {
             Self::DateUpcoming => "W_DATE_UPCOMING",
             Self::DuplicateTouch => "W_DUPLICATE_TOUCH",
             Self::DuplicateSession => "W_DUPLICATE_SESSION",
+            Self::RetractMalformed => "E_RETRACT_MALFORMED",
+            Self::RetractTarget => "E_RETRACT_TARGET",
+            Self::RetractChain => "E_RETRACT_CHAIN",
+            Self::RetractOrder => "E_RETRACT_ORDER",
+            Self::RetractNotAllowed => "E_RETRACT_NOT_ALLOWED",
             Self::Pack(code) => code,
         }
     }
@@ -239,6 +249,11 @@ impl FindingCode {
         "W_PARTIAL_RESULTS",
         "W_DUPLICATE_TOUCH",
         "W_DUPLICATE_SESSION",
+        "E_RETRACT_MALFORMED",
+        "E_RETRACT_TARGET",
+        "E_RETRACT_CHAIN",
+        "E_RETRACT_ORDER",
+        "E_RETRACT_NOT_ALLOWED",
     ];
 
     /// Codes retired by the #449 cutover and the #795 crypto removal
@@ -372,6 +387,11 @@ impl FindingCode {
             "W_DATE_UPCOMING" => Self::DateUpcoming,
             "W_DUPLICATE_TOUCH" => Self::DuplicateTouch,
             "W_DUPLICATE_SESSION" => Self::DuplicateSession,
+            "E_RETRACT_MALFORMED" => Self::RetractMalformed,
+            "E_RETRACT_TARGET" => Self::RetractTarget,
+            "E_RETRACT_CHAIN" => Self::RetractChain,
+            "E_RETRACT_ORDER" => Self::RetractOrder,
+            "E_RETRACT_NOT_ALLOWED" => Self::RetractNotAllowed,
             _ => return None,
         })
     }
@@ -511,16 +531,18 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     }
 
     let mut findings = vault.load_findings.clone();
+    findings.extend(vault.corrections().findings().iter().cloned());
 
     if !SpecVersion::is_supported(&vault.config.spec) {
         findings.push(
             Finding::new(
                 FindingCode::SpecUnsupported,
                 Severity::Error,
-                "vault spec is not supported (this CLI implements 0.1, 0.2, and 0.3)".to_owned(),
+                "vault spec is not supported (this CLI implements 0.1, 0.2, 0.3, and 0.4)"
+                    .to_owned(),
             )
             .at_file("confidant.toml")
-            .with_fix("Use spec = \"0.1\", \"0.2\", or \"0.3\", or upgrade the CLI"),
+            .with_fix("Use spec = \"0.1\", \"0.2\", \"0.3\", or \"0.4\", or upgrade the CLI"),
         );
     }
 
@@ -660,6 +682,16 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
         check_balances(vault, &states, &orphans, &mut findings);
     }
 
+    // A retraction suppresses every line-located finding on its target:
+    // the correction is the remedy, while file-level and record-level
+    // findings still stand.
+    findings.retain(|finding| {
+        !finding.file.as_deref().is_some_and(|file| {
+            finding
+                .line
+                .is_some_and(|line| vault.is_voided_location(file, line))
+        })
+    });
     sort_findings(&mut findings);
     finish_report(vault, options, findings)
 }
@@ -821,11 +853,15 @@ pub fn pack_snapshots(
 /// core list rather than leaking copies (#497 item 1). The `'a` lifetime
 /// is unconstrained because the pack trait's `'static` claims coerce to
 /// it; the caller unifies it with the `vault` borrow it also inserts.
-fn known_verbs<'a>(enabled_packs: &[&dyn Pack]) -> HashSet<&'a str> {
+fn known_verbs<'a>(spec: SpecVersion, enabled_packs: &[&dyn Pack]) -> HashSet<&'a str> {
     // `touch` is core (#179): a mirrored touchpoint carries only a date
-    // and the participant's own id, no pack data.
+    // and the participant's own id, no pack data. `retract` is core in
+    // 0.4 only; older vaults reject it as an unknown verb.
     let mut verbs: HashSet<&'a str> =
         HashSet::from(["alias", "merge", "stage", "balance", "touch"]);
+    if spec >= SpecVersion::V04 {
+        verbs.insert("retract");
+    }
     for pack in enabled_packs {
         verbs.extend(pack.verbs().iter().copied());
     }
@@ -846,7 +882,8 @@ pub struct AcceptedVerbs<'a> {
 }
 
 pub fn accepted_verbs<'a>(vault: &'a Vault, enabled_packs: &[&'a dyn Pack]) -> AcceptedVerbs<'a> {
-    let mut known = known_verbs(enabled_packs);
+    let spec = vault.spec_version().unwrap_or(SpecVersion::V01);
+    let mut known = known_verbs(spec, enabled_packs);
     // Problem packs are not folded, but their claimed verbs stay known
     // (spec/pack-lock.md §5) so the failure does not cascade into
     // `E_UNKNOWN_VERB` noise.
@@ -874,7 +911,7 @@ pub fn verb_passes_check(vault: &Vault, verb: &str) -> bool {
 }
 
 fn check_ledger_paths(vault: &Vault, findings: &mut Vec<Finding>) {
-    for entry in &vault.entries {
+    for entry in vault.effective_entries() {
         if let Some((year, month)) = parse_ledger_file(&entry.file) {
             if entry.entry.date.year() != year || entry.entry.date.month() != month {
                 findings.push(
@@ -911,7 +948,7 @@ fn check_verbs_and_refs(
     known_ids: &HashSet<RecordId>,
     findings: &mut Vec<Finding>,
 ) {
-    for sourced in &vault.entries {
+    for sourced in vault.effective_entries() {
         let e = &sourced.entry;
         if !known_verbs.contains(e.verb.as_str()) {
             if let Some(owner) = orphans.verbs.get(e.verb.as_str()) {
@@ -1390,7 +1427,7 @@ fn check_balances(
     findings: &mut Vec<Finding>,
 ) {
     for sourced in &vault.entries {
-        if sourced.entry.verb != "balance" {
+        if sourced.entry.verb != "balance" || vault.is_voided(sourced) {
             continue;
         }
         let e = &sourced.entry;
@@ -1630,6 +1667,10 @@ fn check_edges(
         if rec.kind != RecordKind::Edge {
             continue;
         }
+        // A retired edge is kept as history and still validated, but it is
+        // not a current relation: it does not participate in the self or
+        // duplicate rules.
+        let retired = vault.is_retired(&rec.id);
 
         // Resolve the kind first: the endpoint rules are per kind.
         let kind_raw = rec.field("kind");
@@ -1658,7 +1699,7 @@ fn check_edges(
             match spec {
                 SpecVersion::V01 => format!("Add {key}: p-<ULID>"),
                 SpecVersion::V02 => format!("Add {key}: p-<ULID> or o-<ULID>"),
-                SpecVersion::V03 => {
+                SpecVersion::V03 | SpecVersion::V04 => {
                     format!("Add {key}: an entity id (p-, o-, or a declared type)")
                 }
             }
@@ -1814,7 +1855,7 @@ fn check_edges(
 
         // Self-edges compare the canonical pair in 0.2+, so a merge cannot
         // leave a record linked to itself. 0.1 keeps the raw comparison.
-        if ends.len() == 2 {
+        if ends.len() == 2 && !retired {
             let (left, right) = if spec != SpecVersion::V01 {
                 (
                     canonical_on(&ends[0], merges, as_of),
@@ -1902,7 +1943,7 @@ fn check_edges(
         // pair with different kinds are different relations, not
         // duplicates. A missing or unknown kind already errors above; it
         // still keys separately here so the duplicate rule stays total.
-        if ends.len() == 2 && ends_valid {
+        if ends.len() == 2 && ends_valid && !retired {
             let kind_key = kind_raw.unwrap_or("").to_string();
             let (left, right) = if spec != SpecVersion::V01 {
                 (
@@ -2030,7 +2071,7 @@ fn check_with_lists(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &mut
 
 fn check_duplicate_src(vault: &Vault, findings: &mut Vec<Finding>) {
     let mut seen: BTreeMap<String, (String, u32)> = BTreeMap::new();
-    for sourced in &vault.entries {
+    for sourced in vault.effective_entries() {
         let Some(src) = sourced.entry.pair("src") else {
             continue;
         };
@@ -2063,7 +2104,7 @@ fn check_duplicate_src(vault: &Vault, findings: &mut Vec<Finding>) {
 /// invisible while a repeated touch is flagged.
 fn check_duplicate_touches(vault: &Vault, findings: &mut Vec<Finding>) {
     let mut seen: BTreeMap<(RecordId, NaiveDate, String), (String, u32)> = BTreeMap::new();
-    for sourced in &vault.entries {
+    for sourced in vault.effective_entries() {
         let Some(identity) = crate::touch::touch_identity(&sourced.entry) else {
             continue;
         };
@@ -2095,7 +2136,7 @@ fn check_duplicate_touches(vault: &Vault, findings: &mut Vec<Finding>) {
 /// with no parseable duration carry no identity and are never flagged.
 fn check_duplicate_sessions(vault: &Vault, findings: &mut Vec<Finding>) {
     let mut seen: BTreeMap<(RecordId, NaiveDate, u32, String), (String, u32)> = BTreeMap::new();
-    for sourced in &vault.entries {
+    for sourced in vault.effective_entries() {
         let entry = &sourced.entry;
         if entry.verb != "session" {
             continue;
@@ -2409,6 +2450,11 @@ mod tests {
             FindingCode::DateUpcoming,
             FindingCode::DuplicateTouch,
             FindingCode::DuplicateSession,
+            FindingCode::RetractMalformed,
+            FindingCode::RetractTarget,
+            FindingCode::RetractChain,
+            FindingCode::RetractOrder,
+            FindingCode::RetractNotAllowed,
         ];
         for code in &variants {
             match code {
@@ -2459,8 +2505,13 @@ mod tests {
                 | FindingCode::TouchMalformed
                 | FindingCode::CadenceOverdue
                 | FindingCode::DateUpcoming
-                | FindingCode::DuplicateTouch => {}
-                FindingCode::DuplicateSession => {}
+                | FindingCode::DuplicateTouch
+                | FindingCode::DuplicateSession
+                | FindingCode::RetractMalformed
+                | FindingCode::RetractTarget
+                | FindingCode::RetractChain
+                | FindingCode::RetractOrder
+                | FindingCode::RetractNotAllowed => {}
                 FindingCode::Pack(_) => panic!("Pack is not a builtin variant"),
             }
         }

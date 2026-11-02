@@ -1,7 +1,8 @@
 //! Parse, model, derived values, and the check engine for Confidant vaults.
 //!
 //! The file format is specified independently in `spec/0.1.md` (frozen),
-//! `spec/0.2.md` (frozen), and `spec/0.3.md` (current) (ADR-1).
+//! `spec/0.2.md` (frozen), `spec/0.3.md` (frozen), and `spec/0.4.md`
+//! (current) (ADR-1).
 
 // Unsafe is denied crate-wide. The Unix `openat` / `O_NOFOLLOW` walk in
 // `paths` is the only exception, matching cr (ADR-13).
@@ -14,6 +15,7 @@ pub mod check;
 pub mod config;
 pub mod conflict;
 pub mod context;
+pub mod corrections;
 pub mod discover;
 pub mod error;
 pub mod id;
@@ -37,10 +39,14 @@ pub use check::{
     JSON_SCHEMA_VERSION,
 };
 pub use config::{SpecVersion, VaultConfig, SPEC_VERSION};
+pub use corrections::{Corrections, Retraction};
 pub use discover::{resolve as resolve_vault, Discovery};
 pub use error::DomainError;
 pub use id::RecordId;
-pub use ledger::{format_entry, parse_ledger, parse_line, LedgerEntry, ParseErrorKind};
+pub use ledger::{
+    format_entry, line_fingerprint, line_ref, parse_ledger, parse_line, parse_retract, LedgerEntry,
+    LineRef, ParseErrorKind, RetractParse, RetractReason, RetractSpec,
+};
 pub use record::{format_record, parse_record, Record};
 pub use record_type::{
     NoAiPolicy, RecordSchema, RecordTypeDecl, RetiredTypeConfig, TypeOwner, TypeProblem,

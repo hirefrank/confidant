@@ -214,6 +214,120 @@ fn place_03_fixture_hides_only_the_no_ai_edge_and_its_note() {
     assert!(operator.contains(&hidden_note));
 }
 
+/// The checked-in spec 0.4 corrections fixture (#746): a duplicate touch, a
+/// corrected touch, a malformed touch that is retracted, a retired person
+/// with a note, and a no-ai person with a hidden retraction.
+fn corrections_04_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/corrections-0.4")
+}
+
+#[test]
+fn corrections_04_fixture_matches_golden() {
+    let json = report_json(&corrections_04_fixture(), None);
+    assert_eq!(json["ok"], true, "{json}");
+    assert_eq!(codes(&json), Vec::<String>::new(), "{json}");
+    assert_golden("corrections-0.4.json", &json);
+}
+
+#[test]
+fn corrections_04_fixture_hides_superseded_and_retired_from_agent_reads() {
+    let root = corrections_04_fixture();
+    let vault = load_vault(&root).unwrap();
+    assert!(confidant_core::allowlist_is_fixed_point(&vault));
+
+    let ada = confidant_core::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+    let bea = confidant_core::RecordId::parse("p-01M3TC5H00MPJG000H24000001").unwrap();
+    let cam = confidant_core::RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
+    let di = confidant_core::RecordId::parse("p-01M3TC5H00MPJG003333000003").unwrap();
+    let cleared = confidant_core::cleared_record_ids(&vault);
+    assert!(cleared.contains(&ada));
+    assert!(cleared.contains(&bea));
+    assert!(
+        !cleared.contains(&cam),
+        "retired record must not be cleared"
+    );
+    assert!(!cleared.contains(&di), "no-ai record must not be cleared");
+
+    let scope = confidant_core::PackScope::All;
+    let agent = confidant_core::search(&vault, "call", &scope).unwrap();
+    assert_eq!(agent.hits.len(), 1, "{:?}", agent.hits);
+    assert_eq!(agent.hits[0].path, "ledger/2026/10.cfd");
+    assert_eq!(agent.hits[0].line, 2, "the duplicate occurrence is skipped");
+    assert!(agent.hits[0].line_ref.is_some());
+
+    let malformed = confidant_core::search(&vault, "notakind", &scope).unwrap();
+    assert!(malformed.hits.is_empty(), "{:?}", malformed.hits);
+    let retired = confidant_core::search(&vault, "Retired note", &scope).unwrap();
+    assert!(retired.hits.is_empty(), "{:?}", retired.hits);
+    let hidden = confidant_core::search(&vault, "Di Hidden", &scope).unwrap();
+    assert!(hidden.hits.is_empty(), "{:?}", hidden.hits);
+
+    // The retraction for the hidden person is hidden with its target; the
+    // visible retractions remain searchable.
+    let retractions = confidant_core::search(&vault, "wrong-kind", &scope).unwrap();
+    assert_eq!(retractions.hits.len(), 1, "{:?}", retractions.hits);
+    assert_eq!(retractions.hits[0].line, 4);
+
+    let cleared_lines = confidant_core::cleared_ledger_lines(&vault);
+    let october = cleared_lines
+        .get("ledger/2026/10.cfd")
+        .cloned()
+        .unwrap_or_default();
+    assert!(october.contains(&2));
+    assert!(!october.contains(&3), "duplicate touch is superseded");
+    assert!(!october.contains(&4), "replaced touch is superseded");
+    assert!(
+        !october.contains(&6),
+        "retracted malformed touch is superseded"
+    );
+    assert!(!october.contains(&7), "no-ai touch is hidden");
+    let november = cleared_lines
+        .get("ledger/2026/11.cfd")
+        .cloned()
+        .unwrap_or_default();
+    assert!(november.contains(&2) && november.contains(&3) && november.contains(&4));
+    assert!(
+        !november.contains(&5),
+        "retraction of a hidden target is hidden"
+    );
+
+    let operator = confidant_core::search_for_operator(&vault, "wrong-kind", &scope).unwrap();
+    assert_eq!(operator.hits.len(), 2, "{:?}", operator.hits);
+    assert!(operator
+        .hits
+        .iter()
+        .any(|hit| hit.line == 5 && hit.operator_only == Some(true)));
+    assert!(operator
+        .hits
+        .iter()
+        .any(|hit| hit.line == 4 && hit.operator_only.is_none()));
+}
+
+#[test]
+fn retract_is_unknown_before_spec_04() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.3\"\npacks = []\nvault_id = \"test-vault\"\n",
+    );
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 touch {ADA} call\n"),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/11.cfd",
+        &format!(
+            "2026-11-02 retract {ADA} line:87d93568b0d238e8e63086bdf1703f496a2824bc829655b1238332f31c8016c7 reason:duplicate\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_UNKNOWN_VERB"], "{json}");
+}
+
 /// The `balance_mismatch` golden vault's records and ledger, shared by the
 /// golden test and the #449 fixture parity test.
 fn balance_mismatch_vault(root: &Path) {

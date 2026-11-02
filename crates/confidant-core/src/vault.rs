@@ -1,12 +1,13 @@
 //! Load a vault from disk: config, records, ledger.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::check::{Finding, FindingCode, Severity};
 use crate::config::{SpecVersion, VaultConfig};
+use crate::corrections::Corrections;
 use crate::id::{collect_uncovered_ulid_windows, scan_id_tokens, IdToken, Prefix, RecordId};
-use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
+use crate::ledger::{parse_ledger, LedgerEntry, LineRef, ParseErrorKind};
 use crate::packs::embedded as packs_embedded;
 use crate::packs::external as packs_external;
 use crate::packs::Pack;
@@ -27,6 +28,10 @@ pub struct SourcedEntry {
     pub file: String,
     pub line: u32,
     pub entry: LedgerEntry,
+    /// Stable identity of this parsed line (#746). Occurrence is assigned
+    /// once the whole vault has been walked, so byte-identical lines get
+    /// distinct 1-based occurrences in `(file, line)` order.
+    pub line_ref: LineRef,
 }
 
 /// Original ledger file line, including unparsable ones, for search.
@@ -36,6 +41,8 @@ pub struct LedgerLine {
     pub line: u32,
     pub text: String,
     pub id: Option<String>,
+    /// Stable identity when this line parses; `None` for a malformed line.
+    pub line_ref: Option<LineRef>,
     /// Canonical `ledger/YYYY/MM.cfd` lines are searchable. Other `*.cfd`
     /// files are read only for link tokens (notes, merges, package openers).
     pub searchable: bool,
@@ -48,6 +55,10 @@ pub struct Vault {
     pub records: BTreeMap<RecordId, Record>,
     pub entries: Vec<SourcedEntry>,
     pub ledger_lines: Vec<LedgerLine>,
+    /// The retraction graph (#746). Empty before spec 0.4.
+    pub corrections: Corrections,
+    /// Records with `retired: true` (spec 0.4). Empty before 0.4.
+    pub retired_ids: BTreeSet<RecordId>,
     pub load_findings: Vec<Finding>,
     /// Number of unreadable ledger paths (code+count only; never a path).
     /// `find` refuses when this is greater than zero.
@@ -112,6 +123,40 @@ impl Vault {
     /// records loaded.
     pub fn spec_version(&self) -> Option<SpecVersion> {
         SpecVersion::parse(&self.config.spec)
+    }
+
+    /// The correction graph (#746).
+    pub fn corrections(&self) -> &Corrections {
+        &self.corrections
+    }
+
+    /// Whether a parsed ledger entry is superseded.
+    pub fn is_voided(&self, sourced: &SourcedEntry) -> bool {
+        self.corrections.is_voided(&sourced.line_ref)
+    }
+
+    /// Whether a `(file, line)` location is a superseded parsed entry.
+    pub fn is_voided_location(&self, file: &str, line: u32) -> bool {
+        self.corrections.is_voided_location(file, line)
+    }
+
+    /// Whether a raw ledger line is superseded. Malformed lines cannot be
+    /// retracted.
+    pub fn is_voided_line(&self, line: &LedgerLine) -> bool {
+        line.line_ref
+            .is_some_and(|line_ref| self.corrections.is_voided(&line_ref))
+    }
+
+    /// Current-state effective entries. Dated arithmetic (a balance
+    /// assertion) must use `corrections().voided_on` instead, because a
+    /// retraction dated after the assertion does not apply to it.
+    pub fn effective_entries(&self) -> impl Iterator<Item = &SourcedEntry> {
+        self.entries.iter().filter(|s| !self.is_voided(s))
+    }
+
+    /// Whether a record is retired (spec 0.4). Before 0.4 the set is empty.
+    pub fn is_retired(&self, id: &RecordId) -> bool {
+        self.retired_ids.contains(id)
     }
 }
 
@@ -348,13 +393,18 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         })
         .collect();
     let mut disabled_packs = Vec::new();
-    if spec == Some(SpecVersion::V03) {
-        let (extra_sources, extra_packs) =
-            unlisted_type_sources(root, &config, &pack_registry, SpecVersion::V03);
+    let spec_03_or_newer = spec.is_some_and(|s| s >= SpecVersion::V03);
+    if spec_03_or_newer {
+        let (extra_sources, extra_packs) = unlisted_type_sources(
+            root,
+            &config,
+            &pack_registry,
+            spec.unwrap_or(SpecVersion::V02),
+        );
         sources.extend(extra_sources);
         disabled_packs = extra_packs;
     }
-    let (retired, retired_problems) = if spec == Some(SpecVersion::V03) {
+    let (retired, retired_problems) = if spec_03_or_newer {
         retired_decls(&config.retired_types)
     } else {
         (Vec::new(), Vec::new())
@@ -410,12 +460,26 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         seed_path_ulids(&names, &records, &mut path_ulids);
     }
 
+    assign_occurrences(&mut entries, &mut ledger_lines);
+    let corrections = Corrections::build(&entries, spec);
+    let retired_ids = if spec.is_some_and(|s| s >= SpecVersion::V04) {
+        records
+            .values()
+            .filter(|record| (**record).is_retired())
+            .map(|record| record.id.clone())
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+
     Ok(Vault {
         root: root.to_path_buf(),
         config,
         records,
         entries,
         ledger_lines,
+        corrections,
+        retired_ids,
         load_findings: findings,
         ledger_unread_count,
         path_ids,
@@ -1891,11 +1955,15 @@ fn ingest_ledger_text(
             continue;
         }
         let entry = by_line.remove(&line);
+        let line_ref = entry
+            .as_ref()
+            .map(|entry| crate::ledger::line_ref(entry, 1));
         ledger_lines.push(LedgerLine {
             file: file.to_owned(),
             line,
             text: raw.to_owned(),
             id: entry.as_ref().map(|e| e.id.to_string()),
+            line_ref,
             searchable,
         });
         if searchable {
@@ -1903,8 +1971,31 @@ fn ingest_ledger_text(
                 entries.push(SourcedEntry {
                     file: file.to_owned(),
                     line,
+                    line_ref: crate::ledger::line_ref(&entry, 1),
                     entry,
                 });
+            }
+        }
+    }
+}
+
+/// Assign 1-based occurrences to byte-identical parsed lines in `(file,
+/// line)` order. `entries` and `ledger_lines` are pushed in the same walk
+/// order, so one pass over entries yields the same numbering for both.
+fn assign_occurrences(entries: &mut [SourcedEntry], ledger_lines: &mut [LedgerLine]) {
+    let mut counts: HashMap<[u8; 32], u32> = HashMap::new();
+    let mut by_location: HashMap<(String, u32), LineRef> = HashMap::new();
+    for sourced in entries.iter_mut() {
+        let hash = *sourced.line_ref.hash();
+        let occurrence = counts.entry(hash).or_insert(0);
+        *occurrence += 1;
+        sourced.line_ref = LineRef::new(hash, *occurrence);
+        by_location.insert((sourced.file.clone(), sourced.line), sourced.line_ref);
+    }
+    for line in ledger_lines.iter_mut() {
+        if let Some(line_ref) = &mut line.line_ref {
+            if let Some(assigned) = by_location.get(&(line.file.clone(), line.line)) {
+                *line_ref = *assigned;
             }
         }
     }

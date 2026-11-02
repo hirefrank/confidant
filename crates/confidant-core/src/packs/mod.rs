@@ -144,7 +144,7 @@ pub const CORE_EDGE_KINDS_0_2: &[EdgeKind] = &[
 pub fn core_edge_kinds(spec: SpecVersion) -> &'static [EdgeKind] {
     match spec {
         SpecVersion::V01 => CORE_EDGE_KINDS_0_1,
-        SpecVersion::V02 | SpecVersion::V03 => CORE_EDGE_KINDS_0_2,
+        SpecVersion::V02 | SpecVersion::V03 | SpecVersion::V04 => CORE_EDGE_KINDS_0_2,
     }
 }
 

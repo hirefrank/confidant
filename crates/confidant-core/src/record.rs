@@ -177,6 +177,12 @@ impl Record {
         self.field("no-ai") == Some("true")
     }
 
+    /// Spec 0.4: a record retired by `record retire` (front-matter
+    /// `retired: true`). Before 0.4 the field is ignored by readers.
+    pub fn is_retired(&self) -> bool {
+        self.field("retired") == Some("true")
+    }
+
     /// Tri-state `no-ai` mode (`None` when the field is absent). A `notes`
     /// value here is only valid on person records — `parse_record`
     /// validates that — so callers can rely on the parse. Anything
@@ -291,7 +297,7 @@ impl FrontmatterError {
 }
 
 const SPEC_KEYS: &[&str] = &[
-    "id", "type", "name", "date", "person", "org", "deal", "entity", "session", "no-ai",
+    "id", "type", "name", "date", "person", "org", "deal", "entity", "session", "no-ai", "retired",
     // Edge (#179): `a` / `b` are person IDs, `kind` is a closed-list kind
     // name, `since` / `until` are dates. `with` is the participant list on
     // an interaction (`[p-…, p-…]`).
@@ -441,10 +447,19 @@ fn is_noai_typo(key: &str) -> bool {
     if key == "no-ai" {
         return false;
     }
-    normalize_noai(key) == "noai"
+    normalize_key(key) == "noai"
 }
 
-fn normalize_noai(key: &str) -> String {
+/// Spec 0.4: a key that normalizes to `retired` but is not exact would
+/// silently leave a record live (fail open), so it is an error.
+fn is_retired_typo(key: &str) -> bool {
+    if key == "retired" {
+        return false;
+    }
+    normalize_key(key) == "retired"
+}
+
+fn normalize_key(key: &str) -> String {
     let mut folded = String::new();
     for c in key.chars() {
         match c {
@@ -777,6 +792,30 @@ pub fn parse_record_with_schema(
             ));
         }
     }
+    // Spec 0.4 record retirement. Before 0.4 `retired` is an unknown key
+    // and is ignored like any other forward-compatible key.
+    if schema.spec >= SpecVersion::V04 {
+        if let Some(key) = fields.keys().find(|key| is_retired_typo(key)) {
+            let line = line_of(key).unwrap_or(1);
+            return Err(FrontmatterError::key_at(
+                line,
+                key,
+                "has a retired key typo",
+                "Use the exact key retired: true or retired: false",
+            ));
+        }
+        if let Some(value) = fields.get("retired") {
+            if value != "true" && value != "false" {
+                let line = line_of("retired").unwrap_or(1);
+                return Err(FrontmatterError::key_at(
+                    line,
+                    "retired",
+                    "is not a valid retired value",
+                    "Use retired: true or retired: false",
+                ));
+            }
+        }
+    }
     for key in ["date", "session", "since", "until"] {
         if let Some(v) = fields.get(key) {
             if parse_strict_date(v).is_none() {
@@ -794,16 +833,24 @@ pub fn parse_record_with_schema(
     // An extra key has no home, so it is rejected rather than silently
     // stored.
     if kind == RecordKind::Edge {
-        const ALLOWED: [&str; 8] = ["id", "type", "a", "b", "kind", "since", "until", "no-ai"];
-        let allowed: &[&str] = if schema.spec >= SpecVersion::V03 {
-            &ALLOWED
+        const ALLOWED_03: [&str; 8] = ["id", "type", "a", "b", "kind", "since", "until", "no-ai"];
+        const ALLOWED_04: [&str; 9] = [
+            "id", "type", "a", "b", "kind", "since", "until", "no-ai", "retired",
+        ];
+        let allowed: &[&str] = if schema.spec >= SpecVersion::V04 {
+            &ALLOWED_04
+        } else if schema.spec >= SpecVersion::V03 {
+            &ALLOWED_03
         } else {
-            &ALLOWED[..7]
+            &ALLOWED_03[..7]
         };
         let disallowed = fields.keys().find(|k| !allowed.contains(&k.as_str()));
         if let Some(key) = disallowed {
             let line = line_of(key).unwrap_or(1);
-            let fix = if schema.spec >= SpecVersion::V03 {
+            let fix = if schema.spec >= SpecVersion::V04 {
+                "Edge records allow only id, type, a, b, kind, since, until, no-ai, and retired; \
+                 move the context into a note on one of the edge's entities"
+            } else if schema.spec >= SpecVersion::V03 {
                 "Edge records allow only id, type, a, b, kind, since, until, and no-ai; \
                  move the context into a note on one of the edge's entities"
             } else {
@@ -1333,5 +1380,37 @@ mod tests {
         assert!(super::parse_record_with_schema(&edge("notes"), "x.md", &v03).is_err());
         let v02 = RecordSchema::core(SpecVersion::V02);
         assert!(super::parse_record_with_schema(&edge("true"), "x.md", &v02).is_err());
+    }
+
+    #[test]
+    fn retired_key_is_spec_gated_and_typed() {
+        use crate::config::SpecVersion;
+        use crate::record_type::RecordSchema;
+
+        let person = |value: &str| {
+            format!(
+                "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nname: Ada Example\nretired: {value}\n---\n"
+            )
+        };
+        let v04 = RecordSchema::core(SpecVersion::V04);
+        let v03 = RecordSchema::core(SpecVersion::V03);
+        let retired = super::parse_record_with_schema(&person("true"), "x.md", &v04).unwrap();
+        assert!(retired.is_retired());
+        let live = super::parse_record_with_schema(&person("false"), "x.md", &v04).unwrap();
+        assert!(!live.is_retired());
+        assert!(super::parse_record_with_schema(&person("maybe"), "x.md", &v04).is_err());
+        assert!(super::parse_record_with_schema(
+            "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nRetired: true\n---\n",
+            "x.md",
+            &v04
+        )
+        .is_err());
+        // 0.3 ignores the key like any other forward-compatible key.
+        assert!(super::parse_record_with_schema(&person("maybe"), "x.md", &v03).is_ok());
+
+        // The closed edge key set gains `retired` only in 0.4.
+        let edge = "---\nid: e-01M3TC5H00MPJG000000000000\ntype: edge\na: p-01M3TC5H00MPJG000000000000\nb: p-01M3TC5H00MPJG000H24000001\nkind: married\nretired: true\n---\n";
+        assert!(super::parse_record_with_schema(edge, "x.md", &v04).is_ok());
+        assert!(super::parse_record_with_schema(edge, "x.md", &v03).is_err());
     }
 }
