@@ -1290,7 +1290,11 @@ fn help_pack_compiled_is_unlabelled() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    let shipped = include_str!("../../confidant-core/pack-manifests/personal-0.2/SKILL.md");
+    let shipped = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../confidant-core/pack-manifests/personal-0.2/SKILL.md"),
+    )
+    .expect("read frozen 0.2 skill");
     assert!(!stdout.starts_with("[external pack:"), "{stdout:?}");
     assert_eq!(
         stdout,
@@ -1314,7 +1318,7 @@ fn help_pack_personal_0_3_serves_the_0_4_skill() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    let shipped = include_str!("../../confidant-core/pack-manifests/personal-0.3/SKILL.md");
+    let shipped = include_str!("../pack-skills/personal/SKILL.md");
     assert!(!stdout.starts_with("[external pack:"), "{stdout:?}");
     assert_eq!(
         stdout,
