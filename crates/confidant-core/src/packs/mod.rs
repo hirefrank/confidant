@@ -627,13 +627,13 @@ mod tests {
             .iter()
             .map(|p| p.name())
             .collect();
-        assert_eq!(names, vec!["personal@0.2"]);
+        assert_eq!(names, vec!["personal@0.2", "personal@0.3"]);
         assert!(ALL_PACKS.is_empty());
     }
 
     #[test]
     fn registry_resolve_enabled_dedups_and_reports_unknown() {
-        let registry = PackRegistry::compiled();
+        let registry = PackRegistry::compiled_for_spec(SpecVersion::V03);
         let names = vec!["nope@9.9".to_string()];
         let (found, unknown) = registry.resolve_enabled(&names);
         // The implicit built-in is always appended.
@@ -644,28 +644,47 @@ mod tests {
 
     #[test]
     fn implicit_personal_is_enabled_with_empty_packs() {
-        let registry = PackRegistry::compiled();
-        let (found, unknown) = registry.resolve_enabled(&[]);
+        let older = PackRegistry::compiled_for_spec(SpecVersion::V03);
+        let (found, unknown) = older.resolve_enabled(&[]);
         assert!(unknown.is_empty(), "{unknown:?}");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name(), "personal@0.2");
+
+        let four = PackRegistry::compiled_for_spec(SpecVersion::V04);
+        let (found, unknown) = four.resolve_enabled(&[]);
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name(), "personal@0.3");
     }
 
     #[test]
     fn personal_listings_are_noops_at_any_version() {
         for listed in ["personal@0.1", "personal@0.2", "personal@9.9"] {
-            let registry = PackRegistry::compiled();
+            let registry = PackRegistry::compiled_for_spec(SpecVersion::V03);
             let names = vec![listed.to_string()];
             let (found, unknown) = registry.resolve_enabled(&names);
             assert!(unknown.is_empty(), "{listed}: {unknown:?}");
             assert_eq!(found.len(), 1, "{listed}");
             assert_eq!(found[0].name(), "personal@0.2", "{listed}");
         }
+        for listed in [
+            "personal@0.1",
+            "personal@0.2",
+            "personal@0.3",
+            "personal@9.9",
+        ] {
+            let registry = PackRegistry::compiled_for_spec(SpecVersion::V04);
+            let names = vec![listed.to_string()];
+            let (found, unknown) = registry.resolve_enabled(&names);
+            assert!(unknown.is_empty(), "{listed}: {unknown:?}");
+            assert_eq!(found.len(), 1, "{listed}");
+            assert_eq!(found[0].name(), "personal@0.3", "{listed}");
+        }
     }
 
     #[test]
     fn registry_orphan_owners_matches_free_function() {
-        let registry = PackRegistry::compiled();
+        let registry = PackRegistry::compiled_for_spec(SpecVersion::V03);
         let personal = registry
             .all()
             .iter()

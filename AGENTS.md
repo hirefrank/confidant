@@ -38,10 +38,11 @@ Read before changing behaviour:
   [`testdata/vaults/place-0.3/`](testdata/vaults/place-0.3/): the spec 0.3
   record-type fixture, its vendored pack pin, and its `check --json` golden.
   Fake data only; keep the demo vault on 0.2.
-- [`packs/personal/0.2.md`](packs/personal/0.2.md): the frozen personal
-  relationships pack for 0.1–0.3. A 0.4 vault selects `personal@0.3`,
-  which adds places and things (ADR-21); the 0.3 pack source lands with
-  #745 PR 1.
+- [`packs/personal/0.3.md`](packs/personal/0.3.md) is the 0.4 personal
+  pack, which adds places and things (ADR-21); the frozen
+  [`packs/personal/0.2.md`](packs/personal/0.2.md) is the 0.1–0.3
+  person-only contract. `personal@0.2` is the active built-in on 0.1–0.3
+  and `personal@0.3` on 0.4.
 - [`spec/pack-manifest.md`](spec/pack-manifest.md): the pack manifest
   format, including spec-selected built-in versions (§13.7). The manifest
   (`packs/<name>/manifest.toml`) is the single

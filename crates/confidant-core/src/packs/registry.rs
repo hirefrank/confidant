@@ -10,6 +10,7 @@
 //! failures fail closed (PD12). The [`crate::packs::Pack`] trait is not
 //! changed by this module.
 
+use crate::config::SpecVersion;
 use crate::packs::embedded;
 use crate::packs::manifest::PackOrigin;
 use crate::packs::{orphan_owners, resolve_enabled, OrphanOwners, Pack};
@@ -50,11 +51,26 @@ impl PackRegistry {
         self.packs.push(pack);
     }
 
-    /// The packs always available to a vault: the compiled packs plus the
-    /// implicit built-ins (#551). The built-ins are enabled in every vault
-    /// even when `packs = []`.
+    /// Every compiled pack plus every embedded built-in version.
+    ///
+    /// This is the all-versions view used by tests and the external-pack
+    /// loader. A vault must use [`PackRegistry::compiled_for_spec`] so only
+    /// the built-in selected by its `spec` is implicit (#745).
     pub fn compiled() -> Self {
         let implicit: Vec<&'static dyn Pack> = embedded::embedded_packs()
+            .iter()
+            .map(|p| p.pack())
+            .collect();
+        let mut packs = crate::packs::ALL_PACKS.to_vec();
+        packs.extend(implicit.iter().copied());
+        Self { packs, implicit }
+    }
+
+    /// The packs available to a vault on `spec`: the compiled packs plus
+    /// only the embedded built-in versions active for that spec (#745).
+    /// `personal@0.2` is implicit on 0.1–0.3; `personal@0.3` on 0.4.
+    pub fn compiled_for_spec(spec: SpecVersion) -> Self {
+        let implicit: Vec<&'static dyn Pack> = embedded::active_for_spec(spec)
             .iter()
             .map(|p| p.pack())
             .collect();

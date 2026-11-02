@@ -1,10 +1,11 @@
 //! Built-in declarative packs compiled into the binary (#550).
 //!
-//! `personal@0.2` ships inside the binary as a small pack directory
-//! (`manifest.toml`, `SKILL.md`, `0.2.md`) and is loaded through the same
-//! manifest-v2 / declarative path external packs use — the same
+//! `personal@0.2` and `personal@0.3` ship inside the binary as small pack
+//! directories (`manifest.toml`, `SKILL.md`, `<version>.md`) and are loaded
+//! through the same declarative path external packs use — the same
 //! [`ManifestPack`] type, the same rule kinds, the same field-grammar
-//! validation. The only difference is the manifest's [`PackOrigin`]:
+//! validation. 0.2 is a v2 manifest for specs 0.1–0.3; 0.3 is a v3 manifest
+//! for spec 0.4. The only difference is the manifest's [`PackOrigin`]:
 //!
 //! - the bytes are compiled in, so the manifest is parsed with
 //!   [`parse_manifest_compiled_in`] and is trusted as core (#504 decision 3):
@@ -16,20 +17,25 @@
 //!   keyed on the origin, **never the pack name**.
 //!
 //! This module is pure data: no filesystem, no network (PD9). The in-crate
-//! bytes are the vendored copy of repo-root `packs/personal/`; a drift test
-//! pins them together, and another proves the bytes pass the pack-directory
-//! loader (allowlist and limits) and hash stably.
+//! 0.3 bytes are the vendored copy of repo-root `packs/personal/`; the 0.2
+//! bytes are frozen (older fixtures and vaults). A drift test pins 0.3 to
+//! the root, and another proves both versions pass the pack-directory loader
+//! (allowlist and limits) and hash stably.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
+use crate::config::SpecVersion;
 use crate::packs::dir::tree_hash;
 use crate::packs::manifest::{parse_manifest_compiled_in, PackManifest};
 use crate::packs::manifest_pack::{build_manifest_pack, ManifestPack};
 use crate::packs::Pack;
 
-/// `name@version` of the built-in personal pack (#550).
+/// `name@version` of the built-in personal pack for specs 0.1–0.3 (#550).
 pub const PERSONAL_0_2: &str = "personal@0.2";
+
+/// `name@version` of the built-in personal pack for spec 0.4 (#745).
+pub const PERSONAL_0_3: &str = "personal@0.3";
 
 /// Whether `listed` names a built-in pack, at any version (#551).
 ///
@@ -75,6 +81,27 @@ const PERSONAL_0_2_CONTRACT: &str = include_str!(concat!(
     "/pack-manifests/personal-0.2/0.2.md"
 ));
 
+/// The embedded personal@0.3 manifest (vendored from
+/// `packs/personal/manifest.toml`).
+const PERSONAL_0_3_MANIFEST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/pack-manifests/personal-0.3/manifest.toml"
+));
+
+/// The embedded personal@0.3 skill text (vendored from
+/// `packs/personal/SKILL.md`).
+const PERSONAL_0_3_SKILL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/pack-manifests/personal-0.3/SKILL.md"
+));
+
+/// The embedded personal@0.3 contract doc (vendored from
+/// `packs/personal/0.3.md`).
+const PERSONAL_0_3_CONTRACT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/pack-manifests/personal-0.3/0.3.md"
+));
+
 /// One pack compiled into the binary as a declarative pack directory.
 pub struct EmbeddedPack {
     /// The `name@version` a vault lists to enable it.
@@ -114,6 +141,20 @@ impl EmbeddedPack {
             .is_some_and(|(name, version)| !version.is_empty() && name == self.reserved_name())
     }
 
+    /// Whether this built-in version is active in a vault with `spec`.
+    ///
+    /// `personal@0.2` serves 0.1–0.3; `personal@0.3` serves 0.4. A future
+    /// built-in defaults to active everywhere until it gets its own rule.
+    pub fn active_in(&self, spec: SpecVersion) -> bool {
+        if self.listed == PERSONAL_0_2 {
+            spec < SpecVersion::V04
+        } else if self.listed == PERSONAL_0_3 {
+            spec >= SpecVersion::V04
+        } else {
+            true
+        }
+    }
+
     /// The registered pack.
     pub fn pack(&self) -> &'static dyn Pack {
         self.pack
@@ -139,13 +180,29 @@ impl EmbeddedPack {
 pub fn embedded_packs() -> &'static [EmbeddedPack] {
     static PACKS: OnceLock<Vec<EmbeddedPack>> = OnceLock::new();
     PACKS.get_or_init(|| {
-        vec![build(
-            PERSONAL_0_2,
-            PERSONAL_0_2_MANIFEST,
-            PERSONAL_0_2_SKILL,
-            PERSONAL_0_2_CONTRACT,
-        )]
+        vec![
+            build(
+                PERSONAL_0_2,
+                PERSONAL_0_2_MANIFEST,
+                PERSONAL_0_2_SKILL,
+                PERSONAL_0_2_CONTRACT,
+            ),
+            build(
+                PERSONAL_0_3,
+                PERSONAL_0_3_MANIFEST,
+                PERSONAL_0_3_SKILL,
+                PERSONAL_0_3_CONTRACT,
+            ),
+        ]
     })
+}
+
+/// The built-in versions active in a vault with `spec`, in registry order.
+pub fn active_for_spec(spec: SpecVersion) -> Vec<&'static EmbeddedPack> {
+    embedded_packs()
+        .iter()
+        .filter(|pack| pack.active_in(spec))
+        .collect()
 }
 
 /// The built-in pack with this `name@version`, if any.
@@ -199,62 +256,65 @@ mod tests {
         dir.is_dir().then_some(dir)
     }
 
-    /// Drift test (#550): the embedded personal@0.2 bytes must match the
-    /// repo-root human contract (`packs/personal/`).
+    /// Drift test (#550, #745): the embedded personal@0.3 bytes must match
+    /// the repo-root human contract (`packs/personal/`). 0.2 is frozen.
     #[test]
-    fn embedded_personal_0_2_matches_repo_root() {
+    fn embedded_personal_0_3_matches_repo_root() {
         let Some(root) = repo_root_pack("personal") else {
             return; // published crate tarball: no repo root to compare against
         };
-        let declared = find(PERSONAL_0_2).expect("personal@0.2 is embedded");
+        let declared = find(PERSONAL_0_3).expect("personal@0.3 is embedded");
         for (rel, bytes) in declared.files() {
             let actual = std::fs::read(root.join(rel))
                 .unwrap_or_else(|e| panic!("read packs/personal/{rel}: {e}"));
             assert_eq!(
                 &actual, bytes,
-                "embedded pack-manifests/personal-0.2/{rel} has drifted from \
+                "embedded pack-manifests/personal-0.3/{rel} has drifted from \
                  packs/personal/{rel}; copy the repo-root file over"
             );
         }
     }
 
-    /// Acceptance (#550): the embedded pack passes the pack-directory loader
-    /// — allowlist, PD6 limits, manifest parse — and hashes stably. The bytes
-    /// are materialized to a temp dir and read back with the compiled-in
+    /// Acceptance (#550): both embedded versions pass the pack-directory
+    /// loader — allowlist, PD6 limits, manifest parse — and hash stably. The
+    /// bytes are materialized to a temp dir and read back with the compiled-in
     /// origin, the same reader `pack verify` uses for a vendored pack.
     #[test]
-    fn embedded_pack_passes_pack_dir_loader_and_hashes_stably() {
-        let declared = find(PERSONAL_0_2).expect("personal@0.2 is embedded");
-        let dir = tempfile::tempdir().expect("tempdir");
-        for (rel, bytes) in declared.files() {
-            let path = dir.path().join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, bytes).unwrap();
+    fn embedded_packs_pass_pack_dir_loader_and_hash_stably() {
+        for declared in embedded_packs() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for (rel, bytes) in declared.files() {
+                let path = dir.path().join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+            let read = read_pack_dir_with_origin(dir.path(), PackOrigin::CompiledIn)
+                .expect("the embedded bytes must pass the pack-dir loader");
+            assert_eq!(
+                read.hash,
+                declared.hash(),
+                "{}: the embedded tree hash must equal the loader's",
+                declared.listed()
+            );
+            // Stable across reads (no mtime/order in the hash).
+            let again = read_pack_dir_with_origin(dir.path(), PackOrigin::CompiledIn).unwrap();
+            assert_eq!(read.hash, again.hash);
         }
-        let read = read_pack_dir_with_origin(dir.path(), PackOrigin::CompiledIn)
-            .expect("the embedded bytes must pass the pack-dir loader");
-        assert_eq!(
-            read.hash,
-            declared.hash(),
-            "the embedded tree hash must equal the loader's"
-        );
-        // Stable across reads (no mtime/order in the hash).
-        let again = read_pack_dir_with_origin(dir.path(), PackOrigin::CompiledIn).unwrap();
-        assert_eq!(read.hash, again.hash);
     }
 
     /// The same bytes must NOT load through the external path: the stable-code
     /// allowance is keyed on compiled-in origin, not the pack name (#504 R8).
     #[test]
     fn embedded_bytes_fail_the_external_reader() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let declared = find(PERSONAL_0_2).expect("personal@0.2 is embedded");
-        for (rel, bytes) in declared.files() {
-            std::fs::write(dir.path().join(rel), bytes).unwrap();
+        for declared in embedded_packs() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for (rel, bytes) in declared.files() {
+                std::fs::write(dir.path().join(rel), bytes).unwrap();
+            }
+            let err = read_pack_dir(dir.path())
+                .expect_err("the embedded manifest must not load as an external pack");
+            assert_eq!(err.code(), "E_PACK_INVALID", "{}", err.message());
         }
-        let err = read_pack_dir(dir.path())
-            .expect_err("the embedded manifest must not load as an external pack");
-        assert_eq!(err.code(), "E_PACK_INVALID", "{}", err.message());
     }
 
     /// The stable-code allowance is origin-based: the embedded manifest parses
@@ -284,42 +344,64 @@ mod tests {
     /// drift from the manifest the binary loads.
     #[test]
     fn embedded_skill_documents_codes_keys_and_fields() {
-        let declared = find(PERSONAL_0_2).expect("personal@0.2 is embedded");
-        let manifest = declared.manifest();
-        let skill = PERSONAL_0_2_SKILL;
-        for code in &manifest.finding_codes {
+        for declared in embedded_packs() {
+            let manifest = declared.manifest();
+            let skill = declared.pack().skill_text().expect("pack skill");
+            for code in &manifest.finding_codes {
+                assert!(
+                    skill.contains(code.as_str()),
+                    "{}: SKILL does not document {code}",
+                    declared.listed()
+                );
+            }
+            for check in manifest
+                .checks
+                .severity
+                .iter()
+                .map(|s| &s.key)
+                .chain(manifest.checks.int.iter().map(|i| &i.key))
+            {
+                assert!(
+                    skill.contains(&format!("`{check}`")),
+                    "{}: SKILL does not document [checks] key {check}",
+                    declared.listed()
+                );
+            }
+            for field in &manifest.fields {
+                assert!(
+                    skill.contains(&field.name),
+                    "{}: SKILL does not document field {}",
+                    declared.listed(),
+                    field.name
+                );
+            }
             assert!(
-                skill.contains(code.as_str()),
-                "SKILL does not document {code}"
+                skill.contains("never"),
+                "{}: SKILL must document cadence `never`",
+                declared.listed()
+            );
+            assert!(
+                skill.contains("snooze_until"),
+                "{}: SKILL must document snooze_until",
+                declared.listed()
             );
         }
-        for check in manifest
-            .checks
-            .severity
+    }
+
+    #[test]
+    fn personal_version_is_selected_by_spec() {
+        let older: Vec<&str> = active_for_spec(SpecVersion::V03)
             .iter()
-            .map(|s| &s.key)
-            .chain(manifest.checks.int.iter().map(|i| &i.key))
-        {
-            assert!(
-                skill.contains(&format!("`{check}`")),
-                "SKILL does not document [checks] key {check}"
-            );
-        }
-        for field in &manifest.fields {
-            assert!(
-                skill.contains(&field.name),
-                "SKILL does not document field {}",
-                field.name
-            );
-        }
-        assert!(
-            skill.contains("never"),
-            "SKILL must document cadence `never`"
-        );
-        assert!(
-            skill.contains("snooze_until"),
-            "SKILL must document snooze_until"
-        );
+            .map(|p| p.listed())
+            .collect();
+        assert_eq!(older, vec![PERSONAL_0_2]);
+        let four: Vec<&str> = active_for_spec(SpecVersion::V04)
+            .iter()
+            .map(|p| p.listed())
+            .collect();
+        assert_eq!(four, vec![PERSONAL_0_3]);
+        assert_eq!(find(PERSONAL_0_2).unwrap().manifest().pack.version, "0.2");
+        assert_eq!(find(PERSONAL_0_3).unwrap().manifest().pack.version, "0.3");
     }
 
     /// #551 nit: a malformed `personal@` (empty version) is not a built-in
@@ -328,6 +410,7 @@ mod tests {
     fn builtin_listings_require_a_nonempty_version() {
         assert!(is_builtin_listing("personal@0.1"));
         assert!(is_builtin_listing("personal@0.2"));
+        assert!(is_builtin_listing("personal@0.3"));
         assert!(is_builtin_listing("personal@9.9"));
         assert!(!is_builtin_listing("personal@"));
         assert!(!is_builtin_listing("personal"));
@@ -336,5 +419,39 @@ mod tests {
         assert!(declared.matches_listing("personal@0.1"));
         assert!(!declared.matches_listing("personal@"));
         assert!(!declared.matches_listing("personal"));
+        let declared = find(PERSONAL_0_3).expect("personal@0.3 is embedded");
+        assert!(declared.matches_listing("personal@0.2"));
+        assert!(!declared.matches_listing("personal@"));
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn personal_versions_keep_the_same_checks_and_codes() {
+        let old = find(PERSONAL_0_2).unwrap().manifest();
+        let new = find(PERSONAL_0_3).unwrap().manifest();
+        let severity = |m: &PackManifest| {
+            m.checks
+                .severity
+                .iter()
+                .map(|s| (s.key.clone(), s.default.clone()))
+                .collect::<Vec<_>>()
+        };
+        let ints = |m: &PackManifest| {
+            m.checks
+                .int
+                .iter()
+                .map(|i| (i.key.clone(), i.default))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(severity(old), severity(new));
+        assert_eq!(ints(old), ints(new));
+        assert_eq!(old.finding_codes, new.finding_codes);
+        assert_eq!(new.pack.version, "0.3");
+        assert_eq!(new.record_types.decls.len(), 2);
+        assert!(new.edge_kinds.iter().any(|k| k.name == "visited"));
     }
 }

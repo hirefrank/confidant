@@ -648,3 +648,121 @@ fn disabled_vendored_pack_type_warns_orphan_and_fails_closed_for_agents() {
         "operator path must still see the disabled record"
     );
 }
+
+// #745: the 0.4 built-in personal@0.3 declares place/thing and their edges.
+const PERSONAL_PLACE: &str = "pl-01M3TC5H00MPJG000000000021";
+const PERSONAL_THING: &str = "th-01M3TC5H00MPJG000000000022";
+const PERSONAL_EDGE: &str = "e-01M3TC5H00MPJG000000000023";
+
+fn personal_04_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.4\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000001\"\n",
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Dana Example\n---\n\nFake person.\n"),
+    );
+    write(
+        dir.path(),
+        &format!("places/{PERSONAL_PLACE}/place.md"),
+        &format!(
+            "---\nid: {PERSONAL_PLACE}\ntype: place\nname: Example Studio\nkind: work\naddress: 1 Example Way\n---\n\nFake place.\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("things/{PERSONAL_THING}/thing.md"),
+        &format!(
+            "---\nid: {PERSONAL_THING}\ntype: thing\nname: Example Bicycle\nkind: object\n---\n\nFake thing.\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("edges/{PERSONAL_EDGE}/edge.md"),
+        &format!(
+            "---\nid: {PERSONAL_EDGE}\ntype: edge\na: {ADA}\nb: {PERSONAL_PLACE}\nkind: visited\nsince: 2026-10-01\n---\n"
+        ),
+    );
+    dir
+}
+
+#[test]
+fn personal_0_3_is_the_0_4_default_with_places_and_things() {
+    let dir = personal_04_vault();
+    let vault = load_vault(dir.path()).unwrap();
+    let names: Vec<&str> = vault
+        .pack_registry()
+        .all()
+        .iter()
+        .map(|pack| pack.name())
+        .collect();
+    assert!(names.contains(&"personal@0.3"), "{names:?}");
+    assert!(!names.contains(&"personal@0.2"), "{names:?}");
+
+    let report = report(dir.path());
+    assert!(report.ok, "{:?}", report.findings);
+    assert!(
+        report.findings.is_empty(),
+        "unexpected findings: {:?}",
+        report.findings
+    );
+
+    let place = confidant_core::RecordId::parse(PERSONAL_PLACE).unwrap();
+    assert!(vault.type_registry().is_entity(place.prefix()));
+    let bundle = build_context(&vault, &place, true, &PackScope::All, false).unwrap();
+    assert_eq!(bundle.entity.kind, "place");
+    assert_eq!(bundle.entity.name.as_deref(), Some("Example Studio"));
+
+    let person = confidant_core::RecordId::parse(ADA).unwrap();
+    let person_bundle = build_context(&vault, &person, true, &PackScope::All, false).unwrap();
+    assert!(
+        person_bundle.packs.contains_key("personal@0.3"),
+        "{:?}",
+        person_bundle.packs
+    );
+    assert!(
+        !person_bundle.packs.contains_key("personal@0.2"),
+        "{:?}",
+        person_bundle.packs
+    );
+
+    let roster = build_roster(&vault, None, &PackScope::All, false);
+    assert!(
+        roster.kinds.contains(&"place".to_owned()),
+        "{:?}",
+        roster.kinds
+    );
+    assert!(
+        roster.kinds.contains(&"thing".to_owned()),
+        "{:?}",
+        roster.kinds
+    );
+}
+
+#[test]
+fn personal_0_2_stays_the_default_for_spec_0_3() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.3\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000002\"\n",
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Dana Example\n---\n\nFake person.\n"),
+    );
+    let vault = load_vault(dir.path()).unwrap();
+    let names: Vec<&str> = vault
+        .pack_registry()
+        .all()
+        .iter()
+        .map(|pack| pack.name())
+        .collect();
+    assert!(names.contains(&"personal@0.2"), "{names:?}");
+    assert!(!names.contains(&"personal@0.3"), "{names:?}");
+}
