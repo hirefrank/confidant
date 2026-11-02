@@ -45,6 +45,13 @@ after that explicit key press. Turning it off drops the operator roster and
 context before reloading, so a failed reload cannot leave hidden content on
 screen without the banner.
 
+Spec 0.4 adds a `[retired]` badge to the operator roster. A retired record
+stays visible there (with its `no_ai` badge too, when it has one) so the
+operator can find and unretire it, but it is absent from the agent roster
+and `context` returns no bundle for it. The TUI only renders what the CLI's
+effective view returns: superseded ledger lines are already gone from
+`context` touchpoints and pack state, and the TUI never re-adds one.
+
 ## Editing
 
 Editing is always operator-only, independent of operator mode: from the
@@ -53,6 +60,15 @@ edits it. `e` uses `record show --for-edit` / `note show --for-edit`, which
 read `no-ai` records even while the roster view is un-badged (operator
 mode off); the badges and banner describe the roster/context view, not the
 edit path.
+
+Corrections and retirement are **not** TUI keybindings. The TUI remains
+read-only for the correction model: use `confidant retract`, `confidant
+correct`, or `confidant record retire|unretire` from the CLI. This is
+deliberate — a retraction is an attributed, check-gated commit and should
+not be a stray keypress in a browsing UI. `record show --for-edit` still
+works on a retired record and prints the retired hint on stderr; the TUI's
+edit path receives the same JSON with `retired: true` and does not change
+its behavior.
 
 The text is staged in 0600 scratch under `<vault>/.confidant/conflicts/<id>/`,
 opens in `$EDITOR`/`$VISUAL` (run as a single program, so `EDITOR="code -w"`

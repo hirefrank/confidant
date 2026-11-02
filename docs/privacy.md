@@ -15,7 +15,8 @@ short version, see the README's [Privacy](../README.md#privacy) section.
 - it has no duplicate or path-id mismatch,
 - every ID in its front matter is cleared,
 - its whole merge group is cleared,
-- any `people/<id>/` parent is cleared.
+- any `people/<id>/` parent is cleared,
+- it is not `retired: true` (spec 0.4).
 
 A path mismatch on a note, interaction, or deal unclears only that record; a
 mismatch or duplicate on a person's profile unclears that whole person.
@@ -88,11 +89,37 @@ no inheritance in either direction. An org bundle also selects notes and
 interactions attached by `org:`, under the same cleared-set and pack-scope
 rules as a person bundle.
 
+## Corrections and retirement (#746)
+
+A `retract` line supersedes a prior ledger line without editing or deleting
+it. A superseded line is not searchable on the agent path and is absent from
+`allowlist`, so it never enters the QMD corpus; `find --for-operator` still
+shows it. A retraction line is searchable only when its own ID tokens **and
+its target line** are allowed. Without that second gate the ref would be a
+hash oracle: an agent could test a guess about a hidden line. A retracted
+line whose target is hidden therefore stays hidden with it.
+
+A `retired: true` record is not in the cleared set. It and records/lines that
+name it are omitted from agent `find`, `context`, `resolve`, `alias resolve`,
+and `record list`; `context` returns no bundle for a retired target. This is
+the same fail-closed posture as `no-ai: true`, not a separate privacy mode:
+retiring a record also removes its notes, interactions, deals, and edges from
+agent reads. The operator path still sees them (`--for-operator`,
+`record show --for-edit`), and `check` still validates the file.
+
+The line refs (`line:<64 hex>`) are opaque values derived from the line's
+canonical bytes. They are never echoed for an uncleared target; the short
+form may appear in operator-facing `check` messages. A correction or
+retirement changes the cleared set, so rebuild the local QMD corpus
+(`qmd-index.py`) before relying on ranked search.
+
 ## Ledger lines
 
-Ledger lines are searchable only when every ID on the line is cleared. A note,
-interaction, or deal is cleared only when every ledger line that names it is
-allowed; this does not apply to persons.
+Ledger lines are searchable only when every ID on the line is cleared. A
+superseded line is not searchable, and a superseded line does not gate a note,
+interaction, or deal it named. A note, interaction, or deal is cleared only
+when every effective ledger line that names it is allowed; this does not
+apply to persons.
 
 ## TUI proposal review
 

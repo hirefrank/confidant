@@ -221,16 +221,17 @@ Installing a pack:
 - commits those files in one commit.
 
 It does **not** touch records. `check` starts applying the pack's rules, its
-verbs become valid, and on a spec 0.3 vault its declared record types become
-writable and readable (for example a `place` or `thing` collection). A pack
+verbs become valid, and on a spec 0.3 or 0.4 vault its declared record types
+become writable and readable (for example a `place` or `thing` collection). A pack
 that declares record types must list `"0.3"` in `requires_spec`; a 0.2 vault
 rejects it with `E_PACK_VERSION`. Existing personal records stay where they
 are; there is no migration.
 
-Spec 0.3 is current. The built-in `personal@0.2` pack remains **person-only**
-in 0.3 and declares no record types; places/things and other domain entities
-come from external packs. See `spec/0.3.md` and `spec/pack-manifest.md` for
-the type declaration and two-letter prefix rules.
+Spec 0.4 is current. The built-in `personal@0.2` pack remains **person-only**
+in 0.3 and 0.4 and declares no record types; places/things and other domain
+entities come from external packs. See `spec/0.4.md`,
+`spec/0.3.md`, and `spec/pack-manifest.md` for the type declaration and
+two-letter prefix rules.
 
 Do not try to seed a pack at `init` time with `--packs <name>@<version>`.
 `init` only seeds packs built into the binary (today the implicit

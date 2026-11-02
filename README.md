@@ -8,13 +8,14 @@ your life — the friend you meant to call, a sibling's birthday, the mentor
 you last saw in March — in one private place your AI agents can read and
 update. Each person is a Markdown file with notes, dates, and a log of every
 touch; `confidant check` turns that into who is overdue and which dates are
-coming up. Spec 0.3 keeps people first and lets a pack declare other entity
-types, such as places and things, in the same vault.
+coming up. Spec 0.4 keeps people first, lets a pack declare other entity
+types such as places and things, and adds corrections and record retirement.
 
 Records are plain-text files in a git repo (the **vault**); the Rust CLI
 `confidant` reads, checks, and writes them. There is no server, and a ledger
 of dated facts (`ledger/2026/10.cfd`) keeps the record append-only and
-auditable.
+auditable. Mistakes are corrected by appending a visible compensating line,
+never by rewriting history.
 
 Start with [Install](#install) or the [demo
 quickstart](#first-five-minutes-the-people-in-your-life).
@@ -329,7 +330,7 @@ declare their own endpoint types with `from` / `to` in the pack manifest.
 
 ### Places, things, and pack-declared types
 
-Spec 0.3 is current. A v3 pack manifest can declare a record type with
+Spec 0.4 is current. A v3 pack manifest can declare a record type with
 `[[record_types]]`: its name, two-letter ID prefix, collection directory,
 main file, entity/person-like flags, `no_ai` policy, roster visibility, and
 required/optional fields. A `place` and a `thing` are the same shape; the
@@ -408,7 +409,7 @@ ID-only.
 
 | Area | Commands |
 |---|---|
-| Write | `record add`, `record edit`, `record resolve`, `note add`, `note edit`, `log touch`, `alias add`, `import` |
+| Write | `record add`, `record edit`, `record resolve`, `record retire`, `record unretire`, `note add`, `note edit`, `log touch`, `retract`, `correct`, `import` |
 | Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `record show`, `note show`, `allowlist`, `schema`, `help` |
 | Check | `check` (read-only; stable codes in [`spec/findings.md`](spec/findings.md)) |
 | Packs | `pack init`, `pack add`, `pack list`, `pack verify`, `pack update`, `pack remove` |
@@ -416,6 +417,15 @@ ID-only.
 | Search | `find`, plus the optional `qmd-search` skill |
 | Sync | `sync` (read-only report; `--pull` / `--push` explicit) |
 | Agents | `mcp`, `agents`, `which`, `routing`, `tui` |
+
+**Corrections.** `confidant retract <id> --line <ref> --reason <token>`
+appends a dated `retract` line that supersedes a prior ledger line; the
+original stays in the ledger and git history. `confidant correct` appends a
+replacement plus the retraction in one commit. Both are operator commands
+(never MCP tools) and require spec 0.4. `confidant record retire <id>` marks
+a record `retired: true`: it stays on disk but leaves agent reads, while
+`record list --for-operator` still shows it. Use `find --json` to copy a
+ledger hit's `ref`.
 
 **Contact values** (emails, phones, handles, former names) are front-matter
 fields on the person, declared by the personal pack. `alias resolve <kind>
@@ -575,7 +585,7 @@ Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 
 ## Where to go deeper
 
-- [`spec/0.3.md`](spec/0.3.md) — current vault format; [`spec/0.2.md`](spec/0.2.md) and [`spec/0.1.md`](spec/0.1.md) — frozen; [`spec/findings.md`](spec/findings.md) — finding codes; [`spec/pack-manifest.md`](spec/pack-manifest.md) — pack manifests.
+- [`spec/0.4.md`](spec/0.4.md) — current vault format; [`spec/0.3.md`](spec/0.3.md), [`spec/0.2.md`](spec/0.2.md), and [`spec/0.1.md`](spec/0.1.md) — frozen; [`spec/findings.md`](spec/findings.md) — finding codes; [`spec/pack-manifest.md`](spec/pack-manifest.md) — pack manifests.
 - [`docs/architecture.md`](docs/architecture.md) — privacy, threat model, ADRs, milestones.
 - [`docs/privacy.md`](docs/privacy.md) — allowlist, `no-ai`, pack scoping, edges; [`docs/threat-model-agents.md`](docs/threat-model-agents.md) — agent limits and gaps.
 - [`docs/sync.md`](docs/sync.md) — the explicit git boundary and timer; [`docs/tui.md`](docs/tui.md) — TUI detail; [`docs/agent-setup.md`](docs/agent-setup.md) — headless hosts and updates.
