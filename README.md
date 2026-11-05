@@ -593,7 +593,8 @@ and accepted, and Confidant makes no claim about what the provider stores.
 link health. The release check is one unauthenticated `GET` to
 `api.github.com/repos/hirefrank/confidant/releases/latest`; no vault data is
 included, and only the `tag_name` is read — the response body is discarded.
-Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
+`confidant status` makes the same release check as part of its readiness
+rollup. Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 `staleness check disabled`.
 
 ## Where to go deeper
