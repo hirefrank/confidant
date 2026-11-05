@@ -2,9 +2,10 @@
 //!
 //! `--create` writes the vault's on-disk shape (collection directories and
 //! the ledger), a `confidant.toml` without a `[crypto]` table, a `main`
-//! branch, and a repo-local fallback git identity when the machine has no
-//! identity of its own. Plain `init` applies the idempotent shape step to an
-//! existing vault. All data and identities are fake.
+//! branch, and a neutral repo-local git identity (kept out of the operator's
+//! global identity). Plain `init` applies the idempotent shape step to an
+//! existing vault and keeps a per-vault identity already set. All data and
+//! identities are fake.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -210,4 +211,31 @@ fn init_create_dry_run_writes_nothing() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["dry_run"], true, "{v}");
     assert!(!vault.exists(), "a dry run must not create the vault");
+}
+
+#[test]
+fn init_keeps_a_per_vault_identity_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let vault = tmp.path().join("vault");
+
+    run_init(&vault, &home, true);
+    // The documented override: edit the vault's own git config.
+    git(&vault, &["config", "--local", "user.name", "Robin (vault)"]);
+    git(
+        &vault,
+        &["config", "--local", "user.email", "robin@example.invalid"],
+    );
+
+    let v = run_init(&vault, &home, false);
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(
+        git(&vault, &["config", "--local", "--get", "user.name"]).trim(),
+        "Robin (vault)"
+    );
+    assert_eq!(
+        git(&vault, &["config", "--local", "--get", "user.email"]).trim(),
+        "robin@example.invalid"
+    );
 }
