@@ -320,3 +320,7 @@ reports `staleness check disabled`.
 `CONFIDANT_OFFLINE=1` opt-out) to decide whether the local binary is behind
 the latest release. When behind, `update` re-links nothing and tells you to
 upgrade the binary first.
+
+`confidant status` makes the same request (same endpoint, same
+`CONFIDANT_OFFLINE=1` opt-out) as part of its readiness rollup, which reuses
+the doctor staleness check.
