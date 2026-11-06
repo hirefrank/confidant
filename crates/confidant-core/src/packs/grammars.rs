@@ -31,6 +31,7 @@ pub const GRAMMAR_LABELED_LIST: &str = "labeled-list";
 pub const GRAMMAR_DATE: &str = "date";
 pub const GRAMMAR_ALIAS_LIST: &str = "alias-list";
 pub const GRAMMAR_ROLE_HISTORY: &str = "role-history";
+pub const GRAMMAR_PROVENANCE_LIST: &str = "provenance-list";
 
 /// The alias kinds an `alias-list` entry may name.
 pub const ALIAS_KINDS: &[&str] = &["email", "phone", "handle", "name"];
@@ -49,6 +50,7 @@ pub const KNOWN_GRAMMARS: &[&str] = &[
     GRAMMAR_DATE,
     GRAMMAR_ALIAS_LIST,
     GRAMMAR_ROLE_HISTORY,
+    GRAMMAR_PROVENANCE_LIST,
 ];
 
 /// A front-matter field value parsed by one of the [`KNOWN_GRAMMARS`].
@@ -70,6 +72,8 @@ pub enum FieldValue {
     /// `role-history`: comma-separated `PERIOD|ROLE|COMPANY[|SOURCE]`
     /// entries.
     RoleHistory(Vec<RoleHistoryEntry>),
+    /// `provenance-list`: comma-separated `KEY|SOURCE|DATE` entries.
+    ProvenanceList(Vec<ProvenanceEntry>),
     /// `date`: one strict `YYYY-MM-DD`.
     Date(NaiveDate),
     /// `non-empty-string`: whitespace-trimmed text.
@@ -88,6 +92,20 @@ pub struct AliasEntry {
     pub status: String,
     /// Optional provenance (`linkedin-export`, `email-signature`, …).
     pub source: Option<String>,
+}
+
+/// One fact's provenance (`provenance-list`): which profile fact, where it
+/// came from, and the month it was recorded. A repeated key with a newer
+/// date supersedes the older entry for context reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvenanceEntry {
+    /// The profile fact this entry describes (`title`, `company`, `profile`,
+    /// `relationship_context`, …).
+    pub key: String,
+    /// Where the fact came from (`linkedin-export`, `operator`, …).
+    pub source: String,
+    /// `YYYY-MM`, month precision.
+    pub date: String,
 }
 
 /// One role/company chapter (`role-history`): what the person did, where,
@@ -134,6 +152,7 @@ pub fn parse_field_grammar(
         GRAMMAR_DATE => parse_date(raw).map(FieldValue::Date),
         GRAMMAR_ALIAS_LIST => parse_alias_list(raw).map(FieldValue::AliasList),
         GRAMMAR_ROLE_HISTORY => parse_role_history(raw).map(FieldValue::RoleHistory),
+        GRAMMAR_PROVENANCE_LIST => parse_provenance_list(raw).map(FieldValue::ProvenanceList),
         GRAMMAR_NON_EMPTY_STRING => {
             let trimmed = raw.trim();
             (!trimmed.is_empty()).then(|| FieldValue::Text(trimmed.to_owned()))
@@ -411,6 +430,65 @@ pub fn parse_role_history(raw: &str) -> Option<Vec<RoleHistoryEntry>> {
     Some(out)
 }
 
+/// Parse `profile_provenance:` (`[KEY|SOURCE|YYYY-MM, ...]`).
+///
+/// `KEY` matches `[a-z][a-z0-9_]{0,40}` and names the profile fact the entry
+/// describes (`profile` for the body, a declared field name otherwise).
+/// `SOURCE` is non-empty free text without `|`. The date is `YYYY-MM`; a
+/// fact is aged at month precision. A repeated key is allowed and supersedes
+/// a newer entry; two entries for the same key and date are rejected so the
+/// "newest wins" rule is never a tie.
+pub fn parse_provenance_list(raw: &str) -> Option<Vec<ProvenanceEntry>> {
+    let inner = strip_optional_brackets(raw)?;
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out: Vec<ProvenanceEntry> = Vec::new();
+    for item in inner.split(',') {
+        let parts = split_pipe_fields(item)?;
+        if parts.len() != 3 {
+            return None;
+        }
+        let (key, source, date) = (parts[0].clone(), parts[1].clone(), parts[2].clone());
+        let mut chars = key.chars();
+        let first = chars.next()?;
+        if !first.is_ascii_lowercase()
+            || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            || key.len() > 41
+            || !is_valid_provenance_month(&date)
+        {
+            return None;
+        }
+        if out.iter().any(|e| e.key == key && e.date == date) {
+            return None;
+        }
+        out.push(ProvenanceEntry { key, source, date });
+    }
+    Some(out)
+}
+
+/// Whether `date` is a month-precision provenance date (`YYYY-MM`, with a
+/// four-digit year in `1000..=2999` and a real month).
+fn is_valid_provenance_month(date: &str) -> bool {
+    let Some((year, month)) = date.split_once('-') else {
+        return false;
+    };
+    if year.len() != 4
+        || !year.bytes().all(|b| b.is_ascii_digit())
+        || month.len() != 2
+        || !month.bytes().all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let Ok(year) = year.parse::<u32>() else {
+        return false;
+    };
+    let Ok(month) = month.parse::<u32>() else {
+        return false;
+    };
+    (1000..=2999).contains(&year) && (1..=12).contains(&month)
+}
+
 /// Whether `period` is `YYYY-YYYY` or `YYYY-` (current), with a sane year
 /// range and a start not after the end.
 fn is_valid_role_period(period: &str) -> bool {
@@ -666,8 +744,8 @@ mod tests {
         // Adding a grammar is a spec change (spec §6); pin the list so it
         // fails loudly here too, not just in the manifest loader. The 0.2
         // spec edit (#509) appended `list`, `labeled-list` and `date`; the
-        // 0.4 personal-fields edit (#739, #740) appended the two structured
-        // list grammars.
+        // 0.4 personal-fields edits (#739, #740) appended the two structured
+        // list grammars; #738 appended the provenance list.
         assert_eq!(
             KNOWN_GRAMMARS,
             &[
@@ -680,6 +758,7 @@ mod tests {
                 "date",
                 "alias-list",
                 "role-history",
+                "provenance-list",
             ]
         );
     }
@@ -700,6 +779,7 @@ mod tests {
                 GRAMMAR_DATE,
                 GRAMMAR_ALIAS_LIST,
                 GRAMMAR_ROLE_HISTORY,
+                GRAMMAR_PROVENANCE_LIST,
             ]
         );
     }
@@ -761,6 +841,51 @@ mod tests {
         assert_eq!(list[1].period, "2021-");
         assert_eq!(list[1].source, None);
         assert!(parse_role_history("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn provenance_list_parses_key_source_and_month() {
+        let list = parse_provenance_list(
+            "[title|linkedin-export|2026-03, company|linkedin-export|2026-03, profile|operator|2026-10]",
+        )
+        .unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].key, "title");
+        assert_eq!(list[0].source, "linkedin-export");
+        assert_eq!(list[0].date, "2026-03");
+        assert!(parse_provenance_list("[]").unwrap().is_empty());
+        // A repeated key with a newer date is allowed: the newer entry wins.
+        let superseding =
+            parse_provenance_list("[title|linkedin-export|2025-01, title|operator|2026-03]")
+                .unwrap();
+        assert_eq!(superseding.len(), 2);
+    }
+
+    #[test]
+    fn provenance_list_rejects_malformed_entries() {
+        for bad in [
+            // Wrong field count.
+            "title|linkedin-export",
+            "title|linkedin-export|2026-03|extra",
+            // Bad key shape.
+            "Title|linkedin-export|2026-03",
+            "1title|linkedin-export|2026-03",
+            "pro-file|linkedin-export|2026-03",
+            "|linkedin-export|2026-03",
+            // Empty source.
+            "title||2026-03",
+            // Bad date.
+            "title|linkedin-export|2026",
+            "title|linkedin-export|2026-13",
+            "title|linkedin-export|2026-00",
+            "title|linkedin-export|26-03",
+            // Same key and date is a tie, even with a different source.
+            "[title|linkedin-export|2026-03, title|operator|2026-03]",
+            // Exact duplicate.
+            "[title|linkedin-export|2026-03, title|linkedin-export|2026-03]",
+        ] {
+            assert!(parse_provenance_list(bad).is_none(), "{bad:?}");
+        }
     }
 
     #[test]

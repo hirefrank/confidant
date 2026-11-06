@@ -228,6 +228,7 @@ registry; the list itself is frozen by this spec):
 | `date` | one strict `YYYY-MM-DD` (a one-off date; `--MM-DD` is not accepted) | `parse_date` |
 | `alias-list` | comma-separated `KIND\|VALUE\|STATUS[\|SOURCE]` entries, optionally wrapped in `[...]`; `KIND` is `email`, `phone`, `handle`, or `name`; `STATUS` is `current` or `historical`; `SOURCE` is optional; a component may contain `:` but not `\|`; a repeated `(KIND, VALUE)` is rejected | `parse_alias_list` |
 | `role-history` | comma-separated `PERIOD\|ROLE\|COMPANY[\|SOURCE]` entries, optionally wrapped in `[...]`; `PERIOD` is `YYYY-YYYY` or `YYYY-` (still current), a four-digit year in `1000..=2999`, start not after end; malformed year, missing field, or duplicate rejected | `parse_role_history` |
+| `provenance-list` | comma-separated `KEY\|SOURCE\|DATE` entries, optionally wrapped in `[...]`; `KEY` matches `[a-z][a-z0-9_]{0,40}`, `SOURCE` is non-empty text without `\|`, `DATE` is `YYYY-MM` with a four-digit year in `1000..=2999` and month `1..=12`; a repeated key is allowed (newer date wins), two entries for the same key and date rejected | `parse_provenance_list` |
 
 A field naming an unknown grammar is a load error. Adding a grammar is
 a spec change to this list plus a Rust parser — never a manifest-only

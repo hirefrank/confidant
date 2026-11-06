@@ -846,9 +846,31 @@ fn personal_04_person_relationship_fields_and_privacy() {
         "{personal}"
     );
 
+    assert_eq!(
+        personal["human_note"], "The kitchen-table pitch is the part I remember.",
+        "{personal}"
+    );
+    assert_eq!(
+        personal["profile_provenance"],
+        json!({
+            "title": {"source": "linkedin-export", "date": "2026-03"},
+            "company": {"source": "linkedin-export", "date": "2026-03"},
+            "profile": {"source": "linkedin-export", "date": "2026-03"},
+            "relationship_context": {"source": "operator", "date": "2026-10"},
+            "human_note": {"source": "operator", "date": "2026-10"},
+        }),
+        "{personal}"
+    );
+
     let private = build_context(&vault, &person, false, &PackScope::All, false).unwrap();
     let personal = &private.packs["personal@0.4"];
-    for field in ["relationship_context", "role_history", "alias_history"] {
+    for field in [
+        "relationship_context",
+        "role_history",
+        "alias_history",
+        "human_note",
+        "profile_provenance",
+    ] {
         assert!(personal.get(field).is_none(), "{field} visible: {personal}");
     }
     let dumped = serde_json::to_string(&private).unwrap();
@@ -856,6 +878,8 @@ fn personal_04_person_relationship_fields_and_privacy() {
         "investor in her company",
         "Product manager",
         "dana@old.example.test",
+        "kitchen-table pitch",
+        "linkedin-export",
     ] {
         assert!(!dumped.contains(leak), "{leak} leaked in {dumped}");
     }

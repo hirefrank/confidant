@@ -349,6 +349,23 @@ fn field_value_json(value: FieldValue) -> Value {
                 })
                 .collect(),
         ),
+        FieldValue::ProvenanceList(list) => {
+            // #738: the newest-dated entry per fact is the effective one.
+            let mut latest: BTreeMap<String, Value> = BTreeMap::new();
+            for entry in list {
+                let newer = latest
+                    .get(&entry.key)
+                    .and_then(|current| current["date"].as_str())
+                    .is_none_or(|current| entry.date.as_str() > current);
+                if newer {
+                    latest.insert(
+                        entry.key,
+                        serde_json::json!({"source": entry.source, "date": entry.date}),
+                    );
+                }
+            }
+            Value::Object(latest.into_iter().collect())
+        }
     }
 }
 
