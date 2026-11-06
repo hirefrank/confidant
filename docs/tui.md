@@ -48,9 +48,12 @@ screen without the banner.
 Spec 0.4 adds a `[retired]` badge to the operator roster. A retired record
 stays visible there (with its `no_ai` badge too, when it has one) so the
 operator can find and unretire it, but it is absent from the agent roster
-and `context` returns no bundle for it. The TUI only renders what the CLI's
-effective view returns: superseded ledger lines are already gone from
-`context` touchpoints and pack state, and the TUI never re-adds one.
+and `context` returns no bundle for it. In operator mode the context pane
+also lists superseded ledger lines in `touchpoints` with a `[superseded]`
+badge (the CLI's `superseded: true`), so the operator can see what a
+retraction voided; pack state (such as `recent_touches`) stays effective-only.
+The agent path never sends a superseded line, and the TUI never re-adds one
+it did not receive.
 
 Places and things are not in the People workspace yet: the TUI stays
 person-only, and `entity.fields` is additive CLI JSON it ignores. Use

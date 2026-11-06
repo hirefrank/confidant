@@ -260,18 +260,27 @@ fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
         lines.extend(body_lines(ixn.body.as_deref(), "    "));
     }
 
-    // Superseded ledger lines are omitted by the CLI's effective view; the
-    // TUI renders exactly the touchpoints it receives and never re-adds one.
+    // Superseded ledger lines are omitted by the CLI's agent view; on the
+    // operator path the CLI lists them with `superseded: true` (#838) and
+    // the TUI badges them instead of hiding what a retraction voided.
     lines.push(Line::from(Span::styled(
         format!("touchpoints ({})", ctx.touchpoints.len()),
         theme::muted().bold(),
     )));
     for tp in &ctx.touchpoints {
-        lines.push(Line::from(vec![
+        let mut row = vec![
             Span::raw("  "),
             theme::pill(&tp.date),
             Span::raw(format!(" {}", tp.kind.as_deref().unwrap_or("-"))),
-        ]));
+        ];
+        if tp.superseded {
+            row.push(Span::raw(" "));
+            row.push(Span::styled(
+                "[superseded]",
+                Style::default().fg(palette::WARNING).bold(),
+            ));
+        }
+        lines.push(Line::from(row));
     }
 
     lines.push(Line::from(vec![
@@ -287,4 +296,38 @@ fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
     ]));
 
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rendered(ctx: &Context) -> String {
+        context_lines(ctx, 0)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn superseded_touchpoint_renders_an_operator_badge() {
+        // Operator context (#838) lists superseded lines with the badge;
+        // live lines and the agent path render without it.
+        let ctx: Context = serde_json::from_str(
+            r#"{
+                "person": {"id": "p-1", "name": "Ada Example", "no_ai": false},
+                "touchpoints": [
+                    {"date": "2026-10-01", "kind": "call"},
+                    {"date": "2026-10-02", "kind": "meet", "superseded": true}
+                ],
+                "packs": {}, "aliases": [], "scope": []
+            }"#,
+        )
+        .unwrap();
+        let text = rendered(&ctx);
+        assert!(text.contains("[superseded]"), "{text}");
+        assert_eq!(text.matches("[superseded]").count(), 1, "{text}");
+    }
 }
