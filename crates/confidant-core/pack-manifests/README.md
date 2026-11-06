@@ -7,11 +7,12 @@ repo-root `../../packs`.
 
 | Path | What |
 |---|---|
-| `personal-0.2/` | The embedded declarative built-in `personal@0.2` (#550, implicit since #551): `manifest.toml`, `SKILL.md`, `0.2.md`. A drift test pins it to the repo-root `packs/personal/`. |
+| `personal-0.2/` | The frozen embedded declarative built-in `personal@0.2` for specs 0.1–0.3 (#550, implicit since #551): `manifest.toml`, `SKILL.md`, `0.2.md`. No repo-root source; do not edit. |
+| `personal-0.3/` | The embedded declarative built-in `personal@0.3` for spec 0.4 (#745): `manifest.toml`, `SKILL.md`, `0.3.md`. A drift test pins it to the repo-root `packs/personal/`. |
 
 External packs are not vendored into the binary: they are copied into a
 vault's `packs/<name>@<version>/` and pinned in that vault's
 `confidant.lock`.
 
-For the built-in, edit the repo-root `packs/personal/` files and copy
-them here (the drift tests fail otherwise).
+For the built-in, edit the repo-root `packs/personal/` files and run
+`python3 .github/scripts/sync-packs.py`.

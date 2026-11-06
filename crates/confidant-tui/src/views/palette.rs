@@ -82,11 +82,6 @@ pub const ENTRIES: &[Entry] = &[
         group: "Write",
     },
     Entry {
-        id: "capture.session",
-        label: "Log a session",
-        group: "Write",
-    },
-    Entry {
         id: "capture.touch",
         label: "Log a touch",
         group: "Write",
@@ -313,8 +308,8 @@ mod tests {
 
     #[test]
     fn filtering_finds_by_label_id_and_group() {
-        let labels: Vec<&str> = filtered("session").iter().map(|entry| entry.id).collect();
-        assert!(labels.contains(&"capture.session"));
+        let labels: Vec<&str> = filtered("touch").iter().map(|entry| entry.id).collect();
+        assert!(labels.contains(&"capture.touch"));
 
         let ids: Vec<&str> = filtered("view.conflicts")
             .iter()

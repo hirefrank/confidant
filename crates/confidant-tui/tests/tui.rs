@@ -265,9 +265,8 @@ fn search_context_and_doctor_views_snapshot() {
     let mut app = App::new(fake);
     app.set_vault_root(vault_root.path().to_path_buf());
 
-    // Unified Search tab (#387): switch with `f` (phase 3 moved `s` to
-    // session capture), toggle exact literal scan with `e`, then press `/`,
-    // type, Enter.
+    // Unified Search tab (#387): switch with `f`, toggle exact literal scan
+    // with `e`, then press `/`, type, Enter.
     app.handle_key(key(KeyCode::Char('f')));
     assert_eq!(app.active_view, ActiveView::Search);
     app.handle_key(key(KeyCode::Char('e')));
@@ -2842,45 +2841,45 @@ fn capture_base_runner() -> FakeRunner {
 }
 
 #[test]
-fn capture_session_prefills_person_previews_then_writes() {
+fn capture_touch_prefills_person_previews_then_writes() {
     let runner = capture_base_runner()
         .with_argv_response(
-            &["log", "session", ADA, "60m", "--dry-run"],
+            &["log", "touch", ADA, "meal", "--dry-run"],
             0,
             capture_dry_json(
-                "log-session",
+                "log-touch",
                 "ledger/2026/10.cfd",
                 "append",
-                "2026-10-13 session ADA 60m\n",
+                "2026-10-13 touch ADA meal\n",
             ),
         )
         .with_argv_response(
-            &["log", "session", ADA, "60m"],
+            &["log", "touch", ADA, "meal"],
             0,
-            capture_applied_json("log-session"),
+            capture_applied_json("log-touch"),
         );
     let mut app = App::new(runner);
     app.load_check();
     app.load_roster();
     assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
 
-    app.handle_key(key(KeyCode::Char('s')));
+    app.handle_key(key(KeyCode::Char('t')));
     let capture = app.capture.as_ref().expect("capture open");
-    assert_eq!(capture.kind, CaptureKind::Session);
+    assert_eq!(capture.kind, CaptureKind::Touch);
     assert_eq!(capture.person_id, ADA, "person pre-filled, no ULID typing");
     assert_eq!(capture.phase, CapturePhase::Editing);
     let form = render_to_string(&app);
-    assert!(form.contains("Capture: Log session"), "{form}");
+    assert!(form.contains("Capture: Log touch"), "{form}");
     assert!(form.contains(ADA), "{form}");
 
-    type_text(&mut app, "60m");
+    type_text(&mut app, "meal");
     app.handle_key(key(KeyCode::Enter));
 
     let calls = app.runner.recorded_calls();
     assert!(
         calls
             .iter()
-            .any(|call| call == &s(&["log", "session", ADA, "60m", "--dry-run"])),
+            .any(|call| call == &s(&["log", "touch", ADA, "meal", "--dry-run"])),
         "the dry run is issued: {calls:?}"
     );
     assert_eq!(
@@ -2891,11 +2890,11 @@ fn capture_session_prefills_person_previews_then_writes() {
     assert!(
         !calls
             .iter()
-            .any(|call| call == &s(&["log", "session", ADA, "60m"])),
+            .any(|call| call == &s(&["log", "touch", ADA, "meal"])),
         "nothing is written before the confirm: {calls:?}"
     );
     let preview = render_to_string(&app);
-    assert!(preview.contains("Confirm: Log session"), "{preview}");
+    assert!(preview.contains("Confirm: Log touch"), "{preview}");
     assert!(preview.contains("ledger/2026/10.cfd"), "{preview}");
 
     app.handle_key(key(KeyCode::Char('y')));
@@ -2904,7 +2903,7 @@ fn capture_session_prefills_person_previews_then_writes() {
     assert!(
         calls
             .iter()
-            .any(|call| call == &s(&["log", "session", ADA, "60m"])),
+            .any(|call| call == &s(&["log", "touch", ADA, "meal"])),
         "the real write is issued: {calls:?}"
     );
     let alert = app.alert.as_ref().expect("result alert");
@@ -2913,24 +2912,24 @@ fn capture_session_prefills_person_previews_then_writes() {
 }
 
 #[test]
-fn capture_session_cancel_writes_nothing() {
+fn capture_touch_cancel_writes_nothing() {
     let runner = capture_base_runner()
         .with_argv_response(
-            &["log", "session", ADA, "60m", "--dry-run"],
+            &["log", "touch", ADA, "meal", "--dry-run"],
             0,
-            capture_dry_json("log-session", "ledger/2026/10.cfd", "append", "x"),
+            capture_dry_json("log-touch", "ledger/2026/10.cfd", "append", "x"),
         )
         .with_argv_response(
-            &["log", "session", ADA, "60m"],
+            &["log", "touch", ADA, "meal"],
             0,
-            capture_applied_json("log-session"),
+            capture_applied_json("log-touch"),
         );
     let mut app = App::new(runner);
     app.load_check();
     app.load_roster();
 
-    app.handle_key(key(KeyCode::Char('s')));
-    type_text(&mut app, "60m");
+    app.handle_key(key(KeyCode::Char('t')));
+    type_text(&mut app, "meal");
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(
         app.capture.as_ref().map(|capture| capture.phase),
@@ -2938,13 +2937,13 @@ fn capture_session_cancel_writes_nothing() {
     );
 
     // Any key other than `y` cancels the capture.
-    app.handle_key(key(KeyCode::Char('n')));
+    app.handle_key(key(KeyCode::Char('m')));
     assert!(app.capture.is_none(), "capture cancelled");
     let calls = app.runner.recorded_calls();
     assert!(
         !calls
             .iter()
-            .any(|call| call == &s(&["log", "session", ADA, "60m"])),
+            .any(|call| call == &s(&["log", "touch", ADA, "meal"])),
         "a cancelled capture writes nothing: {calls:?}"
     );
 }
@@ -2952,15 +2951,15 @@ fn capture_session_cancel_writes_nothing() {
 #[test]
 fn capture_pending_preview_is_not_escaped_by_workspace_shortcuts() {
     let runner = capture_base_runner().with_argv_response(
-        &["log", "session", ADA, "60m", "--dry-run"],
+        &["log", "touch", ADA, "meal", "--dry-run"],
         0,
-        capture_dry_json("log-session", "ledger/2026/10.cfd", "append", "x"),
+        capture_dry_json("log-touch", "ledger/2026/10.cfd", "append", "x"),
     );
     let mut app = App::new(runner);
     app.load_check();
     app.load_roster();
-    app.handle_key(key(KeyCode::Char('s')));
-    type_text(&mut app, "60m");
+    app.handle_key(key(KeyCode::Char('t')));
+    type_text(&mut app, "meal");
     app.handle_key(key(KeyCode::Enter));
     assert!(app.capture.is_some(), "preview armed");
 
@@ -3008,7 +3007,7 @@ fn capture_touch_uses_touch_argv() {
 fn capture_without_a_person_shows_an_alert() {
     let mut app = App::new(capture_base_runner());
     // No roster loaded: nothing is selected.
-    app.handle_key(key(KeyCode::Char('s')));
+    app.handle_key(key(KeyCode::Char('t')));
     assert!(app.capture.is_none(), "no capture without a person");
     let alert = app.alert.as_ref().expect("alert");
     assert_eq!(alert.code.as_deref(), Some("no_person"));
@@ -3020,24 +3019,25 @@ fn capture_dry_run_error_keeps_the_form_open() {
         "ok": false,
         "schema_version": "1",
         "vault": "/fake/demo-vault",
-        "error": {"code": "usage_error", "message": "bad duration 'xx'", "fix": "use like 60m"}
+        "error": {"code": "usage_error", "message": "bad touch kind 'coffee'", "fix": "use a core kind"}
     })
     .to_string();
-    let runner = capture_base_runner().with_argv_response(&["log", "session", ADA, "xx"], 0, error);
+    let runner =
+        capture_base_runner().with_argv_response(&["log", "touch", ADA, "coffee"], 0, error);
     let mut app = App::new(runner);
     app.load_check();
     app.load_roster();
 
-    app.handle_key(key(KeyCode::Char('s')));
-    type_text(&mut app, "xx");
+    app.handle_key(key(KeyCode::Char('t')));
+    type_text(&mut app, "coffee");
     app.handle_key(key(KeyCode::Enter));
 
     let capture = app.capture.as_ref().expect("form stays open");
     assert_eq!(capture.phase, CapturePhase::Editing);
     let message = capture.error.as_deref().unwrap_or("");
-    assert!(message.contains("bad duration"), "{message}");
+    assert!(message.contains("bad touch kind"), "{message}");
     let rendered = render_to_string(&app);
-    assert!(rendered.contains("bad duration"), "{rendered}");
+    assert!(rendered.contains("bad touch kind"), "{rendered}");
 }
 
 #[test]
@@ -3479,15 +3479,15 @@ fn new_person_cannot_open_while_a_write_is_pending() {
     // A pending capture owns the keyboard: pressing `a` cancels the preview
     // instead of opening a second form.
     let runner = capture_base_runner().with_argv_response(
-        &["log", "session", ADA, "60m", "--dry-run"],
+        &["log", "touch", ADA, "meal", "--dry-run"],
         0,
-        capture_dry_json("log-session", "ledger/2026/10.cfd", "append", "x"),
+        capture_dry_json("log-touch", "ledger/2026/10.cfd", "append", "x"),
     );
     let mut app = App::new(runner);
     app.load_check();
     app.load_roster();
-    app.handle_key(key(KeyCode::Char('s')));
-    type_text(&mut app, "60m");
+    app.handle_key(key(KeyCode::Char('t')));
+    type_text(&mut app, "meal");
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(
         app.capture.as_ref().map(|capture| capture.phase),
@@ -3498,15 +3498,15 @@ fn new_person_cannot_open_while_a_write_is_pending() {
     assert!(app.capture.is_none(), "a did not open a new form");
 
     // The programmatic guard is a no-op while any capture is open.
-    app.handle_key(key(KeyCode::Char('s')));
+    app.handle_key(key(KeyCode::Char('t')));
     assert_eq!(
         app.capture.as_ref().map(|capture| capture.kind),
-        Some(CaptureKind::Session)
+        Some(CaptureKind::Touch)
     );
     app.begin_new_person();
     assert_eq!(
         app.capture.as_ref().map(|capture| capture.kind),
-        Some(CaptureKind::Session),
+        Some(CaptureKind::Touch),
         "a pending capture is not replaced"
     );
 }
@@ -3789,7 +3789,7 @@ fn live_new_person_commits_once_and_resolves_through_the_real_cli() {
 #[test]
 fn capture_targets_the_person_open_in_context_not_the_people_cursor() {
     // Ada stays highlighted in People; Bea is opened from a search hit into
-    // the full-screen Context view. `s` must target Bea (what is on screen),
+    // the full-screen Context view. `t` must target Bea (what is on screen),
     // not the stale People cursor.
     let find = serde_json::json!({
         "schema_version": "1",
@@ -3821,9 +3821,9 @@ fn capture_targets_the_person_open_in_context_not_the_people_cursor() {
         )
         .with_argv_response(&["find", "--", "bea"], 0, find)
         .with_argv_response(
-            &["log", "session", BEA, "60m", "--dry-run"],
+            &["log", "touch", BEA, "meal", "--dry-run"],
             0,
-            capture_dry_json("log-session", "ledger/2026/10.cfd", "append", "x"),
+            capture_dry_json("log-touch", "ledger/2026/10.cfd", "append", "x"),
         );
     let mut app = App::new(runner);
     app.load_check();
@@ -3839,7 +3839,7 @@ fn capture_targets_the_person_open_in_context_not_the_people_cursor() {
     // `activate_selected` opens Context without moving the People cursor.
     assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
 
-    app.handle_key(key(KeyCode::Char('s')));
+    app.handle_key(key(KeyCode::Char('t')));
     assert_eq!(
         app.capture
             .as_ref()
@@ -3847,20 +3847,20 @@ fn capture_targets_the_person_open_in_context_not_the_people_cursor() {
         Some(BEA),
         "capture pre-fills the person whose context is on screen"
     );
-    type_text(&mut app, "60m");
+    type_text(&mut app, "meal");
     app.handle_key(key(KeyCode::Enter));
 
     let calls = app.runner.recorded_calls();
     assert!(
         calls
             .iter()
-            .any(|call| call == &s(&["log", "session", BEA, "60m", "--dry-run"])),
+            .any(|call| call == &s(&["log", "touch", BEA, "meal", "--dry-run"])),
         "the write targets Bea: {calls:?}"
     );
     assert!(
         !calls
             .iter()
-            .any(|call| call == &s(&["log", "session", ADA, "60m", "--dry-run"])),
+            .any(|call| call == &s(&["log", "touch", ADA, "meal", "--dry-run"])),
         "the write must not target Ada: {calls:?}"
     );
 }
@@ -3968,32 +3968,32 @@ fn command_palette_opens_with_ctrl_p_and_esc_closes_it() {
 fn command_palette_capture_still_dry_runs_and_waits_for_y() {
     let runner = capture_base_runner()
         .with_argv_response(
-            &["log", "session", ADA, "60m", "--dry-run"],
+            &["log", "touch", ADA, "meal", "--dry-run"],
             0,
             capture_dry_json(
-                "log-session",
+                "log-touch",
                 "ledger/2026/10.cfd",
                 "append",
-                "2026-10-13 session ADA 60m\n",
+                "2026-10-13 touch ADA meal\n",
             ),
         )
         .with_argv_response(
-            &["log", "session", ADA, "60m"],
+            &["log", "touch", ADA, "meal"],
             0,
-            capture_applied_json("log-session"),
+            capture_applied_json("log-touch"),
         );
     let mut app = App::new(runner);
     app.load_check();
     app.load_roster();
 
     app.handle_key(key(KeyCode::Char(':')));
-    type_text(&mut app, "log a session");
+    type_text(&mut app, "log a touch");
     assert_eq!(
         app.palette
             .as_ref()
             .and_then(|state| state.selected_entry())
             .map(|entry| entry.id),
-        Some("capture.session")
+        Some("capture.touch")
     );
     app.handle_key(key(KeyCode::Enter));
 
@@ -4012,13 +4012,13 @@ fn command_palette_capture_still_dry_runs_and_waits_for_y() {
         "no CLI write from the palette alone"
     );
 
-    type_text(&mut app, "60m");
+    type_text(&mut app, "meal");
     app.handle_key(key(KeyCode::Enter));
     let calls = app.runner.recorded_calls();
     assert!(
         calls
             .iter()
-            .any(|call| call == &s(&["log", "session", ADA, "60m", "--dry-run"])),
+            .any(|call| call == &s(&["log", "touch", ADA, "meal", "--dry-run"])),
         "dry run issued: {calls:?}"
     );
     assert_eq!(
@@ -4028,7 +4028,7 @@ fn command_palette_capture_still_dry_runs_and_waits_for_y() {
     assert!(
         !calls
             .iter()
-            .any(|call| call == &s(&["log", "session", ADA, "60m"])),
+            .any(|call| call == &s(&["log", "touch", ADA, "meal"])),
         "preview does not write: {calls:?}"
     );
 
@@ -4038,7 +4038,7 @@ fn command_palette_capture_still_dry_runs_and_waits_for_y() {
         app.runner
             .recorded_calls()
             .iter()
-            .any(|call| call == &s(&["log", "session", ADA, "60m"])),
+            .any(|call| call == &s(&["log", "touch", ADA, "meal"])),
         "y performed the real write"
     );
 }
@@ -4048,8 +4048,8 @@ fn palette_cannot_open_over_a_pending_capture_confirm() {
     let mut app = App::new(capture_base_runner());
     app.load_check();
     app.load_roster();
-    app.handle_key(key(KeyCode::Char('s')));
-    type_text(&mut app, "60m");
+    app.handle_key(key(KeyCode::Char('t')));
+    type_text(&mut app, "meal");
     app.handle_key(key(KeyCode::Enter));
     // No dry-run response is queued; the capture stays open with an inline
     // error. The palette key must stay owned by the capture modal.

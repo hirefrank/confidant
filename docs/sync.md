@@ -7,7 +7,7 @@ only does the work you ask for.
 
 This is deliberate:
 
-- A write must not depend on the network. `confidant log session` keeps
+- A write must not depend on the network. `confidant log touch` keeps
   working offline, on a plane, or with the remote down.
 - A push is a privacy boundary. Only a private remote should receive the
   vault, and the operator decides when.
@@ -152,7 +152,7 @@ Confidant never runs that merge or rebase for you, and never force-pushes.
 A normal day, with a private `origin` remote:
 
 ```sh
-confidant log session p-01… 60m paid --date 2026-10-20
+confidant log touch p-01… meal --date 2026-10-20
 # one local commit; nothing left the machine
 
 confidant doctor        # local-commits: 1 local commit(s) not pushed

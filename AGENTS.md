@@ -25,20 +25,33 @@ interoperating vaults, not one shared vault.
 
 Read before changing behaviour:
 
-- [`spec/0.1.md`](spec/0.1.md): the vault file format. **The spec is the
-  contract**; the code implements it. The spec version and the CLI version
-  are independent (ADR-1).
+- [`spec/0.1.md`](spec/0.1.md), [`spec/0.2.md`](spec/0.2.md), and
+  [`spec/0.3.md`](spec/0.3.md) (frozen) and [`spec/0.4.md`](spec/0.4.md)
+  (current): the vault file format. **The spec is the contract**; the code
+  implements it. The spec version and the CLI version are independent (ADR-1).
 - [`spec/findings.md`](spec/findings.md): stable `check` finding codes.
 - [`docs/architecture.md`](docs/architecture.md): privacy and threat model,
-  ADR-1 to ADR-16, milestones (section 8), and risk decisions (section 9b,
+  ADR-1 to ADR-21, milestones (section 8), and risk decisions (section 9b,
   binding).
 - [`testdata/packs/example-pack/`](testdata/packs/example-pack/): the neutral external-pack fixture used by tests, the QA smoke, and the benchmark generator.
-- [`packs/personal/0.2.md`](packs/personal/0.2.md): the personal
-  relationships pack (implicit built-in).
+- [`testdata/packs/place-pack/`](testdata/packs/place-pack/) and
+  [`testdata/vaults/place-0.3/`](testdata/vaults/place-0.3/): the spec 0.3
+  record-type fixture, its vendored pack pin, and its `check --json` golden.
+  Fake data only; keep the demo vault on 0.2.
+- [`testdata/vaults/personal-0.4/`](testdata/vaults/personal-0.4/): the
+  checked-in 0.4 default fixture for `personal@0.3` places, things, edges,
+  context fields, and the no-ai place; its golden is
+  [`testdata/golden/personal-0.4.json`](testdata/golden/personal-0.4.json).
+- [`packs/personal/0.3.md`](packs/personal/0.3.md) is the 0.4 personal
+  pack, which adds places and things (ADR-21); the frozen
+  [`packs/personal/0.2.md`](packs/personal/0.2.md) is the 0.1–0.3
+  person-only contract. `personal@0.2` is the active built-in on 0.1–0.3
+  and `personal@0.3` on 0.4.
 - [`spec/pack-manifest.md`](spec/pack-manifest.md): the pack manifest
-  format. The manifest (`packs/<name>/manifest.toml`) is the single
-  source of truth for a pack's claims (verbs, fields, edge kinds,
-  finding codes, `[checks]` keys, message templates); the folds and
+  format, including spec-selected built-in versions (§13.7). The manifest
+  (`packs/<name>/manifest.toml`) is the single
+  source of truth for a pack's claims (record types, verbs, fields, edge
+  kinds, finding codes, `[checks]` keys, message templates); the folds and
   findings logic stay in Rust.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) and
   [`docs/borrowing.md`](docs/borrowing.md): contributor setup, and what was
@@ -55,7 +68,9 @@ Read before changing behaviour:
 | `spec/` | Format spec and finding codes |
 | `packs/` | Schema packs (built-in personal; external packs live in the vault) |
 | `crates/confidant-cli/pack-skills/`, `crates/confidant-core/pack-manifests/` | In-crate vendored pack skill/manifest copies the binary embeds; regenerate with `python3 .github/scripts/sync-packs.py` (drift tests guard them) |
-| `examples/demo-vault/` | Fake-data vault used by tests, docs, and CI |
+| `examples/demo-vault/` | Fake-data 0.2 vault used by tests, docs, and CI |
+| `testdata/vaults/place-0.3/` | Checked-in 0.3 fixture for pack-declared types, entity notes, and edge `no-ai` |
+| `testdata/vaults/corrections-0.4/` | Checked-in 0.4 fixture for retractions, superseded lines, and retirement |
 | `testdata/golden/` | Golden `check --json` outputs |
 | `docs/` | Architecture, privacy, sync, benchmarks, research |
 | `contrib/` | Opt-in systemd/launchd timer templates for `confidant sync` (#665) |
@@ -100,7 +115,7 @@ python3 crates/confidant-cli/skills/qmd-search/tests/test_qmd_query.py --cli tar
                                                     # skill allowlist/verification tests (needs a built CLI; the "skills smoke" job)
 cargo build -p confidant-cli --locked --all-features   # build the CLI for qa-smoke (same build as CI's test job)
 python3 .github/scripts/qa-smoke.py --cli target/debug/confidant
-                                                    # 22-step end-to-end smoke on a throwaway vault (.agents/skills/qa-sweep/SKILL.md)
+                                                    # end-to-end smoke on a throwaway vault (.agents/skills/qa-sweep/SKILL.md)
 ```
 
 `--locked` means the lockfile must already be right. If you add a

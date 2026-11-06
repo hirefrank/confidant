@@ -1,6 +1,6 @@
 //! `confidant pack init`: scaffold a local external pack (#674).
 //!
-//! The scaffold is deliberately small and valid as written: a v2 manifest
+//! The scaffold is deliberately small and valid as written: a v3 manifest
 //! with no claims, the agent-facing `SKILL.md`, the human contract
 //! (`<version>.md`), and a `README.md` describing the local review loop.
 //! Every example in the manifest is a comment, so a fresh directory parses
@@ -285,7 +285,7 @@ fn readme_text(name: &str, version: &str) -> String {
         .replace("@VERSION@", version)
 }
 
-/// A valid v2 skeleton. Every example is commented out, so the file parses
+/// A valid v3 skeleton. Every example is commented out, so the file parses
 /// exactly as written; each example names real keys from the manifest spec.
 const MANIFEST_TEMPLATE: &str = r#"# Confidant external pack manifest (spec/pack-manifest.md §13).
 #
@@ -293,7 +293,7 @@ const MANIFEST_TEMPLATE: &str = r#"# Confidant external pack manifest (spec/pack
 # kinds; the CLI supplies every parser, fold and finding. Pack text never
 # executes. Unknown keys are an error, and a claim that collides with core
 # or with another enabled pack is refused.
-manifest_version = 2
+manifest_version = 3
 
 # Top-level keys must come before the first [table] header.
 record_types = []
@@ -305,8 +305,9 @@ name = "@NAME@"
 version = "@VERSION@"
 # The skill served to agents from this pack directory.
 skill = "SKILL.md"
-# Exact vault spec versions this pack supports.
-requires_spec = ["0.1"]
+# Exact vault spec versions this pack supports. Record type declarations
+# require 0.3; a pack with none may still list 0.1 and 0.2.
+requires_spec = ["0.3"]
 
 # Finding message templates, one table per code ([messages."<CODE>"]). The
 # empty table is required even while no code is declared; see the example
@@ -318,6 +319,28 @@ requires_spec = ["0.1"]
 # written. Uncomment only what the pack needs, then review it with:
 #   confidant pack add --from-dir <this-directory>
 # ---------------------------------------------------------------------------
+
+# A record type this pack owns (manifest v3, vault spec 0.3). `id_prefix`
+# is exactly two lowercase letters and must not be a core prefix (`p`, `o`,
+# `d`, `i`, `n`, `e`, or `pkg`); its second letter must not be one of the
+# single-letter core prefixes either. `collection` and `main_file` are the
+# vault layout, and both must be unique across enabled packs. `entity`
+# opts into context targets and edge endpoints; `person_like` adds person
+# read semantics and implies `entity`. `no_ai` is none, full, or notes
+# (notes requires person_like). `roster` includes it in
+# `record list --kind all`. Required fields must be `name` or a field
+# declared below; optional fields follow the same rule.
+# [[record_types]]
+# name = "example"
+# id_prefix = "ex"
+# collection = "examples"
+# main_file = "example.md"
+# entity = true
+# person_like = false
+# no_ai = "full"
+# roster = true
+# required_fields = ["name"]
+# optional_fields = ["example_birthday"]
 
 # A front-matter field this pack owns. `grammar` names a fixed parser from
 # spec/pack-manifest.md §6: recurring-date, cadence, date, non-empty-string,
@@ -333,6 +356,15 @@ requires_spec = ["0.1"]
 # [[verbs]]
 # name = "greet"
 # id_type = "person"
+
+# An edge kind this pack introduces. Core kinds (married, introduced,
+# colleague, works_at, founder_of, investor_in, advisor_to) are refused.
+# `from` / `to` are optional endpoint type lists; absent means person↔person.
+# [[edge_kinds]]
+# name = "backs"
+# symmetric = false
+# from = ["org"]
+# to = ["person"]
 
 # A severity key the operator can tune in confidant.toml. Keys are
 # namespaced to this pack; the default is error, warning, or off.
@@ -376,10 +408,11 @@ description: "@NAME@ pack for a Confidant vault. Declarative claims only; propos
 
 # @NAME@ pack
 
-This pack extends a Confidant vault's vocabulary (fields, verbs, finding
-codes and checks) through `manifest.toml`. It carries no executable code:
-every parser, fold and finding runs in the CLI, and a pack cannot add Rust
-logic.
+This pack extends a Confidant vault's vocabulary (record types, fields,
+verbs, finding codes and checks) through `manifest.toml`. It carries no
+executable code: every parser, fold and finding runs in the CLI, and a pack
+cannot add Rust logic. Spec 0.3 record types use `[[record_types]]` tables;
+a type must list `"0.3"` in `requires_spec`.
 
 ## When to use it
 
@@ -390,7 +423,7 @@ core behaviour; that needs a Confidant core change.
 ## Propose, then wait
 
 1. Read `manifest.toml` and this file. State the claims in plain language:
-   verbs, fields, finding codes, and each rule's parameters.
+   record types, verbs, fields, finding codes, and each rule's parameters.
 2. Show the operator the exact manifest and SKILL.md diff. Pack text becomes
    agent instructions, so the operator must read it.
 3. Wait for explicit confirmation. Never install, update, or commit a pack
@@ -405,7 +438,9 @@ core behaviour; that needs a Confidant core change.
 - A pack cannot widen the §12 allowlist or read `no-ai` content. The CLI
   enforces that; pack text cannot change it.
 - A pack cannot add code, run scripts, or define a new rule kind. New logic
-  is a core change.
+  is a core change. A pack may declare a record type, but it cannot claim a
+  core type or verb; a type's two-letter prefix must follow the manifest
+  rules.
 - Keep claims namespaced to this pack (`@NAME@.<key>`), and never reuse a
   core verb, record type, edge kind, or finding code.
 "#;
@@ -422,6 +457,9 @@ balance metrics, finding codes, or rules.
 
 `manifest.toml` is the single source of truth. It may claim:
 
+- `[[record_types]]` — a pack-declared record type for spec 0.3: name,
+  two-letter ID prefix, collection and main file, entity/person-like flags,
+  `no_ai`, roster visibility, and required/optional fields;
 - `[[fields]]` — front-matter fields and one of the fixed grammars;
 - `[[verbs]]` — ledger verbs (never a core verb);
 - `[[edge_kinds]]` — relationship kinds and symmetry;
@@ -429,6 +467,11 @@ balance metrics, finding codes, or rules.
 - `finding_codes` plus `[messages.<CODE>]` — the text the pack can emit;
 - `[checks]` — operator-tunable severity and integer keys;
 - `[[rules]]` — parameters for a core rule kind.
+
+A record type's ID prefix is exactly two lowercase letters, must not be a
+core one-letter prefix (`p`, `o`, `d`, `i`, `n`, `e`) or `pkg`, and its second
+letter must not be one of those core letters. A type that declares record
+types must list `"0.3"` in `requires_spec`.
 
 It cannot claim behaviour. `fold`, `findings`, balance math, date math and
 every grammar parser stay in Confidant's Rust core; adding a rule kind is a
@@ -484,7 +527,9 @@ confidant pack verify
 
 ## Iterate
 
-1. Edit `manifest.toml` (and `SKILL.md` / `<version>.md`).
+1. Edit `manifest.toml` (and `SKILL.md` / `<version>.md`). For a new
+   domain record type, add a `[[record_types]]` table and include `"0.3"`
+   in `requires_spec`.
 2. Bump `[pack].version` and rename the contract file to `<new-version>.md`.
 3. Review again: `confidant pack add --from-dir <this-directory>`.
 4. Apply: `confidant pack update @NAME@ --from-dir <this-directory> --yes`.
@@ -526,7 +571,7 @@ mod tests {
         assert_eq!(manifest.pack.name, "example-pack");
         assert_eq!(manifest.pack.version, "0.1");
         assert_eq!(manifest.pack.skill, "SKILL.md");
-        assert_eq!(manifest.pack.requires_spec, vec!["0.1".to_owned()]);
+        assert_eq!(manifest.pack.requires_spec, vec!["0.3".to_owned()]);
         assert!(manifest.record_types.is_empty());
         assert!(manifest.balance_metrics.is_empty());
         assert!(manifest.finding_codes.is_empty());
@@ -673,6 +718,10 @@ mod tests {
             expanded.push_str(line);
             expanded.push('\n');
         }
+        // The rendered manifest needs `record_types = []`; the expanded
+        // example instead supplies `[[record_types]]`, and TOML cannot have
+        // both spellings of the same key.
+        let mut expanded = expanded.replace("record_types = []\n", "");
         // A field requires the core front-matter code; the prose says so,
         // but the code table itself is not part of the example set.
         expanded.push_str(
@@ -682,6 +731,7 @@ mod tests {
         );
         let manifest =
             parse_manifest_external(&expanded).expect("every commented example is schema-valid");
+        assert_eq!(manifest.record_types.len(), 1);
         assert_eq!(manifest.fields.len(), 1);
         assert_eq!(manifest.verbs.len(), 1);
         assert_eq!(manifest.rules.len(), 1);
@@ -693,8 +743,20 @@ mod tests {
         const PREFIXES: &[&str] = &[
             "[",
             "name =",
+            "id_prefix =",
+            "collection =",
+            "main_file =",
+            "entity =",
+            "person_like =",
+            "no_ai =",
+            "roster =",
+            "required_fields =",
+            "optional_fields =",
             "grammar =",
             "id_type =",
+            "symmetric =",
+            "from =",
+            "to =",
             "key =",
             "default =",
             "id =",

@@ -1,22 +1,21 @@
-# Pack manifest for personal@0.2 (spec/pack-manifest.md).
+# Pack manifest for personal@0.3 (spec/pack-manifest.md).
 #
 # This is the built-in declarative pack (#550). Its bytes live inside the
-# binary and are loaded through the same manifest-v2 / declarative path
+# binary and are loaded through the same manifest-v3 / declarative path
 # external packs use. Because it is loaded from compiled-in bytes it is
 # trusted as core (#504 decision 3): its rules name the stable finding
 # codes directly and it may claim the core `touch` verb. The allowance is
 # keyed on the bytes' origin, never the pack name, so a vault directory
 # `packs/personal@…` still fails `E_PACK_INVALID` (#504 R8).
 #
-# The repo-root `packs/personal/manifest.toml` is the human contract; a
-# drift test pins the two copies together.
+# Root `packs/personal/` is the 0.3 source; the frozen 0.2 bytes live in
+# `crates/confidant-core/pack-manifests/personal-0.2/`. A drift test pins
+# the root 0.3 files to their embedded copies.
 
-manifest_version = 2
+manifest_version = 3
 
 # Top-level keys come before the first [table] header: in TOML anything
 # after a table header belongs to that table.
-record_types = []
-
 balance_metrics = []
 
 finding_codes = [
@@ -30,9 +29,35 @@ finding_codes = [
 
 [pack]
 name = "personal"
-version = "0.2"
+version = "0.3"
 skill = "SKILL.md"
-requires_spec = ["0.1"]
+# 0.3 is required because this manifest declares record types; 0.4 is the
+# vault spec that selects this built-in version.
+requires_spec = ["0.3", "0.4"]
+
+[[record_types]]
+name = "place"
+id_prefix = "pl"
+collection = "places"
+main_file = "place.md"
+entity = true
+person_like = false
+no_ai = "full"
+roster = true
+required_fields = ["name", "kind"]
+optional_fields = ["address", "tags", "links"]
+
+[[record_types]]
+name = "thing"
+id_prefix = "th"
+collection = "things"
+main_file = "thing.md"
+entity = true
+person_like = false
+no_ai = "full"
+roster = true
+required_fields = ["name", "kind"]
+optional_fields = ["tags", "links"]
 
 [[verbs]]
 name = "touch"
@@ -86,6 +111,14 @@ grammar = "cadence"
 name = "snooze_until"
 grammar = "date"
 
+[[fields]]
+name = "kind"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "address"
+grammar = "non-empty-string"
+
 [[edge_kinds]]
 name = "friend"
 symmetric = true
@@ -109,6 +142,30 @@ symmetric = false
 [[edge_kinds]]
 name = "mentor"
 symmetric = false
+
+[[edge_kinds]]
+name = "visited"
+symmetric = false
+from = ["person"]
+to = ["place"]
+
+[[edge_kinds]]
+name = "lives_at"
+symmetric = false
+from = ["person"]
+to = ["place"]
+
+[[edge_kinds]]
+name = "owns"
+symmetric = false
+from = ["person"]
+to = ["thing"]
+
+[[edge_kinds]]
+name = "located_at"
+symmetric = false
+from = ["thing"]
+to = ["place"]
 
 [checks]
 [[checks.severity]]

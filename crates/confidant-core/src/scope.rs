@@ -27,10 +27,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::config::SpecVersion;
 use crate::error::DomainError;
 use crate::id::RecordId;
 use crate::ledger::{parse_line, LedgerEntry};
-use crate::packs::{EdgeKind, Pack, CORE_EDGE_KINDS};
+use crate::packs::{core_edge_kinds, EdgeKind, Pack};
 use crate::record::{canonical_ref_key, is_spec_key, Record, RecordKind};
 use crate::vault::Vault;
 
@@ -137,8 +138,9 @@ pub fn resolve_scope(
 }
 
 /// The implicit built-in a `name@version` listing names, at any version
-/// (#551): `personal@0.1` names the built-in `personal@0.2`. The version
-/// must be non-empty, so a malformed `personal@` names nothing.
+/// (#551): `personal@0.1` names the active built-in (`personal@0.2` on
+/// 0.1–0.3, `personal@0.3` on 0.4). The version must be non-empty, so a
+/// malformed `personal@` names nothing.
 fn implicit_for_listing<'a>(implicit: &[&'a dyn Pack], listed: &str) -> Option<&'a dyn Pack> {
     let (name, version) = listed.split_once('@')?;
     if version.is_empty() {
@@ -155,7 +157,7 @@ fn implicit_for_listing<'a>(implicit: &[&'a dyn Pack], listed: &str) -> Option<&
 /// the ceiling, never widen it: naming a pack outside the ceiling is an
 /// error, with no implicit bypass (#551). A built-in listing still names
 /// the built-in at any version, so `personal@0.1` matches a ceiling that
-/// already includes `personal@0.2`; it never adds it. The result is
+/// already includes the active personal pack; it never adds it. The result is
 /// validated against the enabled packs.
 pub fn intersect_scope(
     ceiling: &PackScope,
@@ -169,7 +171,8 @@ pub fn intersect_scope(
     if let PackScope::Only(allowed) = ceiling {
         for name in names {
             // Canonicalize a built-in alias before the membership check,
-            // so `personal@0.1` matches a `personal@0.2` ceiling. The name
+            // so `personal@0.1` matches the active personal ceiling (`personal@0.2`
+            // on 0.1–0.3, `personal@0.3` on 0.4). The name
             // must still be in the ceiling: the per-call scope never
             // widens it (#551).
             let canonical = implicit_for_listing(implicit, name)
@@ -185,19 +188,21 @@ pub fn intersect_scope(
     resolve_scope(requested, enabled, implicit)
 }
 
-/// Owner of one front-matter field: the enabled pack claiming it, core
-/// for spec keys (including case-variant ref keys), else unattributed.
+/// Owner of one front-matter field: core for spec keys (including
+/// case-variant ref keys), else the enabled pack claiming it, else
+/// unattributed. Core wins a name collision: `kind` is a core edge key,
+/// so a pack declaring a `kind` field must not hide an edge's `kind:` line
+/// from a scope that excludes that pack (#745).
 pub fn owner_of_field(field: &str, enabled: &[&dyn Pack]) -> Option<OwnerKey> {
+    if is_spec_key(field) || canonical_ref_key(field).is_some() {
+        return Some(OwnerKey::Core);
+    }
     for pack in enabled {
         if pack.fields().contains(&field) {
             return Some(OwnerKey::Pack(pack.name()));
         }
     }
-    if is_spec_key(field) || canonical_ref_key(field).is_some() {
-        Some(OwnerKey::Core)
-    } else {
-        None
-    }
+    None
 }
 
 /// Core ledger verbs: owned by core, visible to every scope. `touch` is
@@ -205,7 +210,7 @@ pub fn owner_of_field(field: &str, enabled: &[&dyn Pack]) -> Option<OwnerKey> {
 /// participant's own id — no pack data. A pack that claims `touch`
 /// (#184) owns touch lines when enabled: [`owner_of_verb`] checks pack
 /// claims first.
-pub const CORE_VERBS: &[&str] = &["alias", "merge", "stage", "touch"];
+pub const CORE_VERBS: &[&str] = &["alias", "merge", "stage", "touch", "retract"];
 
 /// Owner of a ledger verb: the enabled pack claiming it, core for
 /// [`CORE_VERBS`], else unattributed.
@@ -233,16 +238,22 @@ pub fn owner_of_metric(metric: &str, enabled: &[&dyn Pack]) -> Option<OwnerKey> 
     None
 }
 
-/// Owner of an edge kind (#179): the enabled pack claiming the kind,
-/// core for [`CORE_EDGE_KINDS`], else unattributed (unknown kind —
-/// `check` flags it anyway, and the edge is hidden when scoped).
-pub fn owner_of_edge_kind(kind: &str, enabled: &[&dyn Pack]) -> Option<OwnerKey> {
+/// Owner of an edge kind (#179, #813): the enabled pack claiming the
+/// kind, core for this spec's [`core_edge_kinds`], else unattributed
+/// (unknown kind — `check` flags it anyway, and the edge is hidden when
+/// scoped). The spec matters: `works_at` is core-owned in 0.2 but unknown
+/// in 0.1, so a 0.1 vault keeps it unattributed (fail closed).
+pub fn owner_of_edge_kind(
+    kind: &str,
+    enabled: &[&dyn Pack],
+    spec: SpecVersion,
+) -> Option<OwnerKey> {
     for pack in enabled {
         if pack.edge_kinds().iter().any(|k: &EdgeKind| k.name == kind) {
             return Some(OwnerKey::Pack(pack.name()));
         }
     }
-    if CORE_EDGE_KINDS.iter().any(|k| k.name == kind) {
+    if core_edge_kinds(spec).iter().any(|k| k.name == kind) {
         Some(OwnerKey::Core)
     } else {
         None
@@ -302,6 +313,28 @@ pub fn note_linkage_owners(
             }
         }
     }
+    // Spec 0.3: a note or interaction attached with `entity:` inherits the
+    // owning pack of a pack-type entity. Core entities (person/org) add no
+    // pack owner; core stays visible under every scope.
+    for rec in vault.records.values() {
+        let Some(raw) = rec.field("entity") else {
+            continue;
+        };
+        let crate::record::FrontmatterRef::Id(target) = crate::record::parse_ref_id(raw) else {
+            continue;
+        };
+        let Some(target_rec) = vault.records.get(&target) else {
+            continue;
+        };
+        if let Some(pack) = enabled
+            .iter()
+            .find(|pack| pack.record_types().contains(&target_rec.kind.as_str()))
+        {
+            out.entry(rec.id.clone())
+                .or_default()
+                .insert(OwnerKey::Pack(pack.name()));
+        }
+    }
     out
 }
 
@@ -314,6 +347,7 @@ pub fn record_owners(
     record: &Record,
     linkage: &HashMap<RecordId, BTreeSet<OwnerKey>>,
     enabled: &[&dyn Pack],
+    spec: SpecVersion,
 ) -> BTreeSet<OwnerKey> {
     match record.kind {
         RecordKind::Person | RecordKind::Org | RecordKind::Deal => {
@@ -338,14 +372,28 @@ pub fn record_owners(
                     owners.insert(OwnerKey::Pack(name));
                 }
             }
+            if let Some(linked) = linkage.get(&record.id) {
+                owners.extend(linked.iter().copied());
+            }
             owners
         }
+        // A pack-declared type is pack-owned. A disabled/retired type is
+        // unattributed: visible only unscoped, and the type gate keeps it
+        // out of agent reads entirely.
+        RecordKind::Pack { .. } => enabled
+            .iter()
+            .find(|pack| pack.record_types().contains(&record.kind.as_str()))
+            .map(|pack| OwnerKey::Pack(pack.name()))
+            .into_iter()
+            .collect(),
         // #179: an edge is visible exactly when its kind's pack is in
         // scope. The edge's front matter has no pack-owned fields to
         // filter, so kind ownership is the whole story; a missing or
         // unknown kind is unattributed (fail closed).
         RecordKind::Edge => match record.field("kind") {
-            Some(kind) => owner_of_edge_kind(kind, enabled).into_iter().collect(),
+            Some(kind) => owner_of_edge_kind(kind, enabled, spec)
+                .into_iter()
+                .collect(),
             None => BTreeSet::new(),
         },
     }
@@ -401,6 +449,8 @@ mod tests {
             &[EdgeKind {
                 name: "mentor",
                 symmetric: false,
+                from: crate::packs::PERSON_ENDPOINT,
+                to: crate::packs::PERSON_ENDPOINT,
             }]
         }
         fn finding_codes(&self) -> &'static [&'static str] {
@@ -483,6 +533,15 @@ mod tests {
         ]
     }
 
+    /// The 0.4 implicit built-in (`personal@0.3`) for scope tests.
+    fn implicit_personal_03() -> Vec<&'static dyn Pack> {
+        vec![
+            crate::packs::embedded::find(crate::packs::embedded::PERSONAL_0_3)
+                .expect("personal@0.3 is embedded")
+                .pack(),
+        ]
+    }
+
     /// #551: a scoped read includes the implicit built-in only when the
     /// request names it. A `--packs` ceiling naming only an optional pack
     /// excludes personal; a `personal@…` listing names the built-in at any
@@ -511,6 +570,16 @@ mod tests {
         assert_eq!(
             resolve_scope(None, &enabled, &implicit).unwrap(),
             PackScope::All
+        );
+    }
+
+    #[test]
+    fn resolve_scope_personal_alias_uses_the_active_builtin() {
+        let implicit = implicit_personal_03();
+        let enabled: Vec<&dyn Pack> = vec![implicit[0]];
+        assert_eq!(
+            resolve_scope(Some(&["personal@0.2".to_string()]), &enabled, &implicit,).unwrap(),
+            PackScope::Only(["personal@0.3".to_string()].into_iter().collect())
         );
     }
 
@@ -590,6 +659,14 @@ mod tests {
         assert_eq!(owner_of_field("name", &enabled), Some(OwnerKey::Core));
         assert_eq!(owner_of_field("Person", &enabled), Some(OwnerKey::Core));
         assert_eq!(owner_of_field("mystery", &enabled), None);
+
+        // #745: `kind` is a core edge key even though personal@0.3 declares
+        // it as a record field. Core precedence keeps an edge's `kind:` line
+        // visible under a scope that excludes personal.
+        let personal = crate::packs::embedded::find(crate::packs::embedded::PERSONAL_0_3)
+            .expect("personal@0.3 is embedded")
+            .pack();
+        assert_eq!(owner_of_field("kind", &[personal]), Some(OwnerKey::Core));
     }
 
     #[test]
@@ -647,7 +724,7 @@ mod tests {
             "people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG002NAM000005.md",
         )
         .unwrap();
-        let owners = record_owners(&note, &HashMap::new(), &enabled);
+        let owners = record_owners(&note, &HashMap::new(), &enabled, SpecVersion::V02);
         assert_eq!(
             owners,
             [OwnerKey::Pack("testpack@0.1")].into_iter().collect()
@@ -662,7 +739,7 @@ mod tests {
             "people/p-01M3TC5H00MPJG000000000000/profile.md",
         )
         .unwrap();
-        let person_owners = record_owners(&person, &HashMap::new(), &enabled);
+        let person_owners = record_owners(&person, &HashMap::new(), &enabled, SpecVersion::V02);
         assert_eq!(person_owners, [OwnerKey::Core].into_iter().collect());
         assert!(other.allows(&person_owners));
     }
@@ -677,7 +754,7 @@ mod tests {
             "edges/e-01M3TC5H00MPJG00000000000A/edge.md",
         )
         .unwrap();
-        let owners = record_owners(&married, &HashMap::new(), &enabled);
+        let owners = record_owners(&married, &HashMap::new(), &enabled, SpecVersion::V02);
         assert_eq!(owners, [OwnerKey::Core].into_iter().collect());
         // A pack-kind edge (mentor, claimed by testpack) is owned by that
         // pack: visible to a testpack scope, hidden from a coaching scope.
@@ -686,7 +763,7 @@ mod tests {
             "edges/e-01M3TC5H00MPJG00000000000B/edge.md",
         )
         .unwrap();
-        let mentor_owners = record_owners(&mentor, &HashMap::new(), &enabled);
+        let mentor_owners = record_owners(&mentor, &HashMap::new(), &enabled, SpecVersion::V02);
         assert_eq!(
             mentor_owners,
             [OwnerKey::Pack("testpack@0.1")].into_iter().collect()
@@ -701,20 +778,43 @@ mod tests {
             "edges/e-01M3TC5H00MPJG00000000000C/edge.md",
         )
         .unwrap();
-        let mystery_owners = record_owners(&mystery, &HashMap::new(), &enabled);
+        let mystery_owners = record_owners(&mystery, &HashMap::new(), &enabled, SpecVersion::V02);
         assert!(mystery_owners.is_empty());
         assert!(!other.allows(&mystery_owners));
         assert!(PackScope::All.allows(&mystery_owners));
+        // `works_at` is core-owned in 0.2 and unknown in 0.1 (#813), so a
+        // 0.1 vault leaves it unattributed (fail closed).
+        let works_at = parse_record(
+            "---\nid: e-01M3TC5H00MPJG00000000000D\ntype: edge\na: p-01M3TC5H00MPJG000000000000\nb: o-01M3TC5H00MPJG000000000001\nkind: works_at\n---\n",
+            "edges/e-01M3TC5H00MPJG00000000000D/edge.md",
+        )
+        .unwrap();
+        assert_eq!(
+            record_owners(&works_at, &HashMap::new(), &enabled, SpecVersion::V02),
+            [OwnerKey::Core].into_iter().collect()
+        );
+        assert!(record_owners(&works_at, &HashMap::new(), &enabled, SpecVersion::V01).is_empty());
         // `owner_of_edge_kind` directly: core kind, pack kind, unknown.
         assert_eq!(
-            owner_of_edge_kind("married", &enabled),
+            owner_of_edge_kind("married", &enabled, SpecVersion::V02),
             Some(OwnerKey::Core)
         );
         assert_eq!(
-            owner_of_edge_kind("mentor", &enabled),
+            owner_of_edge_kind("mentor", &enabled, SpecVersion::V02),
             Some(OwnerKey::Pack("testpack@0.1"))
         );
-        assert_eq!(owner_of_edge_kind("nemesis", &enabled), None);
+        assert_eq!(
+            owner_of_edge_kind("works_at", &enabled, SpecVersion::V02),
+            Some(OwnerKey::Core)
+        );
+        assert_eq!(
+            owner_of_edge_kind("works_at", &enabled, SpecVersion::V01),
+            None
+        );
+        assert_eq!(
+            owner_of_edge_kind("nemesis", &enabled, SpecVersion::V02),
+            None
+        );
     }
 
     #[test]

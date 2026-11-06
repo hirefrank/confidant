@@ -222,8 +222,7 @@ pub(crate) fn build_ledger_sessions_view(
     recent_limit: usize,
 ) -> Option<Value> {
     let mut sessions: Vec<RecentSession> = vault
-        .entries
-        .iter()
+        .effective_entries()
         .filter(|s| {
             s.entry.verb == consume_verb && facts.canonical_on(&s.entry.id, as_of) == *canonical
         })

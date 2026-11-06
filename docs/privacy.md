@@ -15,15 +15,20 @@ short version, see the README's [Privacy](../README.md#privacy) section.
 - it has no duplicate or path-id mismatch,
 - every ID in its front matter is cleared,
 - its whole merge group is cleared,
-- any `people/<id>/` parent is cleared.
+- any `people/<id>/` parent is cleared,
+- it is not `retired: true` (spec 0.4).
 
 A path mismatch on a note, interaction, or deal unclears only that record; a
 mismatch or duplicate on a person's profile unclears that whole person.
 
 ## Finer `no-ai` granularity (issue #181)
 
-`no-ai` has three values: `true`, `false`, and `notes` (person records
-only). There are no field-level flags — the record is the unit.
+`no-ai` has three values: `true`, `false`, and `notes` on person records
+and declared `person_like` pack types. Other pack-declared types accept
+`full` only (`true` / `false`): a place or thing cannot use `notes`. There
+are no field-level flags — the record is the unit. An edge is the exception:
+it accepts only `true` / `false`, and `true` hides the relation while both
+endpoints stay visible (see “Edges and orgs”).
 
 - **`no-ai: true`** hides the person's (or record's) content from agents —
   names, bodies, profile fields, notes, and free text — the all-or-nothing
@@ -49,6 +54,16 @@ only). There are no field-level flags — the record is the unit.
   is the person's ID — or a list of IDs containing it — all count (#270).
   This is fail-closed on purpose — a note that mentions a notes-mode
   person is hidden unless it carries an explicit `no-ai: false`.
+- **Places and things** are non-person-like pack entities with
+  `no_ai = "full"`. `no-ai: true` hides the place/thing and every edge that
+  touches it; `no-ai: false` keeps it visible. There is no `notes` mode. An
+  uncleared place or thing returns **no agent `context` bundle at all**, not
+  an empty one: unlike a person, it has no derived ledger metadata that
+  would justify revealing its existence. The operator path still returns the
+  bundle with the tri-state badge and its fields. `context.entity.fields`
+  carries the declared fields; `--exclude-private` strips `address`, `tags`,
+  and `links`, while `kind` stays as the type marker (a place's `address` is
+  PII).
 - **Per-note `no-ai: true`** on an otherwise visible person already works:
   "any `true` wins", so the note is excluded from `find`/`allowlist`/the
   search corpus while the person stays visible. Use this for one-off sensitive
@@ -66,11 +81,64 @@ children are treated as `no-ai: true`. Because the flag itself is readable,
 anyone who can read the file learns that a record is marked — but the read
 surfaces still withhold its content from agents.
 
+## Edges and orgs (#813)
+
+`context <id>` accepts a person or an org. An edge is in the bundle only when
+**both** endpoints are cleared **and** the edge itself is not `no-ai: true`:
+`a` and `b` are front-matter IDs, so a `no-ai: true` endpoint drops the whole
+edge from `find`, the allowlist, and every context bundle, including the
+other endpoint's. A `no-ai: true` edge is hidden the same way while both
+endpoints stay visible; the relation is not counted, summarized, or
+anonymized. The bundle carries no count and no anonymized hint; omitted means
+indistinguishable from absent. The operator path still sees a hidden edge and
+badges it with `no_ai: "true"`; `--exclude-private` keeps the edge's opaque
+id, kind, and dates but nulls the other endpoint's name, along with the
+target's name and profile.
+
+Orgs cannot be `no-ai` (org-level hiding remains a later privacy decision,
+#820). Edges accept `no-ai: true` / `false` only: there is no `notes` mode and
+no inheritance in either direction. An org bundle also selects notes and
+interactions attached by `org:`, under the same cleared-set and pack-scope
+rules as a person bundle.
+
+`context` also accepts a declared `entity = true` pack type. A non-person-like
+pack entity (a place or thing) carries its declared `required_fields` and
+`optional_fields` in `entity.fields`, excluding `name`, with values shaped by
+the manifest grammar. The same `--exclude-private` list strips a place's
+`address` and the `tags`/`links` fields; an uncleared one returns no bundle
+on the agent path at all.
+
+## Corrections and retirement (#746)
+
+A `retract` line supersedes a prior ledger line without editing or deleting
+it. A superseded line is not searchable on the agent path and is absent from
+`allowlist`, so it never enters the QMD corpus; `find --for-operator` still
+shows it. A retraction line is searchable only when its own ID tokens **and
+its target line** are allowed. Without that second gate the ref would be a
+hash oracle: an agent could test a guess about a hidden line. A retracted
+line whose target is hidden therefore stays hidden with it.
+
+A `retired: true` record is not in the cleared set. It and records/lines that
+name it are omitted from agent `find`, `context`, `resolve`, `alias resolve`,
+and `record list`; `context` returns no bundle for a retired target. This is
+the same fail-closed posture as `no-ai: true`, not a separate privacy mode:
+retiring a record also removes its notes, interactions, deals, and edges from
+agent reads. The operator path still sees them (`--for-operator`,
+`record show --for-edit`), and `check` still validates the file.
+
+The line refs (`line:<64 hex>`) are opaque values derived from the line's
+canonical bytes. They are never echoed for an uncleared target; the short
+form may appear in operator-facing `check` messages. A correction or
+retirement changes the cleared set, so rebuild the local QMD corpus
+(`qmd-index.py`) before relying on ranked search.
+
 ## Ledger lines
 
-Ledger lines are searchable only when every ID on the line is cleared. A note,
-interaction, or deal is cleared only when every ledger line that names it is
-allowed; this does not apply to persons.
+Ledger lines are searchable only when every ID on the line is cleared. A
+superseded line is not searchable, and a superseded line does not gate a note,
+interaction, or deal it named. A note, interaction, or deal is cleared only
+when every effective ledger line that names it is allowed; this does not
+apply to persons.
 
 ## TUI proposal review
 
@@ -141,7 +209,7 @@ tokens. Near-ULID bare runs are not IDs.
 - Name-only prose.
 - `check`'s location field still shows the paths of invalid files.
 
-`context` honours `no-ai` on the same terms as `find`.
+`context` honours `no-ai` on the same terms as `find`; a non-person-like pack entity that is uncleared gets no agent bundle at all.
 
 ## Pack scoping (issue #178)
 
@@ -183,6 +251,22 @@ Rules:
   filter by scope. `qmd-query.py --packs LIST` passes the scope to the
   verification and fallback `find` calls; the QMD index itself is
   unscoped and the `find` verification is the enforcement point.
+- **Pack-declared record types are pack-owned (spec 0.3).** A record whose
+  `type:` is declared by a pack is visible only while that type is enabled
+  and its declaring pack is in scope. The type declaration is the gate: an
+  agent read returns nothing for a record of a disabled, retired, or
+  undeclared type, even if the record file itself is readable. There is no
+  per-record field-level split for a pack type; the whole record follows its
+  type's owner. Core person/org/deal remain core-owned. The operator path
+  (`record list --for-operator`, or loading the vault for an operator-only
+  command) surfaces orphans with a badge, so a disabled pack's records do
+  not become invisible to the person who must clean them up.
+- **`context` targets an entity type.** A pack type is a context target only
+  when its declaration sets `entity = true`; a `person_like` type also gets
+  person read semantics (aliases, touchpoints, and a person-shaped pack
+  view). Notes and interactions attach through `entity:`, `person:`, or
+  `org:`; they keep their own pack ownership, so a scoped agent sees only
+  the attachments its scope allows even when the target entity is visible.
 - **Shared interactions**: the pack that wrote an interaction decides
   its visibility (#179 settled the mechanics).
 - **Edges**: an edge is visible exactly when its kind's pack is in scope
@@ -193,10 +277,12 @@ Rules:
 
 ## Edges (issue #179)
 
-An edge record carries only ids, kind, and dates — no body, no note.
-Sensitive context belongs in a note on one of the edge's people, where the
-`no-ai` rules above decide who may read it. Because an edge holds no prose,
-it can be visible while the interesting detail stays hidden.
+An edge record carries only ids, kind, dates, and (in 0.3) `no-ai` — no body,
+no note. Sensitive context belongs in a note on one of the edge's entities,
+where the `no-ai` rules above decide who may read it. Because an edge holds
+no prose, it can be visible while the interesting detail stays hidden; a
+`no-ai: true` edge instead hides the relation while both endpoints stay
+visible.
 
 A person's own touchpoints stay in the ledger as opaque-id lines. A `touch`
 line carries a date, one opaque id, and a kind: no other participant, no
@@ -234,3 +320,7 @@ reports `staleness check disabled`.
 `CONFIDANT_OFFLINE=1` opt-out) to decide whether the local binary is behind
 the latest release. When behind, `update` re-links nothing and tells you to
 upgrade the binary first.
+
+`confidant status` makes the same request (same endpoint, same
+`CONFIDANT_OFFLINE=1` opt-out) as part of its readiness rollup, which reuses
+the doctor staleness check.

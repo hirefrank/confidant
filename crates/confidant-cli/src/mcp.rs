@@ -156,31 +156,13 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "context",
-            "Context bundle for one person. Honors no-ai; private data is stripped by default. Honors the connection's pack scope; an optional packs list can only narrow it.",
+            "Context bundle for one entity: a person, an org, or a record of a pack-declared entity type. Honors no-ai; private data is stripped by default. Honors the connection's pack scope; an optional packs list can only narrow it.",
             obj(
                 &["person"],
                 json!({
-                    "person": str_prop("Opaque person id (p-…)."),
+                    "person": str_prop("Opaque entity id (p-…, o-…, or a declared pack type id)."),
                     "exclude_private": {"type": "boolean", "description": "Strip name, profile, and bodies. Default true: private data is stripped unless explicitly set to false."},
                     "packs": {"type": "array", "items": {"type": "string"}, "description": "Pack scope for this call (subset of the connection's scope). Unset = the connection's scope."},
-                }),
-            ),
-        ),
-        tool(
-            "log_session",
-            "Append a session ledger line. One commit; check-gated.",
-            obj(
-                &["person", "duration"],
-                json!({
-                    "person": str_prop("Opaque person id (p-…)."),
-                    "duration": str_prop("Like 60m or 1h30m."),
-                    "tag": str_prop("Billing tag: paid, pps, or comp."),
-                    "date": str_prop("YYYY-MM-DD; default today."),
-                    "note": str_prop("Session note text; creates a note record."),
-                    "src": str_prop("Source token."),
-                    "request_id": str_prop("Idempotency key."),
-                    "dry_run": {"type": "boolean", "description": "Show the logical change only."},
-                    "force": {"type": "boolean", "description": "Log even when an identical session is already in the ledger; use only for a genuinely separate session the same day."},
                 }),
             ),
         ),
@@ -215,18 +197,21 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "note_add",
-            "Create a note record under people/<person>/notes/. One commit; check-gated.",
-            obj(
-                &["person", "body_file"],
-                json!({
+            "Create a note record under people/<person>/notes/ or notes/<id>/note.md. One commit; check-gated.",
+            json!({
+                "type": "object",
+                "required": ["body_file"],
+                "oneOf": [{"required": ["person"]}, {"required": ["entity"]}],
+                "properties": {
                     "person": str_prop("Opaque person id (p-…)."),
+                    "entity": str_prop("Opaque entity id (p-…, o-…, or a declared pack type id); writes a top-level entity note."),
                     "body_file": str_prop("Path to a file holding the note body."),
                     "date": str_prop("YYYY-MM-DD; default today."),
                     "no_ai": {"type": "boolean", "description": "Mark the note no-ai."},
                     "request_id": str_prop("Idempotency key."),
                     "dry_run": {"type": "boolean", "description": "Show the logical change only."},
-                }),
-            ),
+                },
+            }),
         ),
         tool(
             "schema",
@@ -342,28 +327,6 @@ fn build_argv(
             cli.push("--".to_owned());
             cli.push(get_str(args, "person")?);
         }
-        "log_session" => {
-            cli.push("log".to_owned());
-            cli.push("session".to_owned());
-            cli.push(get_str(args, "person")?);
-            cli.push(get_str(args, "duration")?);
-            if let Some(t) = opt_str(args, "tag") {
-                cli.push(t);
-            }
-            for (flag, key) in [("--date", "date"), ("--note", "note"), ("--src", "src")] {
-                if let Some(v) = opt_str(args, key) {
-                    cli.push(flag.to_owned());
-                    cli.push(v);
-                }
-            }
-            // #747 review: MCP is the agent surface, so it needs the
-            // same escape hatch the CLI has — otherwise a legitimate
-            // same-day repeat is loggable from the CLI and impossible
-            // from MCP.
-            if get_bool(args, "force") {
-                cli.push("--force".to_owned());
-            }
-        }
         "log_touch" => {
             cli.push("log".to_owned());
             cli.push("touch".to_owned());
@@ -387,8 +350,19 @@ fn build_argv(
         "note_add" => {
             cli.push("note".to_owned());
             cli.push("add".to_owned());
-            cli.push("--person".to_owned());
-            cli.push(get_str(args, "person")?);
+            let person = opt_str(args, "person");
+            let entity = opt_str(args, "entity");
+            match (person, entity) {
+                (Some(person), None) => {
+                    cli.push("--person".to_owned());
+                    cli.push(person);
+                }
+                (None, Some(entity)) => {
+                    cli.push("--entity".to_owned());
+                    cli.push(entity);
+                }
+                _ => return Err("note_add needs exactly one of `person` or `entity`".to_owned()),
+            }
             cli.push("--body-file".to_owned());
             cli.push(get_str(args, "body_file")?);
             if let Some(d) = opt_str(args, "date") {
@@ -516,6 +490,13 @@ mod tests {
             "edit",
             "list",
             "resolve",
+            "retract",
+            "correct",
+            "record_retire",
+            "record_unretire",
+            "retract_line",
+            "correct_line",
+            "retire",
         ] {
             assert!(
                 !names.contains(&forbidden),
@@ -691,45 +672,36 @@ mod tests {
         }
     }
 
-    /// #747 review: both log tools carry the `--force` escape hatch the
-    /// CLI has — MCP is the agent surface, so a legitimate same-day
-    /// repeat must be loggable from it, and the flag must be absent
-    /// unless the caller explicitly sets it.
+    /// #747 review: `log_touch` carries the `--force` escape hatch the CLI
+    /// has — MCP is the agent surface, so a legitimate same-day repeat must
+    /// be loggable from it, and the flag must be absent unless the caller
+    /// explicitly sets it.
     #[test]
-    fn mcp_passes_force_to_log_tools_only_when_set() {
+    fn mcp_passes_force_to_log_touch_only_when_set() {
         let vault = Path::new("/tmp/vault");
-        for (name, args) in [
-            (
-                "log_session",
-                json!({"person": "p-01ABC", "duration": "60m", "force": true}),
-            ),
-            (
-                "log_touch",
-                json!({"person": "p-01ABC", "kind": "meal", "force": true}),
-            ),
-        ] {
-            let argv = build_argv(name, &args, vault, &None).unwrap();
-            assert!(
-                argv.iter().any(|a| a == "--force"),
-                "{name} dropped force: {argv:?}"
-            );
-        }
-        for (name, args) in [
-            (
-                "log_session",
-                json!({"person": "p-01ABC", "duration": "60m"}),
-            ),
-            (
-                "log_touch",
-                json!({"person": "p-01ABC", "kind": "meal", "force": false}),
-            ),
-        ] {
-            let argv = build_argv(name, &args, vault, &None).unwrap();
-            assert!(
-                !argv.iter().any(|a| a == "--force"),
-                "{name} passed force unasked: {argv:?}"
-            );
-        }
+        let argv = build_argv(
+            "log_touch",
+            &json!({"person": "p-01ABC", "kind": "meal", "force": true}),
+            vault,
+            &None,
+        )
+        .unwrap();
+        assert!(
+            argv.iter().any(|a| a == "--force"),
+            "log_touch dropped force: {argv:?}"
+        );
+
+        let argv = build_argv(
+            "log_touch",
+            &json!({"person": "p-01ABC", "kind": "meal", "force": false}),
+            vault,
+            &None,
+        )
+        .unwrap();
+        assert!(
+            !argv.iter().any(|a| a == "--force"),
+            "log_touch passed force unasked: {argv:?}"
+        );
     }
 
     #[test]
@@ -750,7 +722,6 @@ mod tests {
             "check",
             "find",
             "context",
-            "log_session",
             "log_touch",
             "import_ledger",
             "note_add",
@@ -760,6 +731,10 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
+        assert!(
+            !names.contains(&"log_session"),
+            "log_session must not be exposed: {names:?}"
+        );
     }
 
     #[test]
@@ -804,6 +779,86 @@ mod tests {
         // Non-boolean values fail closed toward stripping.
         assert!(context_strips_private(&json!({"exclude_private": "yes"})));
         assert!(context_strips_private(&json!({"exclude_private": 1})));
+    }
+
+    /// #813: the existing `person` parameter carries an org id unchanged;
+    /// no second tool or parameter is needed.
+    #[test]
+    fn context_argv_accepts_an_org_id() {
+        let org = "o-01M3TC5H00MPJG000000000901";
+        let argv = build_argv(
+            "context",
+            &json!({"person": org, "exclude_private": true}),
+            Path::new("/tmp/vault"),
+            &None,
+        )
+        .unwrap();
+        assert_eq!(argv.first().map(String::as_str), Some("--json"));
+        assert!(argv.iter().any(|arg| arg == org), "{argv:?}");
+        assert!(
+            argv.iter().any(|arg| arg == "--exclude-private"),
+            "{argv:?}"
+        );
+        assert!(!argv.iter().any(|arg| arg == "--for-operator"), "{argv:?}");
+    }
+
+    /// #814: `note_add` can attach to any entity with `entity:`, while the
+    /// original `person` parameter keeps working unchanged.
+    #[test]
+    fn note_add_argv_accepts_person_or_entity() {
+        let vault = Path::new("/tmp/vault");
+        let person = build_argv(
+            "note_add",
+            &json!({"person": "p-01ABC", "body_file": "/tmp/body.md"}),
+            vault,
+            &None,
+        )
+        .unwrap();
+        assert!(person.iter().any(|arg| arg == "--person"), "{person:?}");
+        assert!(!person.iter().any(|arg| arg == "--entity"), "{person:?}");
+        let entity = build_argv(
+            "note_add",
+            &json!({"entity": "pl-01ABC", "body_file": "/tmp/body.md"}),
+            vault,
+            &None,
+        )
+        .unwrap();
+        assert!(entity.iter().any(|arg| arg == "--entity"), "{entity:?}");
+        assert!(!entity.iter().any(|arg| arg == "--person"), "{entity:?}");
+        for args in [
+            json!({"body_file": "/tmp/body.md"}),
+            json!({"person": "p-01ABC", "entity": "pl-01ABC", "body_file": "/tmp/body.md"}),
+        ] {
+            let err = build_argv("note_add", &args, vault, &None).unwrap_err();
+            assert!(err.contains("exactly one"), "{err}");
+        }
+    }
+
+    /// #814: the exposed note_add schema advertises both subjects and
+    /// requires exactly one; the context description names pack entity types.
+    #[test]
+    fn entity_tools_describe_pack_types() {
+        let listed = tools();
+        let note = listed
+            .iter()
+            .find(|tool| tool["name"] == "note_add")
+            .unwrap();
+        assert!(note["inputSchema"]["properties"]["entity"].is_object());
+        assert_eq!(
+            note["inputSchema"]["oneOf"],
+            json!([{"required": ["person"]}, {"required": ["entity"]}])
+        );
+        let context = listed
+            .iter()
+            .find(|tool| tool["name"] == "context")
+            .unwrap();
+        assert!(
+            context["description"]
+                .as_str()
+                .unwrap()
+                .contains("pack-declared entity type"),
+            "{context}"
+        );
     }
 
     #[test]

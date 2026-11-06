@@ -23,7 +23,15 @@ but narrower than it sounds.
   allowlist, or the search corpus — in either the CLI or MCP (though
   `context` still serves the person's derived ledger metadata; see
   `docs/privacy.md`).
+- An edge appears in a context bundle only when both endpoints are cleared
+  **and** the edge is not `no-ai: true`. A `no-ai: true` endpoint or edge
+  drops the relation from every bundle, including the other endpoint's; it is
+  not counted or anonymized (#813, #820). Both endpoints stay visible when
+  only the edge is hidden.
 - `no-ai` does not hide a record from the vault's owner.
+- An MCP agent cannot retract, correct, or retire anything: the tool list
+  has no such call. A correction is a new, visible, attributed ledger line;
+  a retired record leaves agent reads but stays on disk.
 - `check` blocks a commit on errors, never on warnings, and verifies
   coherence, not truthfulness.
 - Ledger lines are plaintext in the vault, as is every other file.
@@ -38,9 +46,9 @@ server configured) works through one fixed tool list.
 
 | Can | Cannot | Enforced by |
 |---|---|---|
-| Call 10 tools: `check`, `find`, `context`, `log_session`, `log_touch`, `import_ledger`, `note_add`, `schema`, `doctor`, `pack_skill` | Call any other tool, or grant itself a new capability | `tools()` in `crates/confidant-cli/src/mcp.rs` — the list is a literal in the binary |
-| Read a person's context bundle, with private data stripped by default | Read private data silently — it must pass `exclude_private: false`, which is visible in its own tool call | `context_strips_private()` in `crates/confidant-cli/src/mcp.rs` |
-| Append a session or touchpoint line, bulk-append ledger lines, or add a note — one commit each, gated by `check` | Write without `check`, or skip the commit | `crates/confidant-core/src/write.rs` — change → `check` → one `git add` + `git commit`; a failing check rolls the files back |
+| Call 9 tools: `check`, `find`, `context`, `log_touch`, `import_ledger`, `note_add`, `schema`, `doctor`, `pack_skill` | Call any other tool (including retract/correct/retire), or grant itself a new capability | `tools()` in `crates/confidant-cli/src/mcp.rs` — the list is a literal in the binary |
+| Read a person's or org's context bundle, with private data stripped by default | Read private data silently — it must pass `exclude_private: false`, which is visible in its own tool call | `context_strips_private()` in `crates/confidant-cli/src/mcp.rs` |
+| Append a touchpoint line, bulk-append ledger lines (including a pack's own verb such as `session`), or add a note — one commit each, gated by `check` | Write without `check`, or skip the commit | `crates/confidant-core/src/write.rs` — change → `check` → one `git add` + `git commit`; a failing check rolls the files back |
 | Pass `exclude_private: false` and read private data | Be stopped from doing so by any vault setting — no vault config removes the opt-out | Current behavior; see Known gaps |
 
 There are **no per-agent scopes and no agent identity** in the MCP server.
@@ -105,9 +113,11 @@ trusted devices.
 ### `no-ai`: an exposure control, not access control
 
 `no-ai` is a per-record flag in the record's YAML front matter
-(`no-ai: true`, or `no-ai: notes` on a person), read by
-`crates/confidant-core/src/search.rs`. A record's effective flag is its own
-flag **or** its person's flag — "any `true` wins".
+(`no-ai: true`, or `no-ai: notes` on a person; an edge accepts only
+`true` / `false`), read by `crates/confidant-core/src/search.rs`. A record's
+effective flag is its own flag **or** its person's flag — "any `true` wins".
+An edge has only its own flag: hiding it does not hide either endpoint, and a
+hidden endpoint still hides every edge touching it.
 
 What it does: a `no-ai` record's content never appears in `find` (filter in
 `crates/confidant-core/src/search.rs`), in `context` (which shows a `no-ai`
@@ -145,6 +155,26 @@ What it does not do:
   a readable file, so anyone who can read the file learns that the record is
   marked — though the read surfaces still withhold its content.
 
+### Corrections and retirement: compensating entries, not rewrites
+
+Spec 0.4 adds `confidant retract` and `confidant correct` (CLI-only, never
+MCP tools) and `confidant record retire|unretire`. A retraction is a new
+dated ledger line that supersedes a prior line by content-hash ref; the
+target is never edited or deleted. Readers use an effective view:
+current-state rules apply every valid retraction, while a `balance`
+assertion dated D applies only retractions dated on or before D. Findings on
+a retracted target are suppressed, so a correction can clear a check error —
+but the retraction is visible and attributed, and the original line stays in
+git history.
+
+A retired record (`retired: true`) is not an entity for any read: it and its
+dependents leave agent `find`, `context`, `resolve`, `alias resolve`, and
+`record list`. The operator path still sees it; `context` returns no bundle
+for a retired target. `check` still validates the file. The refs are opaque;
+a retraction line is visible to agents only when its target line is, which
+prevents a hash oracle over a hidden line. A correction or retirement changes
+the cleared set, so the QMD corpus must be rebuilt before ranked search.
+
 ### `check`: coherence, not truthfulness
 
 `check` runs after a change and before the commit, on the merged result.
@@ -172,7 +202,10 @@ vault, and every write rolls back on a failing check (#209).
    agents that don't ask; it does not constrain an agent that does.
 2. **Direct writes commit with no human review.** MCP and CLI writes commit
    as soon as `check` passes. Proposal review — see, approve, or reject
-   agent-proposed changes before main — is future work (#191).
+   agent-proposed changes before main — is future work (#191). This includes
+   `retract`/`correct`/`record retire`: an agent with a shell can run them
+   even though MCP cannot. The commit is attributed and the correction is
+   visible, but there is no approval step.
 3. **`check` verifies coherence, not truth.** A well-formed false fact
    passes.
 4. **Every file is readable to anyone with repo access**, ledger lines

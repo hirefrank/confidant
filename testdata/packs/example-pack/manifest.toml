@@ -41,7 +41,7 @@ finding_codes = [
 name = "example-pack"
 version = "0.1"
 skill = "SKILL.md"
-requires_spec = ["0.1"]
+requires_spec = ["0.1", "0.2"]
 
 [[verbs]]
 name = "grant"
@@ -64,6 +64,15 @@ grammar = "non-empty-string"
 [[edge_kinds]]
 name = "ally"
 symmetric = true
+
+# A directed org→person kind (#813): exercises an explicit endpoint
+# declaration. The endpoint arrays are optional; absent means the
+# historical person↔person rule (as for `ally` above).
+[[edge_kinds]]
+name = "backs"
+symmetric = false
+from = ["org"]
+to = ["person"]
 
 # Opt in to the core `ledger-sessions` context view. The view's verbs and
 # metrics come from the single `ledger-balance` rule below.

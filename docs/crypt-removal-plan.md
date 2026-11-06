@@ -1,6 +1,6 @@
 # Technical Specification: `confidant-crypt` Removal (Plaintext-Only Confidant) — v2
 
-**Status:** Approved for Execution (revision 2 — no migration)
+**Status:** Complete (implemented in #801, 2026-11-01; retained as the design record)
 **Target Repository:** `confidant` (Rust workspace + Python `qmd-search` skill)
 **Operator Context:** Single operator, solo maintainer. The existing encrypted vault has **no value to preserve** — it can be rebuilt by hand with `confidant init` after the crypto removal lands. Backward compatibility with encrypted vaults is **not** required.
 
@@ -215,7 +215,7 @@ This is not documentation polishing; it is the format/privacy change hard rules 
 
 **Root `AGENTS.md`:** rewrite hard rules 4 ("never log secrets", crypto half), 6 ("crypto changes need review", obsolete once removed), and the intro line "Client content is meant to be encrypted at rest once milestone 2 lands". Update the repo map's `confidant-crypt` row (delete it), the `crypto-design.md` references, and the "Crypto changes need review first" workflow.
 
-**Agent contract — fold in #797 (legacy `coaching` key).** The legacy top-level `coaching` key in `context`/`resolve` (`main.rs:7511` `bundle.coaching`, `schema.rs:206` `required` key, spec §8 sentence) is removed as part of this same ADR-7 contract bump — it is the same "clean up the agent contract" work and edits the same `schema.rs`. Tracked in #797. The *functional* `session`-verb / `log session` remnants are tracked separately in #799 (their final shape depends on #796).
+**Agent contract — fold in #797 (legacy `coaching` key).** The legacy top-level `coaching` key in `context`/`resolve` (`main.rs:7511` `bundle.coaching`, `schema.rs:206` `required` key, spec §8 sentence) is removed as part of this same ADR-7 contract bump — it is the same "clean up the agent contract" work and edits the same `schema.rs`. Tracked in #797. The *functional* `session`-verb / `log session` remnants were removed in #799 step 2: the pack `session` verb and its rule kinds remain, and a pack logs it through `import --file`.
 
 **`contrib/sync/` templates:** drop `E_PLAINTEXT_REMOTE` and keychain-unlock caveats from `confidant-sync.service` and `com.kitchenrodeo.confidant.sync.plist`.
 
@@ -225,15 +225,33 @@ This is not documentation polishing; it is the format/privacy change hard rules 
 
 ## 8. Acceptance Criteria
 
-- [ ] `cargo check --workspace --all-targets` and `cargo clippy --workspace --all-targets -- -D warnings` pass with zero warnings.
-- [ ] `crates/confidant-crypt` is gone; `Cargo.lock` contains no `age` or `crypto-bigint`.
-- [ ] `cargo test --workspace --all-features --locked` passes 100%.
-- [ ] `python3 -m unittest discover -s crates/confidant-cli/skills/qmd-search/tests -p 'test_*.py'` passes 100%.
-- [ ] Extracted `qmd-search/bin/*.py` are `0755` after `confidant setup`.
-- [ ] `no-ai: true` / `no-ai: notes` records remain excluded from `find`, `context`, `show` (agent mode), `allowlist`, MCP tools, and `qmd-search`.
-- [ ] `confidant sync --push` succeeds against any configured `origin` with no `E_PLAINTEXT_REMOTE`.
-- [ ] `spec/0.1.md`, `spec/findings.md`, `docs/`, `README.md`, and root `AGENTS.md` contain no encryption-envelope references, and `confidant check --json --no-input --vault examples/demo-vault` is `ok:true`.
-- [ ] `crypto-review` issue #795 (from §3) is linked by `Part of #795` on every deletion PR.
+- [x] `cargo check --workspace --all-targets` and `cargo clippy --workspace --all-targets -- -D warnings` pass with zero warnings.
+- [x] `crates/confidant-crypt` is gone; `Cargo.lock` contains no `age` or `crypto-bigint`.
+- [x] `cargo test --workspace --all-features --locked` passes 100%.
+- [x] `python3 -m unittest discover -s crates/confidant-cli/skills/qmd-search/tests -p 'test_*.py'` passes 100% (73 tests).
+- [x] Extracted `qmd-search/bin/*.py` are `0755` after `confidant setup`.
+- [x] `no-ai: true` / `no-ai: notes` records remain excluded from `find`, `context`, `show` (agent mode), `allowlist`, MCP tools, and `qmd-search`.
+- [x] `confidant sync --push` succeeds against any configured `origin` with no `E_PLAINTEXT_REMOTE`.
+- [x] The live contract (`spec/0.1.md`, `docs`, `README.md`, root `AGENTS.md`) contains no encryption-envelope claims, and `confidant check --json --no-input --vault examples/demo-vault` is `ok:true` (0 errors, 2 expected warnings). Retired codes stay reserved in `spec/findings.md`, and historical notes remain in ADR-4/ADR-15 and `docs/research/`.
+- [x] The `crypto-review` issue #795 (from §3) is linked from the deletion PR (#801 used `Fixes #795`).
+
+### Closeout notes (2026-11-01)
+
+Merged as #801 (`4579b73`), on top of #807's date-pin fix. Deliberate
+deviations from the text above:
+
+- Retired finding codes stay listed in `spec/findings.md` under "Retired, not
+  emitted, never reused" instead of being deleted; the repo's stable-code
+  rule forbids reusing them.
+- `spec/0.1.md` keeps a short tombstone paragraph for `[crypto]` and
+  `[inbox]` so older vaults know they are ignored, rather than being silent.
+- `sha2` remains a dependency because pack tree hashing still uses it.
+- Historical references remain in ADR-4's alternatives, the withdrawn ADR-15,
+  `docs/research/cr-spike.md`, and this plan; they are history, not live
+  contract.
+
+Remaining post-plan work (legacy encrypted-vault refusal, the spec 0.1 vs
+0.2 decision, and the crates.io `confidant-crypt` yank) is tracked in #809.
 
 ---
 

@@ -1,0 +1,36 @@
+manifest_version = 3
+
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER"]
+
+[pack]
+name = "place-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.3"]
+
+[[record_types]]
+name = "place"
+id_prefix = "pl"
+collection = "places"
+main_file = "place.md"
+entity = true
+person_like = false
+no_ai = "full"
+roster = true
+required_fields = ["name"]
+optional_fields = ["address"]
+
+[[fields]]
+name = "address"
+grammar = "non-empty-string"
+
+[[edge_kinds]]
+name = "visited"
+symmetric = false
+from = ["person"]
+to = ["place"]
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"

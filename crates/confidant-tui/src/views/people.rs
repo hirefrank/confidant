@@ -278,6 +278,12 @@ fn nudge_row<'a>(nudge: &'a Nudge, roster: Option<&Roster>) -> ListItem<'a> {
 }
 
 fn person_row(entry: &RosterEntry) -> ListItem<'_> {
+    ListItem::new(person_line(entry))
+}
+
+/// The roster row's line, split out so tests can assert the retired badge
+/// without a terminal.
+fn person_line(entry: &RosterEntry) -> Line<'_> {
     let mut spans = vec![Span::styled(entry.name.clone(), palette::TEXT)];
     if let Some(badge) = entry.no_ai.badge() {
         spans.push(Span::raw(" "));
@@ -286,11 +292,18 @@ fn person_row(entry: &RosterEntry) -> ListItem<'_> {
             Style::default().fg(palette::WARNING).bold(),
         ));
     }
+    if entry.retired {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "[retired]",
+            Style::default().fg(palette::WARNING).bold(),
+        ));
+    }
     if entry.name != entry.id {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(entry.id.clone(), theme::muted()));
     }
-    ListItem::new(Line::from(spans))
+    Line::from(spans)
 }
 
 /// A dim placeholder used by the right pane before a roster is loaded.
@@ -369,5 +382,22 @@ mod tests {
         assert_eq!(filtered_entries(Some(&roster), "P-01").len(), 1);
         assert_eq!(filtered_entries(Some(&roster), "").len(), 2);
         assert!(filtered_entries(Some(&roster), "zzz").is_empty());
+    }
+
+    #[test]
+    fn retired_entry_renders_the_operator_badge() {
+        let entry = RosterEntry {
+            id: "p-03".to_owned(),
+            name: "Retired Example".to_owned(),
+            retired: true,
+            ..RosterEntry::default()
+        };
+        let text: String = person_line(&entry)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("[retired]"), "{text}");
+        assert!(!text.contains("[no-ai]"), "{text}");
     }
 }

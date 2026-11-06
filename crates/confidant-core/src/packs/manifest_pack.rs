@@ -20,6 +20,7 @@ use crate::packs::groups::MergeGroups;
 use crate::packs::manifest::{PackManifest, PackOrigin};
 use crate::packs::rules::ledger::{self, LedgerFacts};
 use crate::packs::{EdgeKind, Pack, PackState};
+use crate::record_type::{NoAiPolicy, RecordTypeDecl, TypeOwner};
 use crate::vault::{SourcedEntry, Vault};
 use chrono::NaiveDate;
 
@@ -42,6 +43,7 @@ pub struct ManifestPack {
     verbs: &'static [&'static str],
     verb_id_types: Vec<(&'static str, Prefix)>,
     record_types: &'static [&'static str],
+    record_type_decls: &'static [RecordTypeDecl],
     fields: &'static [&'static str],
     balance_metrics: &'static [&'static str],
     balance_open_verbs: &'static [&'static str],
@@ -85,12 +87,51 @@ pub(crate) fn build_manifest_pack(
     let verb_id_types: Vec<(&'static str, Prefix)> = manifest
         .verbs
         .iter()
-        .filter_map(|v| v.id_type.map(|p| (leak_str(v.name.clone()), p)))
+        .filter_map(|v| {
+            let id_type = v.id_type.as_ref()?;
+            let prefix = manifest.type_prefix(id_type)?;
+            Some((leak_str(v.name.clone()), prefix))
+        })
         .collect();
     let record_types: Vec<&'static str> = manifest
         .record_types
         .iter()
         .map(|r| leak_str(r.clone()))
+        .collect();
+    let record_type_decls: Vec<RecordTypeDecl> = manifest
+        .record_types
+        .decls
+        .iter()
+        .map(|decl| {
+            let prefix = Prefix::parse(&decl.id_prefix)
+                .expect("record type prefix validated at manifest load");
+            let required: Vec<&'static str> = decl
+                .required_fields
+                .iter()
+                .map(|f| leak_str(f.clone()))
+                .collect();
+            let optional: Vec<&'static str> = decl
+                .optional_fields
+                .iter()
+                .map(|f| leak_str(f.clone()))
+                .collect();
+            RecordTypeDecl {
+                name: leak_str(decl.name.clone()),
+                id_prefix: leak_str(decl.id_prefix.clone()),
+                prefix,
+                collection: leak_str(decl.collection.clone()),
+                main_file: leak_str(decl.main_file.clone()),
+                entity: decl.entity,
+                person_like: decl.person_like,
+                no_ai: NoAiPolicy::parse(&decl.no_ai).expect("no_ai validated at manifest load"),
+                roster: decl.roster.unwrap_or(decl.entity),
+                required_fields: Box::leak(required.into_boxed_slice()),
+                optional_fields: Box::leak(optional.into_boxed_slice()),
+                owner: TypeOwner::Pack(name),
+                enabled: true,
+                retired: false,
+            }
+        })
         .collect();
     let fields: Vec<&'static str> = manifest
         .fields
@@ -109,12 +150,35 @@ pub(crate) fn build_manifest_pack(
         .filter_map(|r| r.params.get("open_verb").and_then(|v| v.as_str()))
         .map(|v| leak_str(v.to_owned()))
         .collect();
+    // `validate_edge_endpoints` already refused unknown types, so the
+    // conversion below cannot see one. Absent declarations keep the
+    // historical person↔person rule.
+    let endpoint_slice = |names: &[String]| -> &'static [Prefix] {
+        let prefixes: Vec<Prefix> = names
+            .iter()
+            .map(|name| {
+                manifest
+                    .type_prefix(name)
+                    .expect("edge endpoint type validated at manifest load")
+            })
+            .collect();
+        Box::leak(prefixes.into_boxed_slice())
+    };
+    let person_only: &'static [Prefix] = crate::packs::PERSON_ENDPOINT;
     let edge_kinds: Vec<EdgeKind> = manifest
         .edge_kinds
         .iter()
-        .map(|e| EdgeKind {
-            name: leak_str(e.name.clone()),
-            symmetric: e.symmetric,
+        .map(|e| {
+            let (from, to) = match (&e.from, &e.to) {
+                (Some(from), Some(to)) => (endpoint_slice(from), endpoint_slice(to)),
+                _ => (person_only, person_only),
+            };
+            EdgeKind {
+                name: leak_str(e.name.clone()),
+                symmetric: e.symmetric,
+                from,
+                to,
+            }
         })
         .collect();
     let finding_codes: Vec<&'static str> = manifest
@@ -135,6 +199,7 @@ pub(crate) fn build_manifest_pack(
         verbs: Box::leak(verbs.into_boxed_slice()),
         verb_id_types,
         record_types: Box::leak(record_types.into_boxed_slice()),
+        record_type_decls: Box::leak(record_type_decls.into_boxed_slice()),
         fields: Box::leak(fields.into_boxed_slice()),
         balance_metrics: Box::leak(balance_metrics.into_boxed_slice()),
         balance_open_verbs: Box::leak(balance_open_verbs.into_boxed_slice()),
@@ -157,8 +222,20 @@ impl Pack for ManifestPack {
         self.record_types
     }
 
+    fn record_type_decls(&self) -> &'static [RecordTypeDecl] {
+        self.record_type_decls
+    }
+
     fn fields(&self) -> &'static [&'static str] {
         self.fields
+    }
+
+    fn field_grammar(&self, field: &str) -> Option<&'static str> {
+        self.manifest
+            .fields
+            .iter()
+            .find(|decl| decl.name == field)
+            .map(|decl| decl.grammar.as_str())
     }
 
     fn balance_metrics(&self) -> &'static [&'static str] {
@@ -175,34 +252,6 @@ impl Pack for ManifestPack {
 
     fn finding_codes(&self) -> &'static [&'static str] {
         self.finding_codes
-    }
-
-    /// #747 round 3: the pack's `session-checks` billing tags for verb
-    /// `session`, in rule order, deduplicated. Malformed entries
-    /// (missing/non-array/non-string tags, a rule for another verb)
-    /// contribute nothing here — manifest validation rejects them
-    /// elsewhere, and log-time validation must not crash on them.
-    fn session_billing_tags(&self) -> Vec<String> {
-        let mut tags: Vec<String> = Vec::new();
-        for rule in &self.manifest.rules {
-            if rule.kind != "session-checks" {
-                continue;
-            }
-            if rule.params.get("verb").and_then(|v| v.as_str()) != Some("session") {
-                continue;
-            }
-            let Some(list) = rule.params.get("billing_tags").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            for tag in list {
-                if let Some(tag) = tag.as_str() {
-                    if !tag.trim().is_empty() && !tags.contains(&tag.to_string()) {
-                        tags.push(tag.to_string());
-                    }
-                }
-            }
-        }
-        tags
     }
 
     /// `verb → id-type` constraints from the manifest's `[[verbs]]`.
@@ -318,12 +367,28 @@ impl Pack for ManifestPack {
         as_of: NaiveDate,
     ) -> Option<serde_json::Value> {
         if self.serves_core_personal_view() {
+            // #799: contact verbs are the pack's declaration, not a literal
+            // `touch`/`session` pair in core. The loader requires a
+            // `cadence-overdue` rule with non-empty `event_verbs` for the
+            // personal manifest, so this list is non-empty in practice; an
+            // empty fallback keeps the view valid if a future manifest
+            // shape ever reaches here without one.
+            let event_verbs: Vec<&str> = self
+                .manifest
+                .rules
+                .iter()
+                .find(|rule| rule.kind == "cadence-overdue")
+                .and_then(|rule| rule.params.get("event_verbs"))
+                .and_then(|value| value.as_array())
+                .map(|verbs| verbs.iter().filter_map(|value| value.as_str()).collect())
+                .unwrap_or_default();
             return crate::context::personal::build_personal_view(
                 vault,
                 person,
                 canonical,
                 as_of,
                 &self.manifest.fields,
+                &event_verbs,
             );
         }
         let params = self.context_params.as_ref()?;
@@ -356,11 +421,11 @@ impl Pack for ManifestPack {
     }
 
     /// #594: a declarative pack that declares `[context]` serves the core
-    /// `ledger-sessions` view. The legacy `coaching` alias is tied to the
-    /// base name `coaching` (`context` matches it), so this only makes the
-    /// coaching pack the alias — a `[context]` pack under another name serves
-    /// its own `packs` entry only. The built-in personal pack serves its own
-    /// view, so it is never the alias.
+    /// `ledger-sessions` view. The legacy "coaching" compatibility alias is
+    /// keyed on that base name (`context` matches it), so only a pack named
+    /// `coaching` populates it — a `[context]` pack under another name
+    /// serves its own `packs` entry only. The built-in personal pack serves
+    /// its own view, so it is never the alias.
     fn context_view_kind(&self) -> Option<&'static str> {
         if self.serves_core_personal_view() {
             return None;
@@ -393,115 +458,5 @@ pub struct ManifestState {
 impl PackState for ManifestState {
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::packs::manifest::parse_manifest_compiled_in;
-    use crate::packs::Pack;
-
-    /// A v2 manifest whose `session-checks` rule bills under different
-    /// tags than the core default, plus a second `session-checks` rule
-    /// for another verb that must not change `log session` validation.
-    fn session_pack() -> &'static ManifestPack {
-        let text = r#"manifest_version = 2
-record_types = []
-balance_metrics = []
-finding_codes = ["E_SESS_DURATION", "E_SESS_TAGS", "W_SESS_UNTAGGED", "E_SESS_NOTES", "E_OTHER_DURATION", "E_OTHER_TAGS", "W_OTHER_UNTAGGED", "E_OTHER_NOTES"]
-
-[pack]
-name = "billing-pack"
-version = "0.1"
-skill = "SKILL.md"
-requires_spec = ["0.1"]
-
-[[verbs]]
-name = "session"
-id_type = "person"
-
-[[verbs]]
-name = "use"
-
-[[checks.severity]]
-key = "billing-pack.duration"
-default = "error"
-
-[[checks.severity]]
-key = "billing-pack.notes"
-default = "error"
-
-[[rules]]
-id = "sessions"
-kind = "session-checks"
-code = "E_SESS_DURATION"
-severity_duration_key = "billing-pack.duration"
-severity_notes_key = "billing-pack.notes"
-verb = "session"
-billing_tags = ["full", "barter"]
-tags_code = "E_SESS_TAGS"
-untagged_code = "W_SESS_UNTAGGED"
-notes_code = "E_SESS_NOTES"
-
-[[rules]]
-id = "uses"
-kind = "session-checks"
-code = "E_OTHER_DURATION"
-severity_duration_key = "billing-pack.duration"
-severity_notes_key = "billing-pack.notes"
-verb = "use"
-billing_tags = ["other-tag"]
-tags_code = "E_OTHER_TAGS"
-untagged_code = "W_OTHER_UNTAGGED"
-notes_code = "E_OTHER_NOTES"
-
-[messages."E_SESS_DURATION"]
-default = "session needs a duration"
-default_fix = "Add a duration"
-
-[messages."E_SESS_TAGS"]
-default = "session has the wrong tags"
-default_fix = "Fix the tags"
-
-[messages."W_SESS_UNTAGGED"]
-default = "session is untagged"
-default_fix = "Tag it"
-
-[messages."E_SESS_NOTES"]
-default = "session has no notes"
-default_fix = "Add a note"
-
-[messages."E_OTHER_DURATION"]
-default = "use needs a duration"
-default_fix = "Add a duration"
-
-[messages."E_OTHER_TAGS"]
-default = "use has the wrong tags"
-default_fix = "Fix the tags"
-
-[messages."W_OTHER_UNTAGGED"]
-default = "use is untagged"
-default_fix = "Tag it"
-
-[messages."E_OTHER_NOTES"]
-default = "use has no notes"
-default_fix = "Add a note"
-"#;
-        let manifest = parse_manifest_compiled_in(text).expect("fixture manifest parses");
-        build_manifest_pack(manifest, "skill".to_string())
-    }
-
-    /// #747 round 3: a pack's `session-checks` tags for verb
-    /// `session` are its log-time vocabulary; a rule for another verb
-    /// contributes nothing.
-    #[test]
-    fn session_billing_tags_read_from_manifest() {
-        let pack = session_pack();
-        assert_eq!(
-            pack.session_billing_tags(),
-            vec!["full".to_string(), "barter".to_string()],
-            "only the session-verb rule counts, in rule order"
-        );
     }
 }

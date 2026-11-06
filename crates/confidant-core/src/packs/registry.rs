@@ -10,6 +10,7 @@
 //! failures fail closed (PD12). The [`crate::packs::Pack`] trait is not
 //! changed by this module.
 
+use crate::config::SpecVersion;
 use crate::packs::embedded;
 use crate::packs::manifest::PackOrigin;
 use crate::packs::{orphan_owners, resolve_enabled, OrphanOwners, Pack};
@@ -50,11 +51,26 @@ impl PackRegistry {
         self.packs.push(pack);
     }
 
-    /// The packs always available to a vault: the compiled packs plus the
-    /// implicit built-ins (#551). The built-ins are enabled in every vault
-    /// even when `packs = []`.
+    /// Every compiled pack plus every embedded built-in version.
+    ///
+    /// This is the all-versions view used by tests and the external-pack
+    /// loader. A vault must use [`PackRegistry::compiled_for_spec`] so only
+    /// the built-in selected by its `spec` is implicit (#745).
     pub fn compiled() -> Self {
         let implicit: Vec<&'static dyn Pack> = embedded::embedded_packs()
+            .iter()
+            .map(|p| p.pack())
+            .collect();
+        let mut packs = crate::packs::ALL_PACKS.to_vec();
+        packs.extend(implicit.iter().copied());
+        Self { packs, implicit }
+    }
+
+    /// The packs available to a vault on `spec`: the compiled packs plus
+    /// only the embedded built-in versions active for that spec (#745).
+    /// `personal@0.2` is implicit on 0.1–0.3; `personal@0.3` on 0.4.
+    pub fn compiled_for_spec(spec: SpecVersion) -> Self {
+        let implicit: Vec<&'static dyn Pack> = embedded::active_for_spec(spec)
             .iter()
             .map(|p| p.pack())
             .collect();
@@ -87,8 +103,8 @@ impl PackRegistry {
     /// rather than being compiled into the binary (#535). `false` for a
     /// name no pack implements. The decision is by [`Pack::origin`], never
     /// by base name, so an external pack whose base name matches a
-    /// compiled pack (`coaching@0.9` next to `coaching@0.1`) is still
-    /// external.
+    /// compiled pack (`example-pack@0.9` next to `example-pack@0.1`) is
+    /// still external.
     pub fn is_external(&self, name: &str) -> bool {
         self.packs
             .iter()
@@ -131,7 +147,7 @@ mod tests {
 
     impl Pack for CollidingExternal {
         fn name(&self) -> &'static str {
-            "coaching@0.9"
+            "example-pack@0.9"
         }
         fn verbs(&self) -> &'static [&'static str] {
             &[]
@@ -190,15 +206,16 @@ mod tests {
         let external: &'static dyn Pack = Box::leak(Box::new(CollidingExternal));
         registry.register(external);
 
-        // The external pack keeps the compiled pack's base name.
+        // The external pack keeps a colliding base name.
         assert_eq!(
-            "coaching@0.9".split('@').next(),
-            "coaching@0.1".split('@').next()
+            "example-pack@0.9".split('@').next(),
+            "example-pack@0.1".split('@').next()
         );
-        assert!(registry.is_external("coaching@0.9"));
-        // The compiled pack and the compiled-in built-in are not external,
-        // even though the built-in carries skill text of its own.
-        assert!(!registry.is_external("coaching@0.1"));
+        assert!(registry.is_external("example-pack@0.9"));
+        // A colliding name at a version no pack implements is not
+        // external, and the compiled-in built-in is not either, even
+        // though it carries skill text of its own.
+        assert!(!registry.is_external("example-pack@0.1"));
         assert!(!registry.is_external("personal@0.2"));
         // A name no pack implements is not external.
         assert!(!registry.is_external("nope@9.9"));

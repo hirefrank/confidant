@@ -1,10 +1,9 @@
-//! Shared ledger arithmetic for the coaching rule kinds (#446-#448).
+//! Shared ledger arithmetic for the ledger rule kinds (#446-#448).
 //!
-//! The shipped `coaching@0.1` pack's `ledger-balance` rule and the
-//! `session-checks` and `activity-gap` kinds must agree exactly, so this
-//! module owns the accumulation and the merge-aware queries. The rules and
-//! messages stay in their own modules; only the arithmetic and the fold
-//! ordering live here.
+//! The `ledger-balance`, `session-checks` and `activity-gap` kinds must
+//! agree exactly, so this module owns the accumulation and the merge-aware
+//! queries. The rules and messages stay in their own modules; only the
+//! arithmetic and the fold ordering live here.
 //!
 //! Semantics:
 //! - events are ordered by date, then opens before the consuming verb,
@@ -47,6 +46,8 @@ pub(crate) fn format_hundredths(n: i64) -> String {
 struct OpenEvent {
     date: NaiveDate,
     n: i64,
+    /// Date the line was retracted (#746). `None` is effective forever.
+    voided_on: Option<NaiveDate>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +56,8 @@ struct SessionEvent {
     minutes: Option<u32>,
     pps: bool,
     consumes: bool,
+    /// Date the line was retracted (#746). `None` is effective forever.
+    voided_on: Option<NaiveDate>,
 }
 
 /// One person's ledger events, before merge grouping.
@@ -67,13 +70,17 @@ pub(crate) struct PersonLedger {
 impl PersonLedger {
     fn remaining_on(&self, on: NaiveDate) -> Option<i64> {
         let mut opened: i64 = 0;
-        for o in self.opens.iter().filter(|o| o.date <= on) {
+        for o in self
+            .opens
+            .iter()
+            .filter(|o| o.date <= on && o.voided_on.is_none_or(|v| v > on))
+        {
             opened = opened.checked_add(o.n)?;
         }
         let used = i64::try_from(
             self.sessions
                 .iter()
-                .filter(|s| s.date <= on && s.consumes)
+                .filter(|s| s.date <= on && s.consumes && s.voided_on.is_none_or(|v| v > on))
                 .count(),
         )
         .ok()?;
@@ -83,7 +90,7 @@ impl PersonLedger {
     fn minutes_on(&self, on: NaiveDate) -> u32 {
         self.sessions
             .iter()
-            .filter(|s| s.date <= on)
+            .filter(|s| s.date <= on && s.voided_on.is_none_or(|v| v > on))
             .filter_map(|s| s.minutes)
             .fold(0u32, |acc, m| acc.saturating_add(m))
     }
@@ -91,19 +98,28 @@ impl PersonLedger {
     fn last_session_on(&self, on: NaiveDate) -> Option<NaiveDate> {
         self.sessions
             .iter()
+            .filter(|s| s.voided_on.is_none_or(|v| v > on))
             .map(|s| s.date)
             .filter(|d| *d <= on)
             .max()
     }
 
     fn last_open_on(&self, on: NaiveDate) -> Option<NaiveDate> {
-        self.opens.iter().map(|o| o.date).filter(|d| *d <= on).max()
+        self.opens
+            .iter()
+            .filter(|o| o.voided_on.is_none_or(|v| v > on))
+            .map(|o| o.date)
+            .filter(|d| *d <= on)
+            .max()
     }
 
     fn pps_in_lookback(&self, as_of: NaiveDate, window: chrono::Duration) -> bool {
-        self.sessions
-            .iter()
-            .any(|s| s.pps && s.date <= as_of && as_of.signed_duration_since(s.date) <= window)
+        self.sessions.iter().any(|s| {
+            s.pps
+                && s.date <= as_of
+                && s.voided_on.is_none_or(|v| v > as_of)
+                && as_of.signed_duration_since(s.date) <= window
+        })
     }
 
     /// Total minutes accumulated so far, used for the compiled overflow
@@ -260,9 +276,9 @@ impl LedgerFacts {
 /// The verbs and cap one fold uses.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FoldParams<'a> {
-    /// The verb that adds units (`open` for coaching).
+    /// The verb that adds units (e.g. `grant`).
     pub(crate) open_verb: &'a str,
-    /// The verb that consumes a unit (`session` for coaching).
+    /// The verb that consumes a unit (e.g. `use`).
     pub(crate) consume_verb: &'a str,
     /// Per-entry cap on one `open` line.
     pub(crate) max_open_n: i64,
@@ -326,10 +342,17 @@ pub(crate) fn fold<'a>(
         if e.id.prefix() != Prefix::Person {
             continue;
         }
+        let voided_on = vault.corrections().voided_on(&sourced.line_ref);
         if e.verb == params.open_verb {
-            apply_open(&mut facts, sourced, params.max_open_n, &mut issues);
+            apply_open(
+                &mut facts,
+                sourced,
+                params.max_open_n,
+                voided_on,
+                &mut issues,
+            );
         } else {
-            apply_session(&mut facts, sourced, &mut issues);
+            apply_session(&mut facts, sourced, voided_on, &mut issues);
         }
     }
 
@@ -340,6 +363,7 @@ fn apply_open<'a>(
     facts: &mut LedgerFacts,
     sourced: &'a SourcedEntry,
     max_open_n: i64,
+    voided_on: Option<NaiveDate>,
     issues: &mut Vec<(&'a SourcedEntry, LedgerIssue)>,
 ) {
     let entry = &sourced.entry;
@@ -369,6 +393,7 @@ fn apply_open<'a>(
             person.opens.push(OpenEvent {
                 date: entry.date,
                 n,
+                voided_on,
             });
             facts.packages.insert(pkg);
         }
@@ -404,6 +429,7 @@ fn parse_open(entry: &LedgerEntry) -> Option<Result<(RecordId, i64), OpenIssue>>
 fn apply_session<'a>(
     facts: &mut LedgerFacts,
     sourced: &'a SourcedEntry,
+    voided_on: Option<NaiveDate>,
     issues: &mut Vec<(&'a SourcedEntry, LedgerIssue)>,
 ) {
     let entry = &sourced.entry;
@@ -426,6 +452,7 @@ fn apply_session<'a>(
         minutes: duration,
         pps,
         consumes,
+        voided_on,
     });
 }
 

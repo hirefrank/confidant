@@ -184,7 +184,7 @@ Ledger arguments carry identifiers and structured values, never prose: a `touch`
 
 **Decision.**
 
-- **Records are plaintext.** A record is YAML front matter plus a Markdown body on disk: readable, greppable, diffable, and mergeable by git. `record add`, `note add`, and `log session --note` write those bytes straight through an atomic temp-file + rename.
+- **Records are plaintext.** A record is YAML front matter plus a Markdown body on disk: readable, greppable, diffable, and mergeable by git. `record add`, `note add`, and `log touch --note` write those bytes straight through an atomic temp-file + rename.
 - **The perimeter is the machine and the repo.** The operator runs Confidant on trusted devices (§3) with full-disk encryption enabled, and syncs to a **private** git remote. `confidant doctor`'s `git-remote` check refuses cleartext transports (`http://`, `git://`) and warns on transports it cannot verify; it does not police whether the host is private.
 - **`no-ai` is the agent boundary.** It is enforced at read time in the allowlist (§12), not by the storage layer, and it applies to `find`, `context`, `allowlist`, MCP, and the QMD corpus.
 - **No second secrecy layer.** There is no key material in a vault, so a vault is self-contained: clone it and read it. That removes key handling from the failure surface — no key to lose, rotate, or fail to unwrap — and it makes every record reviewable with `git diff`.
@@ -230,7 +230,7 @@ There is no separate audit journal. The audit trail is the ledger plus git histo
 
 - `--json` on every command; every JSON response includes the resolved vault path.
 - `--no-input`: never prompt; fail with an error code instead.
-- `--file` to pass structured input; `--dry-run` on every write. Dry runs and confirm-before-write skills show and bind to the logical change (ledger lines, the plaintext diff) that will be written.
+- `--file` to pass structured input; `--dry-run` on every write. Dry runs and confirm-before-write skills show and bind to the logical change (ledger lines, the plaintext diff) that will be written. A dry run runs the same read-only pre-write `check` as apply (a repairing write skips it on both paths), so an already-broken vault blocks the preview exactly as it blocks the write. It cannot run the post-write check without writing, so dry-run JSON carries `checks.pre` and `checks.post` (`passed`/`skipped`); `checks.post` is always `skipped`. A dry run never writes, commits, or queues.
 - Stable exit codes and error codes. Errors name the file and line and suggest a fix; paths are opaque IDs, so this leaks nothing. Errors are classified by type, never by message text. `internal_error` is reserved for unclassified failures, and usage errors exit with code 2.
 - Optional `--request-id` so a retried write does not apply twice. It is scoped per write command (imports are multi-record). Only hashes are stored, in a commit trailer: a domain-separated hash of the id and of the canonical request. Reusing an id with different content is an error (`E_IDEMPOTENCY_CONFLICT`). ADR-8's `src:` provenance stays the content-level dedupe.
 - One commit per write, attributed to the human or agent. Commit messages and trailers are readable by anyone with the repo, so they carry only opaque IDs, verbs, agent identity and request-id hashes. Free-text reasons and intent go in a record body when they are worth keeping, or are omitted. When an agent performs a write, set `CONFIDANT_AGENT_ID` to an opaque identifier (no free-text names); the write pipeline adds an `Agent:` commit trailer carrying that value.
@@ -405,9 +405,152 @@ registry, no signing in v1. External packs affect `check` only.
 
 **Consequences.** Nothing here needs to defend against a co-tenant. Anything two operators must not see together belongs in two vaults. Revisit this ADR before adding any multi-user feature.
 
+### ADR-17. Edges connect entities, not just people (spec 0.2).
+
+**Door:** One-way (once a vault holds an org edge, the format is fixed).
+
+**Context.** Edges were person↔person only: `check` rejected any other ID prefix, and the core kinds were `married`, `introduced`, and `colleague`. Orgs were therefore unlinkable islands. The pilot vault (#752) made the cost concrete: the only person↔org connection was a free-text `company` field, so two people at the same org did not resolve together and role history had nowhere to live. #796 decided the domain model should generalize in two phases; this ADR records phase 1, entity endpoints (#813). Phase 2, pack-definable record types, is separate.
+
+**Decision.**
+
+- Phase 1 declares **person and org** as edge endpoint entities. Deals, notes, interactions, edges, and packages are not endpoints; a place/thing type arrives with phase 2.
+- The edge record does **not** change: `a`, `b`, `kind`, `since`, `until`, no body, no `no-ai`. The kind declares which endpoint types each side allows.
+- Core ships four directed person→org kinds in 0.2: `works_at`, `founder_of`, `investor_in`, `advisor_to`. The 0.1 kind list is frozen.
+- Pack kinds declare optional `from`/`to` type sets. Absent means person↔person, so every existing pack keeps its meaning.
+- Spec 0.2 keeps every 0.1 rule. A vault opts in with a one-line `spec` change; `init` writes 0.2. No `migrate` command.
+- Merges redirect at read time. 0.2 `check` canonicalizes self-edges and duplicate relations; 0.1 keeps the raw comparison. No edge file is rewritten.
+- Privacy is unchanged: an edge is agent-visible only when both endpoints are cleared. Edges stay `no-ai`-free and orgs stay `no-ai`-free; hiding a single relation or an org is a separate privacy review.
+
+**Alternatives considered.** (a) Keep edges person-only: fails #752 and blocks the relationship graph. (b) Make record types pack-definable first: larger and slower; edges are the smaller unlock. (c) Store `a_type`/`b_type` on the edge: duplicates the kind's declaration and can disagree with it. (d) Rewrite edge files on merge: history churn for a problem read-time resolution already solves.
+
+**Consequences.** The spec gets a second frozen document (`spec/0.2.md`). A pack that declares a non-person endpoint must add `"0.2"` to `requires_spec`, and a 0.1 vault rejects it with `E_PACK_VERSION` rather than guessing. Org context and the default all-kinds roster followed in #813 phases 2 and 3. A per-edge or per-org `no-ai` mode remains an open privacy question.
+
+### ADR-18. Record types are pack-declarable (spec 0.3).
+
+**Door:** One-way (a vault that contains a pack-typed record has committed to the two-letter prefix and collection).
+
+**Context.** ADR-17 generalized edges to entities but left the type vocabulary closed. #796 then decided the domain model should generalize in two phases: entity edges first, pack-definable record types second (#814). The personal default schema still reads like a database diagram, and places/things have nowhere to live (#745). The pack cap was `record_types = []`.
+
+**Decision.**
+
+- Spec 0.3 adds a v3 pack manifest. `[[record_types]]` declares a type's name, two-letter ID prefix, collection directory, main file, `entity`/`person_like`/`no_ai`/`roster` flags, and required/optional fields.
+- Core keeps `person`, `org`, `deal`, `interaction`, `note`, `edge`; `deal` is legacy and not extended. `package` stays a ledger-only prefix. `place`/`thing` are pack types, not core.
+- Pack prefixes are exactly two lowercase letters, unique across registered packs and core, and never end in `p/o/d/i/n/e` (the scanner must keep a glued core ID recognizable). Core keeps one-letter prefixes and `pkg`.
+- A pack's `[[verbs]].id_type` and edge endpoints may name core types or its own types. Cross-pack type references are refused; core is the shared vocabulary.
+- Agent reads fail closed on a disabled, retired, or undeclared type. `check` reports `W_PACK_ORPHAN`; the operator path still sees the record. `[[retired_types]]` in `confidant.toml` keeps a removed pack's records parseable.
+- `entity:` is a generic front-matter reference key, so notes and interactions can attach to any declared entity. `person:`/`org:`/`deal:` stay.
+- Edge-level `no-ai` is the companion privacy change to the same format version (ADR-19); core orgs remain `no-ai`-free.
+
+**Alternatives considered.** (a) Move `deal`/`interaction` to the personal pack now: their one-letter prefixes and core verbs (`stage`) are frozen, and a format migration buys no user-visible gain. (b) Arbitrary prefix strings with a registry-aware scanner: more parser coupling and no orphan parsing after removal. (c) One core `thing`/`place`: repeats the database-diagram problem and makes the personal default a different product. (d) Reuse `person` for domains: fields can express a client, but the type identity, roster, and edges cannot.
+
+**Consequences.** Spec 0.3 was the current document when this ADR landed; 0.4 supersedes it (ADR-20), and `init` now writes 0.4. 0.1/0.2 stay frozen. A 0.2 vault opts in with one `spec` change and no record rewrite. A pack that declares types must list `"0.3"` in `requires_spec`; a 0.2 vault rejects it with `E_PACK_VERSION`. The built-in personal pack stays `personal@0.2` and declares no types in this slice; ADR-21 later adds `personal@0.3` for 0.4. The demo vault stays on 0.2; [`testdata/vaults/place-0.3/`](../testdata/vaults/place-0.3/) is the checked-in 0.3 fixture with a place pack, an `entity:` note, a visible edge, and a hidden edge. Pack removal tombstones ship with the removal workflow (#699); this ADR defines the read behavior.
+
+### ADR-19. Edge-level `no-ai` (spec 0.3).
+
+**Door:** One-way (a vault that hides an edge has committed to the 0.3 edge key set).
+
+**Context.** ADR-17 kept edges `no-ai`-free and gated them only on endpoint visibility. #820 found the gap: a cleared person's structured relationships can be sensitive even when both people are visible (for example an `investor_in` relation). The review deferred org-level hiding but approved edge-level `no-ai` as the smaller first step, shipped with the next format version alongside pack-declared types.
+
+**Decision.**
+
+- A 0.3 edge may carry `no-ai: true` or `no-ai: false`. `notes` is invalid; there is no inheritance in either direction.
+- `true` hides the relation from every agent-facing read while **both endpoints stay visible**. The relation is not counted, summarized, or anonymized.
+- The operator path (`find --for-operator`, `context --for-operator`, `record show --for-edit`) still sees the edge; `context` badges it with its tri-state `no_ai`.
+- `check` still validates the edge. A finding on a hidden edge may carry its opaque `e-…` id and file, but never its kind or either endpoint id.
+- 0.2 remains frozen: `no-ai` on an edge is `E_FRONTMATTER` there. Org-level `no-ai` remains deferred.
+
+**Alternatives considered.** (a) Keep endpoint-only gating and document the limit: fails the sensitive-relation case. (b) Hide the whole relation by hiding an endpoint: also hides that person's other relationships and changes person-level visibility. (c) Allow `no-ai: notes` on an edge: edges have no prose or children, so there is nothing for `notes` to hide. (d) Add org hiding at the same time: needs its own inheritance, findings, and search design; deferred by #820.
+
+**Consequences.** The edge format gains one key in 0.3. The allowlist's existing own-flag rule hides the edge; `context` filters it out and the operator bundle carries the badge. `find`/`allowlist`/QMD never see it. Edge tests cover agent vs operator, a note naming a hidden edge, both endpoints staying visible, and 0.2 rejection.
+
+### ADR-20. Corrections are compensating ledger entries; retirement is record state (spec 0.4).
+
+**Door:** One-way (content-hash line refs and `retired` become format).
+
+**Context.** #746 found that append-only had no correction path: an agent's backfill re-added 41 touches, a wrong ledger line could not be voided, and a wrongly-created record had no non-destructive remedy. Append-only is a trust property; "cannot be silently rewritten" and "cannot be corrected" are different claims. Rewriting pushed git history breaks every other clone and the audit story.
+
+**Decision.**
+
+- **A correction is a new fact.** `DATE retract SUBJECT-ID line:<64 hex> [occurrence:<n>] reason:<token> [replace:<64 hex>]` voids a prior parsed line without editing or deleting it. The original line and the retraction stay in the ledger and in git history.
+- **Line identity is content-addressed.** The ref is the SHA-256 of the canonical `format_entry` bytes with the `confidant-line-ref/v1` domain, plus a 1-based occurrence for byte-identical lines. It survives appends, renames, and line-number shifts, and fails loudly (`E_RETRACT_TARGET`) after a hand edit. The canonical form and pinned vectors are part of spec 0.4; a future formatter change needs a `v2` domain and dual-read.
+- **One on-disk verb, `retract`.** The closed reason vocabulary is `duplicate`, `wrong-date`, `wrong-kind`, `wrong-person`, `wrong-amount`, `wrong-note`, `wrong-record`, `typo`, `other`. `replace:` links a replacement line with the same subject and a date on or before the retraction's. `confidant correct` appends the replacement and the retraction in one commit; there is no separate `correct` grammar. A `merge` or `retract` line cannot be retracted, and a correction cannot move a fact between subjects.
+- **Readers use an effective view.** Current-state rules (`check`, `find`/`allowlist`, `context`, roster, resolve, cadence/duplicate rules) apply every valid retraction; a `balance` assertion dated D applies only retractions dated on or before D. Findings on a retracted target are suppressed, so a correction is a remedy; the retraction line's own findings still stand.
+- **Record retirement is front-matter state.** `retired: true` with `confidant record retire|unretire` keeps the file and history but removes the record and its dependents from agent reads, `context`, `resolve`, and `alias resolve`. The operator path still sees it (`record list --for-operator` badges it; `record show --for-edit` reads it); `context` returns no bundle for a retired target. `check` still validates the file. Before 0.4 the key is ignored.
+- **0.4 is the version gate.** 0.1–0.3 remain frozen. A 0.3 binary would otherwise keep counting a voided line (or treat a retired record as live), so 0.4 is a new spec version, not a 0.3 addendum.
+- **Guardrails.** Corrections are attributed commits; no history rewrite; no silent retarget; `retract` is core-owned and no pack may claim it; a retraction line is visible to agents only when its target line is, and refs are opaque; no MCP tool was added (CLI-only, operator path). A pack used in a 0.4 vault lists `"0.4"` in `requires_spec`.
+
+**Alternatives considered.** (a) Rewrite or delete ledger lines and rely on git history: breaks every other clone, loses the visible mistake, and makes readers infer corrections from diffs. (b) Per-line ULIDs in a trailing comment: requires a backfill/rewrite of existing lines. (c) A `path:line` reference: shifts after appends and merges. (d) A ledger `retire` verb: adds a second read-time map and date semantics to every reader, while retirement is record lifecycle state. (e) A separate on-disk `correct` verb: duplicates target/ref/reason parsing and the chain model for no reader benefit.
+
+**Consequences.** Spec 0.4 is current; 0.3 is frozen. `init` writes 0.4 and an existing 0.3 vault opts in with one `spec` change. Every reader must use the effective view; the QMD corpus must be rebuilt after a correction or retirement; external packs used in a 0.4 vault must list `"0.4"`. Suppressing a target's findings is a deliberate trust choice: a retraction can clear a check error, but it is attributed and visible. Unmerging a `merge` line remains a separate identity problem.
+
+**Follow-up (unresolved).** `record retire` is a normal check-gated write, not a repairing write: it does not suppress record-level findings. A record that itself causes a `check` error must be fixed before it can be retired, so retirement is a remedy for a valid-but-unwanted record, not for a malformed one. Whether retirement should become a repairing write (and which findings it may suppress) is left open for the #746 correction review.
+
+### ADR-21. The 0.4 default personal pack adds places and things (`personal@0.3`).
+
+**Door:** One-way (a vault that writes a place or thing commits to their
+two-letter prefixes and collections).
+
+**Context.** The personal default schema was person-only: `personal@0.2`
+declares no record types. #745 found that places and things have nowhere to
+live, so operators overload notes or install an external pack. #839 approved
+the default schema change for 0.4. Spec 0.3 is frozen; changing its default
+would alter the `context.packs` key, the `place-0.3` fixture, and TUI
+snapshots.
+
+**Decision.**
+
+- The binary compiles `personal@0.2` and `personal@0.3`. A 0.1–0.3 vault
+  selects 0.2; a 0.4 vault selects 0.3. The vault `spec` selects the active
+  built-in version; a `personal@…` listing remains a no-op
+  (`spec/pack-manifest.md` §13.7).
+- `personal@0.3` is a v3 manifest and keeps every 0.2 claim. It adds
+  `place` (`pl`, `places/`; required `name`, `kind`; optional `address`,
+  `tags`, `links`) and `thing` (`th`, `things/`; required `name`, `kind`;
+  optional `tags`, `links`). Both are entities, not person-like,
+  `no_ai = "full"`, and roster-visible.
+- `kind` is required, non-empty, and an open vocabulary. The pack-field
+  claim gives core spec keys precedence in `scope::owner_of_field`, so a
+  personal `kind` field does not hide a core edge's `kind:` line.
+- The pack adds `visited` (person→place), `lives_at` (person→place), `owns`
+  (person→thing), and `located_at` (thing→place). `visited` is a durable
+  "has been to" relation; individual visits are interactions or notes, not
+  repeated edges.
+- `context.entity.fields` exposes a non-person-like pack entity's declared
+  fields. `--exclude-private` strips `address`, `tags`, and `links`; an
+  uncleared place or thing returns no agent bundle at all.
+- `context.packs` follows the active version (`personal@0.3` in 0.4);
+  `--packs personal@0.2` remains a no-op alias. `org` and `deal` stay core;
+  `thing.kind` excludes `organization`.
+- The demo vault stays on 0.2; `testdata/vaults/personal-0.4/` is the new
+  fixture. Root `packs/personal/` becomes the 0.3 source; frozen 0.2 bytes
+  stay in `crates/confidant-core/pack-manifests/personal-0.2/`.
+- No new verbs, finding codes, metrics, or `[checks]` keys. No TUI
+  place/thing UI, no name resolution for them, and no per-visit event verb
+  in this lane.
+
+**Alternatives considered.** (a) One `personal@0.3` in every spec: changes
+frozen 0.3 behavior and cannot honestly list 0.1/0.2. (b) Core
+`place`/`thing`: repeats the database-diagram problem and reverses ADR-18.
+(c) Namespaced types (`personal_place`): avoids external claims but leaks
+implementation into IDs and the operator vocabulary. (d) `category` instead
+of `kind`: avoids the precedence fix but loses the natural noun. (e) An
+optional `kind`: lets junk-drawer records in. (f) Move the demo to 0.4:
+churns every snapshot and loses old-format coverage. (g) Fold `org` into
+`thing` or retire `deal`: a format migration beyond this lane.
+
+**Consequences.** 0.4 is the first spec whose default personal schema has
+places and things; 0.1–0.3 remain byte-compatible. A 0.4-compatible external
+pack cannot claim `place`/`pl`/`places` or `thing`/`th`/`things`; it must
+rename or drop the claim. Callers that hardcode
+`context.packs["personal@0.2"]` on 0.4 must read the active key. An
+uncleared place or thing yields no agent bundle, and `address` is stripped
+from private context. The new fixture and golden cover the types, edges,
+fields, and privacy. TUI work, name resolution, per-visit history, the
+org/deal migration, and cross-pack type references remain follow-ups.
+
 ## 8. v0 scope and milestones
 
-1. **Spec + core + check.** Format spec 0.1, parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
+1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18) and edge-level `no-ai` (ADR-19), 0.4 corrections and record retirement (ADR-20), and 0.4's `personal@0.3` default with places and things (ADR-21); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
 2. **Vault safety and sync.** `confidant doctor` (git repo and identity, transport, spec, `check`, staleness, skills links), `confidant sync` as the explicit git boundary, and the §12 `no-ai` allowlist. Done when a fresh clone on a clean machine reads and writes the vault with no extra setup.
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
 4. **Import skills.** Agent skills that pull events and transcripts from outside systems into the vault, with dry runs and safe retries.

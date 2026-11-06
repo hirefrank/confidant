@@ -40,18 +40,33 @@ pub enum Prefix {
     Note,
     Edge,
     Package,
+    /// A pack-declared record type: exactly two lowercase ASCII letters
+    /// (spec 0.3 §3). The bytes keep `Prefix` `Copy` and let `RecordId`
+    /// parse without a vault.
+    Pack([u8; 2]),
 }
 
 impl Prefix {
-    pub fn as_str(self) -> &'static str {
+    /// Core prefixes render as their fixed string; a pack prefix renders as
+    /// its two bytes. `as_str` is core-only because a pack prefix has no
+    /// `&'static str`; use `Display` for a general spelling.
+    pub fn core_str(self) -> Option<&'static str> {
         match self {
-            Self::Person => "p",
-            Self::Org => "o",
-            Self::Deal => "d",
-            Self::Interaction => "i",
-            Self::Note => "n",
-            Self::Edge => "e",
-            Self::Package => "pkg",
+            Self::Person => Some("p"),
+            Self::Org => Some("o"),
+            Self::Deal => Some("d"),
+            Self::Interaction => Some("i"),
+            Self::Note => Some("n"),
+            Self::Edge => Some("e"),
+            Self::Package => Some("pkg"),
+            Self::Pack(_) => None,
+        }
+    }
+
+    pub fn pack_bytes(self) -> Option<[u8; 2]> {
+        match self {
+            Self::Pack(bytes) => Some(bytes),
+            _ => None,
         }
     }
 
@@ -63,8 +78,14 @@ impl Prefix {
             Self::Interaction => Some("interaction"),
             Self::Note => Some("note"),
             Self::Edge => Some("edge"),
-            Self::Package => None,
+            Self::Package | Self::Pack(_) => None,
         }
+    }
+
+    /// Whether this core prefix names an entity an edge may connect (#813).
+    /// Pack types consult [`crate::record_type::TypeRegistry::is_entity`].
+    pub fn is_core_entity(self) -> bool {
+        matches!(self, Self::Person | Self::Org)
     }
 
     pub fn collection(self) -> Option<&'static str> {
@@ -75,7 +96,7 @@ impl Prefix {
             Self::Interaction => Some("interactions"),
             Self::Note => Some("notes"),
             Self::Edge => Some("edges"),
-            Self::Package => None,
+            Self::Package | Self::Pack(_) => None,
         }
     }
 
@@ -87,7 +108,7 @@ impl Prefix {
             Self::Interaction => Some("interaction.md"),
             Self::Note => Some("note.md"),
             Self::Edge => Some("edge.md"),
-            Self::Package => None,
+            Self::Package | Self::Pack(_) => None,
         }
     }
 
@@ -100,7 +121,17 @@ impl Prefix {
             "n" => Some(Self::Note),
             "e" => Some(Self::Edge),
             "pkg" => Some(Self::Package),
-            _ => None,
+            _ => {
+                let bytes = s.as_bytes();
+                if bytes.len() == 2
+                    && bytes[0].is_ascii_lowercase()
+                    && bytes[1].is_ascii_lowercase()
+                {
+                    Some(Self::Pack([bytes[0], bytes[1]]))
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -125,6 +156,17 @@ impl Prefix {
             "note" => Some(Self::Note),
             "edge" => Some(Self::Edge),
             _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Prefix {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pack(bytes) => {
+                formatter.write_str(std::str::from_utf8(bytes).expect("pack prefix is ASCII"))
+            }
+            other => formatter.write_str(other.core_str().expect("core prefix has a string")),
         }
     }
 }
@@ -169,13 +211,32 @@ impl RecordId {
     }
 
     pub fn as_str(&self) -> String {
-        format!("{}-{}", self.prefix.as_str(), self.ulid)
+        match self.prefix {
+            Prefix::Pack(bytes) => {
+                format!("{}{}-{}", bytes[0] as char, bytes[1] as char, self.ulid)
+            }
+            other => format!(
+                "{}-{}",
+                other.core_str().expect("core prefix has a string"),
+                self.ulid
+            ),
+        }
     }
 }
 
 impl Display for RecordId {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", self.prefix.as_str(), self.ulid)
+        match self.prefix {
+            Prefix::Pack(bytes) => {
+                write!(f, "{}{}-{}", bytes[0] as char, bytes[1] as char, self.ulid)
+            }
+            other => write!(
+                f,
+                "{}-{}",
+                other.core_str().expect("core prefix has a string"),
+                self.ulid
+            ),
+        }
     }
 }
 
@@ -457,6 +518,15 @@ fn prefix_len_before_soft_hyphen(s: &str) -> Option<usize> {
             return Some(plen);
         }
     }
+    let bytes = s.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1].is_ascii_alphabetic()
+        && !is_core_prefix_byte(bytes[1])
+        && s[2..].starts_with('\u{00ad}')
+    {
+        return Some(2);
+    }
     None
 }
 
@@ -509,11 +579,30 @@ pub(crate) fn strip_ignorable(s: &str) -> Cow<'_, str> {
     Cow::Owned(s.chars().filter(|c| !is_ignorable(*c)).collect())
 }
 
-fn starts_id_prefix(s: &str) -> bool {
+fn is_core_prefix_byte(b: u8) -> bool {
     matches!(
-        s.as_bytes().first(),
-        Some(b'p' | b'P' | b'o' | b'O' | b'd' | b'D' | b'i' | b'I' | b'n' | b'N' | b'e' | b'E')
+        b.to_ascii_lowercase(),
+        b'p' | b'o' | b'd' | b'i' | b'n' | b'e'
     )
+}
+
+fn starts_id_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if matches!(
+        bytes.first(),
+        Some(b'p' | b'P' | b'o' | b'O' | b'd' | b'D' | b'i' | b'I' | b'n' | b'N' | b'e' | b'E')
+    ) {
+        return true;
+    }
+    // Two-letter pack prefix: any ASCII letter pair followed by a dash. A
+    // second letter that is itself a core prefix (`xp-`) is not a pack
+    // prefix: the scanner must advance so a glued `p-<ULID>` stays a person
+    // ID (privacy). Manifest validation forbids such prefixes.
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1].is_ascii_alphabetic()
+        && !is_core_prefix_byte(bytes[1])
+        && bytes[2] == b'-'
 }
 
 fn is_crockford_byte(b: u8) -> bool {
@@ -604,52 +693,58 @@ pub fn scan_ids(text: &str) -> Vec<RecordId> {
 fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
     const PREFIXES: &[&str] = &["pkg", "p", "o", "d", "i", "n", "e"];
     for pref in PREFIXES {
-        let plen = pref.len();
-        let Some(head) = s.get(..plen) else {
-            continue;
-        };
-        if !head.eq_ignore_ascii_case(pref) {
-            continue;
+        if let Some(found) = match_named_prefix_at(s, pref, glued) {
+            return Some(found);
         }
-        let Some(after) = s.get(plen..) else {
-            continue;
-        };
-        let (dash_bytes, dash_count, single_ascii_dash) = dash_run(after);
-        if dash_count == 0 {
-            continue;
-        }
-        let run_start = dash_bytes;
-        let run_len = after[run_start..]
-            .find(|c: char| !c.is_ascii_alphanumeric())
-            .unwrap_or(after.len() - run_start);
-        let total = plen + run_start + run_len;
-        let run = &after[run_start..run_start + run_len];
-        if glued {
-            if is_32_lowercase_hex(run) {
-                continue;
-            }
-            if single_ascii_dash && run_len == ULID_LEN {
-                if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
-                    return Some((IdToken::Valid(id), total));
-                }
-            }
-            if let Some(candidate) = lookalike_candidate(pref, run) {
-                if run_len > ULID_LEN || !single_ascii_dash {
-                    return Some((
-                        IdToken::Malformed {
-                            candidate: Some(candidate),
-                        },
-                        total,
-                    ));
-                }
-            }
-            continue;
-        }
+    }
+    // Pack types use exactly two lowercase letters (spec 0.3 §3). The
+    // scanner can recognize the shape without a vault, which is what lets an
+    // orphaned record still be found and fail closed.
+    let bytes = s.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1].is_ascii_alphabetic()
+        && !is_core_prefix_byte(bytes[1])
+        && bytes[2] == b'-'
+    {
+        let pref = format!(
+            "{}{}",
+            (bytes[0] as char).to_ascii_lowercase(),
+            (bytes[1] as char).to_ascii_lowercase()
+        );
+        return match_named_prefix_at(s, &pref, glued);
+    }
+    None
+}
+
+fn match_named_prefix_at(s: &str, pref: &str, glued: bool) -> Option<(IdToken, usize)> {
+    let plen = pref.len();
+    let head = s.get(..plen)?;
+    if !head.eq_ignore_ascii_case(pref) {
+        return None;
+    }
+    let after = s.get(plen..)?;
+    let (dash_bytes, dash_count, single_ascii_dash) = dash_run(after);
+    if dash_count == 0 {
+        return None;
+    }
+    let run_start = dash_bytes;
+    let run_len = after[run_start..]
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(after.len() - run_start);
+    let total = plen + run_start + run_len;
+    let run = &after[run_start..run_start + run_len];
+    if glued {
         if is_32_lowercase_hex(run) {
-            continue;
+            return None;
         }
-        if run_len > 32 {
-            if let Some(candidate) = lookalike_candidate(pref, run) {
+        if single_ascii_dash && run_len == ULID_LEN {
+            if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
+                return Some((IdToken::Valid(id), total));
+            }
+        }
+        if let Some(candidate) = lookalike_candidate(pref, run) {
+            if run_len > ULID_LEN || !single_ascii_dash {
                 return Some((
                     IdToken::Malformed {
                         candidate: Some(candidate),
@@ -657,20 +752,33 @@ fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
                     total,
                 ));
             }
-            continue;
         }
-        if run_len < 20 {
-            continue;
-        }
-        if single_ascii_dash {
-            if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
-                return Some((IdToken::Valid(id), total));
-            }
-        }
-        let candidate = lookalike_candidate(pref, run);
-        return Some((IdToken::Malformed { candidate }, total));
+        return None;
     }
-    None
+    if is_32_lowercase_hex(run) {
+        return None;
+    }
+    if run_len > 32 {
+        if let Some(candidate) = lookalike_candidate(pref, run) {
+            return Some((
+                IdToken::Malformed {
+                    candidate: Some(candidate),
+                },
+                total,
+            ));
+        }
+        return None;
+    }
+    if run_len < 20 {
+        return None;
+    }
+    if single_ascii_dash {
+        if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
+            return Some((IdToken::Valid(id), total));
+        }
+    }
+    let candidate = lookalike_candidate(pref, run);
+    Some((IdToken::Malformed { candidate }, total))
 }
 
 /// Consecutive `is_id_dash` characters after a prefix count as one dash.
@@ -745,6 +853,30 @@ pub fn person_id_from_path(path: &str) -> Option<RecordId> {
     let stem = second.strip_suffix(".md").unwrap_or(second);
     let id = RecordId::parse(stem).ok()?;
     if id.prefix() != Prefix::Person {
+        return None;
+    }
+    Some(id)
+}
+
+/// Entity ID for a vault-relative path under `<entity collection>/<id>/`.
+///
+/// Used by the allowlist's path-parent rule. The registry decides whether the
+/// collection is an entity type; a note's collection is not, so a top-level
+/// note never assigns a parent this way.
+pub fn entity_id_from_path(
+    path: &str,
+    types: &crate::record_type::TypeRegistry,
+) -> Option<RecordId> {
+    let mut parts = path.split('/');
+    let collection = parts.next()?;
+    let decl = types.get_by_collection(collection)?;
+    if !decl.entity {
+        return None;
+    }
+    let second = parts.next()?;
+    let stem = second.strip_suffix(".md").unwrap_or(second);
+    let id = RecordId::parse(stem).ok()?;
+    if id.prefix() != decl.prefix {
         return None;
     }
     Some(id)
@@ -1219,5 +1351,30 @@ mod tests {
             Some(id)
         );
         assert!(super::person_id_from_path("notes/n-01M3TC5H00MPJG002NAM000005/note.md").is_none());
+    }
+    #[test]
+    fn two_letter_pack_prefix_parses_and_scans() {
+        let id = super::RecordId::parse("pl-01M3TC5H00MPJG000000000000").unwrap();
+        assert_eq!(id.prefix(), super::Prefix::Pack(*b"pl"));
+        assert_eq!(id.to_string(), "pl-01M3TC5H00MPJG000000000000");
+        assert_eq!(
+            super::scan_ids("see pl-01M3TC5H00MPJG000000000000."),
+            vec![id.clone()]
+        );
+        // A pack prefix whose second letter is a core prefix is not scanned
+        // as a pack ID: the glued core ID wins (`xp-` is a `p-` person).
+        let person = super::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        assert_eq!(
+            super::scan_ids("xp-01M3TC5H00MPJG000000000000"),
+            vec![person]
+        );
+        // A two-letter prefix with a near-ULID is Malformed with a
+        // candidate; a short lookalike is not a token.
+        assert!(matches!(
+            super::scan_id_tokens("pl-01M3TC5H00MPJG00000000000I").as_slice(),
+            [super::IdToken::Malformed { candidate: None }]
+        ));
+        assert!(super::scan_id_tokens("pl-1234").is_empty());
+        assert!(super::scan_id_tokens("pl-0123456789abcdef0123456789abcdef").is_empty());
     }
 }

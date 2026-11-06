@@ -20,7 +20,7 @@ trait — they are exactly the part the two packs do not share.
 - record types
 - front-matter fields and their grammars (named, from a fixed list)
 - balance metrics
-- edge kinds and symmetry
+- edge kinds, endpoint types, and symmetry
 - finding codes
 - verb-to-ID type
 - `[checks]` keys and defaults
@@ -115,7 +115,8 @@ id_type = "person"          # optional
 name = "birthday"
 grammar = "recurring-date"
 
-# Edge kinds this pack introduces, with symmetry.
+# Edge kinds this pack introduces. `symmetric` is required; the optional
+# `from` / `to` type arrays declare endpoint types (absent = person↔person).
 [[edge_kinds]]
 name = "friend"
 symmetric = true
@@ -148,6 +149,37 @@ none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cad
 
 `id_type` names one of the record ID prefixes: `person`, `org`, `deal`,
 `interaction`, `note`, `edge`, `package`. (Today's `Prefix` enum.)
+
+### Edge kinds
+
+`[[edge_kinds]]` declares one relation kind. `name` and `symmetric` are
+required. `from` / `to` are optional arrays of record-type names for the
+`a` / `b` endpoints (#813):
+
+```toml
+[[edge_kinds]]
+name = "works_at"
+symmetric = false
+from = ["person"]
+to = ["org"]
+```
+
+- Absent `from` and `to` mean `["person"]` / `["person"]`, the historical
+  person↔person rule. Every 0.1-era pack kind keeps that meaning.
+- Both must appear together. Each list must be non-empty and contain no
+  duplicates.
+- In a 0.2 vault the names are the declared entity types (`person`,
+  `org`); any other name is `E_PACK_INVALID` at load, in every spec
+  version. A 0.1 vault validates the declaration but enforces only the
+  person-only edge rule (it treats every kind as person↔person).
+- A `symmetric = true` kind must declare equal sets: the relation reads
+  the same in both directions, so it cannot allow an asymmetric pair.
+- A manifest that declares a non-person endpoint must list `"0.2"` in
+  `requires_spec`. A 0.1 vault then fails closed with `E_PACK_VERSION`
+  before the endpoint declaration matters.
+- Core edge kinds are reserved in every spec version; an external pack
+  may not claim `married`, `introduced`, `colleague`, `works_at`,
+  `founder_of`, `investor_in`, or `advisor_to`.
 
 ### `[checks]` key namespacing
 
@@ -270,9 +302,11 @@ cannot render a code it does not claim.
 The TOML below is the frozen `personal@0.1` claims that the compiled pack
 shipped with until the #551 cutover. That pack and its in-crate manifest
 (`crates/confidant-core/pack-manifests/personal-0.1/manifest.toml`) are
-deleted; the current built-in is `personal@0.2` at
-`packs/personal/manifest.toml` (§13.7). The example is kept because it is the
-clearest statement of the v1 manifest shape.
+deleted; the current built-in is the `personal` pack, with
+`personal@0.3` at `packs/personal/manifest.toml` for 0.4 and the frozen
+`personal@0.2` bytes in `crates/confidant-core/pack-manifests/personal-0.2/`
+(§13.7). The example is kept because it is the clearest statement of the v1
+manifest shape.
 
 ```toml
 manifest_version = 1
@@ -387,10 +421,9 @@ Notes on the example:
 - `E_TOUCH_MALFORMED` is intentionally absent: it is a core code
   emitted by `check`, not by the pack (cf. the comment on
   `finding_codes()` in `personal.rs`).
-- The edge kinds and finding codes above were checked by hand
-  (2026-10-15) against `PERSONAL_EDGE_KINDS` and `finding_codes()` in
-  `crates/confidant-core/src/packs/personal.rs` and match exactly.
-  Step 4's parity test must prove the same mechanically.
+- The edge kinds and finding codes above match
+  `packs/personal/manifest.toml` and the embedded copy it is vendored
+  from; the drift test pins the bytes.
 - `E_FRONTMATTER`'s `{problem}`/`{fix}` placeholders are filled by Rust
   at the call site (per-field text from `push_field_error`); the
   manifest holds only the template shell and never enumerates the
@@ -401,7 +434,7 @@ Notes on the example:
 
 ## 12. Non-goals
 
-- No new pack is added by this spec; the two compiled packs keep
+- No new pack is added by this spec; the compiled packs keep
   working exactly as today.
 - No change to the `Pack` trait's compiled methods.
 - No grammar language, no expression language, no WASM (per the
@@ -445,12 +478,16 @@ requires_spec = ["0.1"]
 ```
 
 - `[pack].requires_spec`: required in v2, absent in v1. Non-empty list
-  of exact spec version strings.
+  of exact spec version strings. A pack that declares `from` / `to` on an
+  edge kind must include `"0.2"`; a pack that only needs the historical
+  person↔person rule may list `"0.1"` alone.
 - `[[rules]]`: the declarative checks (§13.2). Absent in v1.
 - `[context]`: the opt-in `context` view (§13.9). Absent in v1.
-- Everything else (§4) is unchanged: `record_types`, `balance_metrics`,
-  `finding_codes`, `[pack]` name/version/skill, `[[verbs]]`,
-  `[[fields]]`, `[[edge_kinds]]`, `[checks]`, `[messages]`.
+- Everything else (§4) is unchanged in v2: `record_types` (still an array
+  of names, and empty), `balance_metrics`, `finding_codes`, `[pack]`
+  name/version/skill, `[[verbs]]`, `[[fields]]`, `[[edge_kinds]]`,
+  `[checks]`, `[messages]`. A v3 manifest replaces the name array with
+  `[[record_types]]` tables; see §14.
 
 ### 13.2. `[[rules]]`: generic keys
 
@@ -966,7 +1003,8 @@ only event is a grant on `2026-01-01` emits `none`.
 - `personal` is reserved: no external pack may use it. `personal@…` names
   the implicit built-in personal pack: the listing is a no-op at any
   version, and any vendored directory or lockfile pin for it is
-  `E_PACK_INVALID` (§13.7).
+  `E_PACK_INVALID` (§13.7). The active built-in version is selected by the
+  vault's `spec`, not by the listing (§13.7).
 - Rule `id`s match `^[a-z][a-z0-9_]*$` and are unique within the pack.
 - Finding codes declared by an external pack must match
   `^[EW]_[A-Z0-9_]{2,40}$` (PD13), must not equal any existing core or
@@ -1055,12 +1093,18 @@ issue turns the v2 example into a test.
 
 ### 13.7. Compiled-in built-ins (#550)
 
-A **built-in** pack (today `personal@0.2`) is a v2 manifest whose bytes
-are compiled into the binary and loaded through the same loader and rule
-kinds as an external pack. A built-in is **implicit**: it is enabled in
-every vault, a `packs = []` vault included, and a `personal@…` listing is a
-no-op. The manifest's **origin** is what differs, and only the loader sets
-it (a manifest file cannot claim it):
+A **built-in** pack (today the `personal` pack) is a v2 or v3 manifest
+whose bytes are compiled into the binary and loaded through the same loader
+and rule kinds as an external pack. A built-in is **implicit**: it is
+enabled in every vault, a `packs = []` vault included, and a `personal@…`
+listing is a no-op. A binary may compile more than one version of the same
+built-in; exactly one version is active per vault, selected by the vault's
+`spec`, never by the `packs` list. The active version must list that spec in
+`requires_spec`; the inactive versions are inert. For the personal pack,
+specs 0.1–0.3 select `personal@0.2` (v2) and spec 0.4 selects
+`personal@0.3` (v3). A `personal@…` listing still does not choose a version.
+The manifest's **origin** is what differs, and only the loader sets it (a
+manifest file cannot claim it):
 
 - origin `external` (the default): the bytes came from the vault's
   `packs/<name>@<version>/`; the PD8 capability limits and the
@@ -1077,8 +1121,8 @@ The allowance is keyed on the origin, **never on the pack name**. A
 vault directory `packs/personal@<version>/` still resolves through the
 external path and is `E_PACK_INVALID` (a built-in is never installed
 from the vault: any lockfile pin or vendored directory for its name
-fails closed). The v2 schema itself — rule ids, kinds, declared codes,
-message tables — applies in full.
+fails closed). The manifest schema itself — v2 rules and declared codes, plus v3
+`[[record_types]]` when the active built-in is v3 — applies in full.
 
 ### 13.8. Moving a compiled pack to an external pack
 
@@ -1087,8 +1131,8 @@ pack without a format change. The external pack carries its manifest and
 skill text, is vendored under `packs/<name>@<version>/`, and is pinned in
 `confidant.lock`; the binary stops registering the compiled path. Its
 finding codes stay pack-owned, and a vault that lists the pack resolves it
-like any other external pack. The built-in `personal@0.2` is the only
-compiled pack.
+like any other external pack. The built-in `personal` pack is the only
+compiled pack; a binary may carry more than one of its versions (§13.7).
 
 The legacy top-level `coaching` field in `context` survives (ADR-7): it is
 the entry of the pack named `coaching` that serves the `ledger-sessions`
@@ -1170,3 +1214,87 @@ surface. A pack without `[context]` is check-only, as before.
 over a vault and asserts the literal values and ordering, so arithmetic or
 shape drift fails. The golden `check` JSON files record findings and are
 **not** edited.
+
+## 14. Manifest v3: pack-declared record types (spec 0.3)
+
+*Part of #814. v3 is the same claims file as v2 plus `[[record_types]]`
+tables. The folds, findings, and read paths stay compiled in Rust; a pack
+declares data and text, never logic.*
+
+Set `manifest_version = 3`. A reader that does not implement v3 fails with
+`E_PACK_INVALID` and an "upgrade confidant" fix. A v3 manifest with no
+`[[record_types]]` is otherwise shaped like v2. A v2 manifest remains
+readable but its `record_types` must be an empty array; a string name
+without a declaration is `E_PACK_INVALID`.
+
+### 14.1. `[[record_types]]`
+
+```toml
+manifest_version = 3
+
+[pack]
+name = "place-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.3"]
+
+[[record_types]]
+name = "place"
+id_prefix = "pl"
+collection = "places"
+main_file = "place.md"
+entity = true
+person_like = false
+no_ai = "full"
+roster = true
+required_fields = ["name"]
+optional_fields = ["address"]
+
+[[fields]]
+name = "address"
+grammar = "non-empty-string"
+
+[[edge_kinds]]
+name = "visited"
+symmetric = false
+from = ["person"]
+to = ["place"]
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | The record's `type:` value; `^[a-z][a-z0-9_]{0,31}$`; not a core type or `package`. |
+| `id_prefix` | string | Exactly two lowercase letters; not core `p/o/d/i/n/e` or `pkg`; the second letter must not be `p/o/d/i/n/e` (the scanner must not confuse `xp-` with a glued `p-`). |
+| `collection` | string | Vault-relative directory; `^[a-z][a-z0-9_-]{0,31}$`; not a core/vault name; unique per type. |
+| `main_file` | string | Plain `.md` file name inside `<collection>/<prefix>-<ULID>/`; no slash/dotfile. |
+| `entity` | bool, default false | May be an edge endpoint, a `context` target, and an `entity:` target. |
+| `person_like` | bool, default false | Opts into person read semantics. In 0.3: `no_ai = "notes"` and a person-shaped `context` view. `resolve`, `touch`, and cadence-rule subjects remain core-person-only. Implies `entity = true`. |
+| `no_ai` | string, default `"none"` | `none`, `full`, or `notes`. `notes` requires `person_like`. |
+| `roster` | bool, default = `entity` | Included in `record list --kind all`. `--kind <type>` always works for a declared type. |
+| `required_fields` | string array, default empty | `name` or a field declared in this manifest's `[[fields]]`; missing is `E_FRONTMATTER`. |
+| `optional_fields` | string array, default empty | Same names; no duplicates and no overlap with required. |
+
+Unknown keys are an error. A type declaration also makes the type a pack
+claim: two enabled packs claiming the same name, prefix, or collection is
+`E_PACK_CONFLICT`; the same collision with core is `E_PACK_INVALID`.
+
+The declaration must list `"0.3"` in `requires_spec`. A 0.1/0.2 vault
+therefore fails closed with `E_PACK_VERSION` before the declaration matters.
+
+### 14.2. Verb and edge endpoint names
+
+`[[verbs]].id_type` and `[[edge_kinds]].from` / `to` resolve against core
+types plus the **same manifest's** declared types. Cross-pack type
+references are `E_PACK_INVALID` in 0.3: core is the shared vocabulary, and
+a pack's domain types are self-contained. A type with `entity = false`
+cannot appear in an edge endpoint list.
+
+### 14.3. Ownership, scope, and removal
+
+A declared type's records are owned by the declaring pack for `--packs`
+scoping. A disabled, retired, or undeclared type's records are
+`W_PACK_ORPHAN`: they remain parseable and editable, are hidden from agent
+reads by the type gate, and are visible to the operator path. A removed
+pack's types are preserved by `[[retired_types]]` in `confidant.toml`
+(spec 0.3 §2); writing that table belongs to the pack-removal workflow, not
+this manifest.

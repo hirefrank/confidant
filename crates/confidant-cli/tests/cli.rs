@@ -89,7 +89,7 @@ fn check_demo_json_ok() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["schema_version"], "1");
-    assert_eq!(v["spec"], "0.1");
+    assert_eq!(v["spec"], "0.2");
     assert!(v["vault"].as_str().unwrap().contains("demo-vault"));
     // Personal-first teaching content: two warnings, no errors. The default
     // `--fail-on error` keeps the CI step exiting 0.
@@ -124,6 +124,31 @@ fn find_demo_hits_fake_name() {
         .unwrap()
         .iter()
         .any(|m| { m["excerpt"].as_str().unwrap().contains("Dana Example") }));
+}
+
+#[test]
+fn demo_context_org_shows_the_works_at_edge() {
+    let v = run_json(&["context", CLI_ORG], &demo());
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["entity"]["kind"], "org");
+    assert_eq!(v["entity"]["name"], "Example Studio");
+    assert!(v.get("person").is_none(), "{v}");
+    let edges = v["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "{v}");
+    assert_eq!(edges[0]["kind"], "works_at");
+    assert_eq!(edges[0]["direction"], "in");
+    assert_eq!(edges[0]["other"]["id"], "p-01M3TC5H00MPJG000000000101");
+    assert_eq!(edges[0]["other"]["name"], "Dana Example");
+}
+
+#[test]
+fn demo_find_returns_the_org() {
+    let v = run_json(&["find", "Example Studio"], &demo());
+    assert!(v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"] == CLI_ORG && m["path"] == "orgs/o-01M3TC5H00MPJG000000000901/org.md"));
 }
 
 #[test]
@@ -503,6 +528,263 @@ fn context_scoped_to_example_pack_filters_notes() {
 
 const BEA: &str = "p-01M3TC5H00MPJG000H24000001";
 const EDGE_FRIEND: &str = "e-01M3TC5H00MPJG00E100000000";
+const CLI_ORG: &str = "o-01M3TC5H00MPJG000000000901";
+const CLI_WORKS: &str = "e-01M3TC5H00MPJG00E200000000";
+
+/// A 0.2 vault with two people and one org, plus a person→org `works_at`
+/// edge. Fake data only.
+fn entity_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.2\"\npacks = []\nvault_id = \"01M3TC5H00MPJG005VQC00000B\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    )
+    .unwrap();
+    for (id, name) in [(ADA, "Ada Example"), (BEA, "Bea Demo")] {
+        let d = root.join(format!("people/{id}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("profile.md"),
+            format!("---\nid: {id}\ntype: person\nname: {name}\n---\n\nFake person.\n"),
+        )
+        .unwrap();
+    }
+    let org_dir = root.join(format!("orgs/{CLI_ORG}"));
+    std::fs::create_dir_all(&org_dir).unwrap();
+    std::fs::write(
+        org_dir.join("org.md"),
+        format!("---\nid: {CLI_ORG}\ntype: org\nname: Example Studio\n---\n\nFake org body.\n"),
+    )
+    .unwrap();
+    let edge_dir = root.join(format!("edges/{CLI_WORKS}"));
+    std::fs::create_dir_all(&edge_dir).unwrap();
+    std::fs::write(
+        edge_dir.join("edge.md"),
+        format!(
+            "---\nid: {CLI_WORKS}\ntype: edge\na: {ADA}\nb: {CLI_ORG}\nkind: works_at\nsince: 2024-01-01\n---\n"
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+fn personal_04() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/personal-0.4")
+}
+
+#[test]
+fn context_personal_04_fields_and_no_ai_bundle() {
+    let vault = personal_04();
+    let place = "pl-01M3TC5H00MPJG000000000201";
+    let v = run_json(&["context", place], &vault);
+    assert_eq!(v["entity"]["kind"], "place");
+    assert_eq!(v["entity"]["fields"]["kind"], "work");
+    assert_eq!(v["entity"]["fields"]["address"], "1 Example Way");
+    assert_eq!(
+        v["entity"]["fields"]["tags"],
+        serde_json::json!(["studio", "work"])
+    );
+    assert_eq!(
+        v["entity"]["fields"]["links"],
+        serde_json::json!([{"label": "map", "value": "https://example.test/map"}])
+    );
+
+    let private = run_json(&["context", place, "--exclude-private"], &vault);
+    assert_eq!(private["entity"]["fields"]["kind"], "work");
+    assert!(private["entity"]["fields"].get("address").is_none());
+    assert!(private["entity"]["fields"].get("tags").is_none());
+    assert!(private["entity"]["fields"].get("links").is_none());
+    assert!(private["entity"]["name"].is_null());
+    assert!(private["entity"]["profile"].is_null());
+
+    let hidden = "pl-01M3TC5H00MPJG000000000202";
+    let out = Command::new(bin())
+        .args(["context", hidden, "--json", "--vault"])
+        .arg(&vault)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(err["error"]["code"], "E_NOT_FOUND", "{err}");
+
+    let operator = run_json(&["context", hidden, "--for-operator"], &vault);
+    assert_eq!(operator["entity"]["no_ai"], "true");
+    assert_eq!(operator["entity"]["fields"]["kind"], "home");
+    assert_eq!(operator["entity"]["fields"]["address"], "2 Example Lane");
+}
+
+#[test]
+fn context_org_json_shape() {
+    let dir = entity_vault();
+    let v = run_json(&["context", CLI_ORG], dir.path());
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["entity"]["id"], CLI_ORG);
+    assert_eq!(v["entity"]["kind"], "org");
+    assert_eq!(v["entity"]["name"], "Example Studio");
+    assert!(v.get("person").is_none(), "org bundle has no person alias");
+    assert!(v["packs"].as_object().unwrap().is_empty());
+    assert!(v["touchpoints"].as_array().unwrap().is_empty());
+    assert!(v["aliases"].as_array().unwrap().is_empty());
+
+    let edges = v["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "{v}");
+    assert_eq!(edges[0]["id"], CLI_WORKS);
+    assert_eq!(edges[0]["kind"], "works_at");
+    assert_eq!(edges[0]["direction"], "in");
+    assert_eq!(edges[0]["other"]["id"], ADA);
+    assert_eq!(edges[0]["other"]["kind"], "person");
+    assert_eq!(edges[0]["other"]["name"], "Ada Example");
+    assert_eq!(edges[0]["since"], "2024-01-01");
+    assert!(edges[0]["until"].is_null());
+}
+
+#[test]
+fn context_person_json_keeps_person_and_adds_entity_and_edges() {
+    let dir = entity_vault();
+    let v = run_json(&["context", ADA], dir.path());
+    assert_eq!(v["person"]["id"], ADA);
+    assert_eq!(v["person"]["name"], "Ada Example");
+    assert_eq!(v["entity"]["kind"], "person");
+    assert_eq!(v["entity"]["name"], "Ada Example");
+    let edges = v["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "{v}");
+    assert_eq!(edges[0]["direction"], "out");
+    assert_eq!(edges[0]["other"]["id"], CLI_ORG);
+    assert_eq!(edges[0]["other"]["kind"], "org");
+}
+
+#[test]
+fn context_org_omits_edge_to_a_hidden_person() {
+    let dir = entity_vault();
+    std::fs::write(
+        dir.path().join(format!("people/{ADA}/profile.md")),
+        format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\nno-ai: true\n---\n\nFake person.\n"
+        ),
+    )
+    .unwrap();
+    let v = run_json(&["context", CLI_ORG], dir.path());
+    assert!(v["edges"].as_array().unwrap().is_empty(), "{v}");
+    let dumped = v.to_string();
+    assert!(!dumped.contains(ADA), "{dumped}");
+    assert!(!dumped.contains("Ada Example"), "{dumped}");
+}
+
+#[test]
+fn context_org_exclude_private_strips_names_and_bodies() {
+    let dir = entity_vault();
+    let v = run_json(&["context", CLI_ORG, "--exclude-private"], dir.path());
+    assert!(v["entity"]["name"].is_null(), "{v}");
+    assert!(v["entity"]["profile"].is_null(), "{v}");
+    let edge = &v["edges"][0];
+    assert_eq!(edge["id"], CLI_WORKS);
+    assert_eq!(edge["kind"], "works_at");
+    assert_eq!(edge["since"], "2024-01-01");
+    assert!(edge["other"]["id"] == ADA);
+    assert!(edge["other"]["name"].is_null(), "{v}");
+}
+
+#[test]
+fn context_deal_is_not_found() {
+    let dir = entity_vault();
+    let deal = "d-01M3TC5H00MPJG00248G000004";
+    let d = dir.path().join(format!("deals/{deal}"));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("deal.md"),
+        format!("---\nid: {deal}\ntype: deal\nname: Fake Deal\n---\n"),
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args(["context", deal, "--json", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no entity"),
+        "{v}"
+    );
+}
+
+#[test]
+fn context_unsupported_spec_fails() {
+    let dir = entity_vault();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"9.9\"\nvault_id = \"01M3TC5H00MPJG005VQC00000B\"\n",
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args(["context", CLI_ORG, "--json", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_SPEC_UNSUPPORTED");
+}
+
+#[test]
+fn context_org_by_name_is_not_resolved_in_phase_one() {
+    let dir = entity_vault();
+    let out = Command::new(bin())
+        .args(["context", "Example Studio", "--json", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+}
+
+#[test]
+fn context_org_bundle_in_zero_one_has_no_edges() {
+    let dir = entity_vault();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01M3TC5H00MPJG005VQC00000B\"\n",
+    )
+    .unwrap();
+    let v = run_json(&["context", CLI_ORG], dir.path());
+    assert_eq!(v["entity"]["kind"], "org");
+    assert!(v["edges"].as_array().unwrap().is_empty(), "{v}");
+}
+
+#[test]
+fn context_org_text_output_names_the_kind_and_counts_edges() {
+    let dir = entity_vault();
+    let out = Command::new(bin())
+        .args(["context", CLI_ORG, "--no-input", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Example Studio (org)"), "{text}");
+    assert!(text.contains("edges: 1"), "{text}");
+    assert!(!text.contains("[no-ai]"), "{text}");
+}
+
+#[test]
+fn context_operator_does_not_badge_a_visible_person() {
+    let dir = entity_vault();
+    let out = Command::new(bin())
+        .args(["context", ADA, "--for-operator", "--no-input", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Ada Example"), "{text}");
+    assert!(!text.contains("[no-ai]"), "{text}");
+}
 
 /// A vault with personal-owned data — a personal field (`relationship`), a
 /// personal edge kind (`friend`), and a `touch` ledger line — next to a
@@ -1038,7 +1320,8 @@ fn help_pack_bare_includes_external_pack() {
 }
 
 /// PD10 (#445) acceptance: a compiled pack's skill output is unchanged
-/// byte for byte — it ships with the binary, so it gets no label.
+/// byte for byte — it ships with the binary, so it gets no label. The demo
+/// vault is spec 0.2, so it serves the frozen 0.2 text.
 #[test]
 fn help_pack_compiled_is_unlabelled() {
     let out = Command::new(bin())
@@ -1052,12 +1335,57 @@ fn help_pack_compiled_is_unlabelled() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    let shipped = include_str!("../pack-skills/personal/SKILL.md");
+    let shipped = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../confidant-core/pack-manifests/personal-0.2/SKILL.md"),
+    )
+    .expect("read frozen 0.2 skill");
     assert!(!stdout.starts_with("[external pack:"), "{stdout:?}");
     assert_eq!(
         stdout,
         format!("{shipped}\n"),
         "compiled skill output must be byte-identical to the shipped text"
+    );
+}
+
+/// #745: a 0.4 vault serves the 0.3 built-in skill, byte for byte.
+#[test]
+fn help_pack_personal_0_3_serves_the_0_4_skill() {
+    let vault = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/corrections-0.4");
+    let out = Command::new(bin())
+        .args(["help", "pack:personal@0.3", "--vault"])
+        .arg(vault)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let shipped = include_str!("../pack-skills/personal/SKILL.md");
+    assert!(!stdout.starts_with("[external pack:"), "{stdout:?}");
+    assert_eq!(
+        stdout,
+        format!("{shipped}\n"),
+        "0.4 must serve the personal@0.3 skill text"
+    );
+
+    // A versioned built-in listing names the active version at any version.
+    let alias = Command::new(bin())
+        .args(["help", "pack:personal@0.2", "--vault"])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/corrections-0.4"))
+        .output()
+        .unwrap();
+    assert!(
+        alias.status.success(),
+        "{}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(alias.stdout).unwrap(),
+        format!("{shipped}\n"),
+        "personal@0.2 is a no-op alias on 0.4"
     );
 }
 
@@ -1133,6 +1461,132 @@ fn tui_help_lists_subcommand() {
     assert!(out.status.success());
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("tui"), "{help}");
+}
+
+/// Every visible top-level command (#721). Hidden `bench-gen` is left out of
+/// human help but stays in `help --json`.
+const VISIBLE_COMMANDS: &[&str] = &[
+    "setup",
+    "init",
+    "doctor",
+    "status",
+    "sync",
+    "check",
+    "context",
+    "find",
+    "log",
+    "note",
+    "record",
+    "alias",
+    "resolve",
+    "agents",
+    "mcp",
+    "routing",
+    "pack",
+    "import",
+    "allowlist",
+    "schema",
+    "update",
+    "which",
+    "help",
+    "tui",
+];
+
+/// #721: the human top level groups commands by journey instead of one flat
+/// list, keeps the required `<COMMAND>` in usage, and never drops a visible
+/// command. `help --json` is a separate contract and stays flat.
+#[test]
+fn help_groups_commands_by_journey() {
+    let out = Command::new(bin()).arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+
+    let groups = ["Start here", "Everyday", "Integrations", "Advanced / rare"];
+    let mut last = 0;
+    for group in groups {
+        let at = help
+            .find(group)
+            .unwrap_or_else(|| panic!("missing group {group}\n{help}"));
+        assert!(at >= last, "group out of order: {group}\n{help}");
+        last = at;
+    }
+
+    for command in VISIBLE_COMMANDS {
+        assert!(
+            help.lines()
+                .any(|line| line.starts_with(&format!("    {command}  "))),
+            "missing grouped command {command}\n{help}"
+        );
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.starts_with(&format!("  {command}  "))),
+            "command {command} still appears in a flat list\n{help}"
+        );
+    }
+    assert!(
+        help.contains("Usage: confidant [OPTIONS] <COMMAND>"),
+        "{help}"
+    );
+}
+
+#[test]
+fn help_examples_cover_each_journey() {
+    let out = Command::new(bin()).arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for example in [
+        "Start here:        confidant setup --agent auto",
+        "Everyday:          confidant log touch p-01H… meal --json --no-input",
+        "Integrations:      confidant mcp",
+        "Advanced / rare:   confidant schema --json",
+        "Demo vault:        confidant check --vault ./examples/demo-vault",
+    ] {
+        assert!(help.contains(example), "missing example: {example}\n{help}");
+    }
+}
+
+/// `confidant help` with no topic prints the same human screen as
+/// `confidant --help`; `-h` keeps the short option summary.
+#[test]
+fn help_subcommand_uses_grouped_journeys() {
+    let out = Command::new(bin()).arg("help").output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for group in ["Start here", "Everyday", "Integrations", "Advanced / rare"] {
+        assert!(help.contains(group), "missing group {group}\n{help}");
+    }
+    assert!(
+        help.lines().any(|line| line.starts_with("    setup  ")),
+        "{help}"
+    );
+}
+
+/// #721 / ADR-7: grouping is human help only. `help --json` stays one flat,
+/// ordered list with the hidden `bench-gen` entry and no journey metadata.
+#[test]
+fn help_json_stays_flat() {
+    let out = Command::new(bin())
+        .args(["help", "--json"])
+        .env_remove("CONFIDANT_VAULT")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema_version"], "1");
+    assert!(v["vault"].is_null());
+    assert!(v.get("journeys").is_none());
+    let names: Vec<&str> = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.first(), Some(&"check"));
+    assert_eq!(names.last(), Some(&"bench-gen"));
+    for name in VISIBLE_COMMANDS {
+        assert!(names.contains(name), "help --json lost {name}: {names:?}");
+    }
 }
 
 #[test]
@@ -1661,7 +2115,7 @@ fn hostile_pack_dir() -> tempfile::TempDir {
         dir.path().join("manifest.toml"),
         format!(
             "manifest_version = 2\n\
-             record_types = [\"bad{bidi}record\"]\n\
+             record_types = []\n\
              balance_metrics = [\"bad{bidi}metric\"]\n\
              finding_codes = [\"E_FRONTMATTER\", \"W_EXAMPLE_UNSAFE\"]\n\
              \n\
@@ -1737,7 +2191,6 @@ fn pack_add_escapes_untrusted_report_text_and_lists_every_claim() {
     }
     // One-line values are escaped, including the newline in a field name.
     assert!(stdout.contains("bad\\u{202e}\\nfield"), "{stdout}");
-    assert!(stdout.contains("bad\\u{202e}record"), "{stdout}");
     assert!(stdout.contains("bad\\u{202e}metric"), "{stdout}");
     assert!(stdout.contains("example-pack.bad\\u{202e}key"), "{stdout}");
     // PD10: the full claim list, not just counts.
@@ -1771,10 +2224,7 @@ fn pack_add_escapes_untrusted_report_text_and_lists_every_claim() {
         v["claims"]["fields"],
         serde_json::json!(["bad\\u{202e}\\nfield", "birthday"])
     );
-    assert_eq!(
-        v["claims"]["record_types"],
-        serde_json::json!(["bad\\u{202e}record"])
-    );
+    assert_eq!(v["claims"]["record_types"], serde_json::json!([]));
     let files = v["files"].as_array().unwrap();
     assert!(
         files.iter().any(|f| f["path"] == "README-\\u{202e}evil"),
@@ -2050,6 +2500,8 @@ fn pack_add_yes_dry_run_writes_nothing() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["dry_run"], true, "{v}");
+    assert_eq!(v["checks"]["pre"], "passed", "{v}");
+    assert_eq!(v["checks"]["post"], "skipped", "{v}");
     assert!(v["commit"].is_null(), "{v}");
     assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), "1\n");
     assert!(!vault.path().join("packs").exists());
@@ -2062,6 +2514,16 @@ fn pack_add_yes_dry_run_writes_nothing() {
 #[test]
 fn pack_init_round_trip_review_install_and_update() {
     let vault = git_vault();
+    // The scaffold is a v3 manifest and requires vault spec 0.3.
+    let config_path = vault.path().join("confidant.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        config.replace("spec = \"0.1\"", "spec = \"0.3\""),
+    )
+    .unwrap();
+    git(vault.path(), &["add", "confidant.toml"]);
+    git(vault.path(), &["commit", "-q", "--amend", "--no-edit"]);
     let parent = tempfile::tempdir().unwrap();
     let source = parent.path().join("example-local");
 
@@ -3818,12 +4280,13 @@ fn roster_names(v: &serde_json::Value) -> Vec<&str> {
 
 #[test]
 fn record_list_demo_is_the_cleared_set_in_name_order() {
-    let v = demo_roster(&[]);
+    let v = demo_roster(&["--kind", "person"]);
     // ADR-7 envelope: resolved vault path, ok, schema version.
     assert_eq!(v["ok"], true);
     assert_eq!(v["schema_version"], "1");
     assert!(v["vault"].as_str().unwrap().contains("demo-vault"));
     assert_eq!(v["kind"], "person");
+    assert_eq!(v["kinds"], serde_json::json!(["person"]));
     assert_eq!(v["for_operator"], false);
     // Deterministic: display name, case-insensitive.
     assert_eq!(
@@ -3837,9 +4300,34 @@ fn record_list_demo_is_the_cleared_set_in_name_order() {
     }
 }
 
+/// #813: the default roster is every identity kind, so the demo org is
+/// visible without knowing to pass `--kind org`.
+#[test]
+fn record_list_defaults_to_all_identity_kinds() {
+    let v = demo_roster(&[]);
+    assert_eq!(v["kind"], "all");
+    assert_eq!(v["kinds"], serde_json::json!(["person", "org", "deal"]));
+    let names = roster_names(&v);
+    for expected in ["Dana Example", "Eli Sample", "Example Studio"] {
+        assert!(names.contains(&expected), "{expected} missing: {v}");
+    }
+    let org = v["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "org")
+        .expect("demo org in the default roster");
+    assert_eq!(org["name"], "Example Studio");
+
+    // The explicit spelling is the same call.
+    let explicit = demo_roster(&["--kind", "all"]);
+    assert_eq!(explicit["kind"], "all");
+    assert_eq!(roster_names(&explicit), roster_names(&v));
+}
+
 #[test]
 fn record_list_demo_for_operator_adds_no_ai_with_tri_state() {
-    let v = demo_roster(&["--for-operator"]);
+    let v = demo_roster(&["--kind", "person", "--for-operator"]);
     assert_eq!(v["for_operator"], true);
     assert_eq!(
         roster_names(&v),
@@ -3872,9 +4360,80 @@ fn record_list_kind_filters() {
 
     let orgs = run_json(&["record", "list", "--kind", "org"], dir.path());
     assert_eq!(orgs["kind"], "org");
+    assert_eq!(orgs["kinds"], serde_json::json!(["org"]));
     assert_eq!(roster_names(&orgs), vec!["Example Org"]);
     let deals = run_json(&["record", "list", "--kind", "deal"], dir.path());
+    assert_eq!(deals["kind"], "deal");
     assert_eq!(roster_names(&deals), vec!["Example Deal"]);
+
+    // `all` is explicit too, and lists both identity kinds in name order.
+    let all = run_json(&["record", "list", "--kind", "all"], dir.path());
+    assert_eq!(all["kind"], "all");
+    assert_eq!(all["kinds"], serde_json::json!(["person", "org", "deal"]));
+    assert_eq!(roster_names(&all), vec!["Example Deal", "Example Org"]);
+}
+
+#[test]
+fn record_list_shows_orphan_badges_and_rejects_non_roster_kinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.3\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n[[retired_types]]\nname = \"place\"\nid_prefix = \"pl\"\ncollection = \"places\"\nmain_file = \"place.md\"\nentity = true\nperson_like = false\nno_ai = \"full\"\nroster = true\nremoved_pack = \"place-pack@0.1\"\n",
+    )
+    .unwrap();
+    let place = "pl-01J9Z3K4QF0000000000000001";
+    std::fs::create_dir_all(root.join("places").join(place)).unwrap();
+    std::fs::write(
+        root.join("places").join(place).join("place.md"),
+        format!("---\nid: {place}\ntype: place\nname: Example Studio\n---\n"),
+    )
+    .unwrap();
+
+    // The agent path hides the retired type; the operator path shows it
+    // with an orphan badge.
+    let agent = run_json(&["record", "list", "--kind", "place"], root);
+    assert!(agent["records"].as_array().unwrap().is_empty(), "{agent}");
+    let operator = run_json(
+        &["record", "list", "--kind", "place", "--for-operator"],
+        root,
+    );
+    assert_eq!(operator["records"][0]["kind"], "place");
+    assert_eq!(operator["records"][0]["orphan"], "removed");
+    let human = Command::new(bin())
+        .args([
+            "record",
+            "list",
+            "--kind",
+            "place",
+            "--for-operator",
+            "--no-input",
+            "--vault",
+        ])
+        .arg(root)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("[orphan: removed]"), "{text}");
+
+    for kind in ["note", "interaction", "edge", "nonexistent"] {
+        let out = Command::new(bin())
+            .args([
+                "record",
+                "list",
+                "--kind",
+                kind,
+                "--json",
+                "--no-input",
+                "--vault",
+            ])
+            .arg(root)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{kind}: {out:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["error"]["code"], "usage_error", "{kind}: {v}");
+    }
 }
 
 #[test]
@@ -3882,7 +4441,7 @@ fn record_list_packs_scope_is_reported_and_fails_closed() {
     // The scope is echoed and validated, like `find` / `context`. Roster
     // entries are core-owned identity records, so a narrower scope does not
     // remove them today.
-    let v = demo_roster(&["--packs", "personal@0.2"]);
+    let v = demo_roster(&["--kind", "person", "--packs", "personal@0.2"]);
     assert_eq!(v["scope"], serde_json::json!(["personal@0.2"]));
     assert_eq!(
         roster_names(&v),
@@ -3966,6 +4525,28 @@ fn record_list_text_output_lists_one_entry_per_line() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("Dana Example"), "{text}");
     assert!(text.contains("Eli Sample"), "{text}");
+    assert!(text.contains("Example Studio"), "{text}");
+    assert!(text.contains("5 records (all)"), "{text}");
+}
+
+#[test]
+fn record_list_text_output_names_a_person_filter() {
+    let out = Command::new(bin())
+        .args([
+            "record",
+            "list",
+            "--kind",
+            "person",
+            "--no-input",
+            "--vault",
+        ])
+        .arg(demo())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Dana Example"), "{text}");
+    assert!(!text.contains("Example Studio"), "{text}");
     assert!(text.contains("4 people (person)"), "{text}");
 }
 

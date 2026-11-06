@@ -17,15 +17,15 @@
 use serde::Serialize;
 
 use crate::id::RecordId;
-use crate::record::RecordKind;
-use crate::scope::PackScope;
-use crate::search::cleared_record_ids;
+use crate::record_type::TypeOwner;
+use crate::scope::{record_owners, PackScope};
+use crate::search::{cleared_record_ids, cleared_record_ids_for_operator};
 use crate::vault::Vault;
 
 /// One roster entry: the identity fields a list view needs.
 #[derive(Clone, Debug, Serialize)]
 pub struct RosterEntry {
-    /// Opaque record id (`p-…`, `o-…`, `d-…`).
+    /// Opaque record id (`p-…`, `o-…`, `d-…`, or a pack type's prefix).
     pub id: String,
     /// Display name, falling back to the opaque id when the record is
     /// unnamed. Never `null`: a list view always has something to render.
@@ -34,56 +34,116 @@ pub struct RosterEntry {
     /// `"false"` (absent field = `"false"`). Only meaningful with the
     /// operator flag; a `no-ai: true` record is absent without it.
     pub no_ai: &'static str,
-    /// Record kind (`"person"`, `"org"`, `"deal"`).
-    pub kind: &'static str,
+    /// Record kind (a core type or a pack-declared type).
+    pub kind: String,
+    /// Operator path only: why this record is orphaned (a disabled pack, a
+    /// removed pack, or an unknown type). Absent for a live type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orphan: Option<String>,
+    /// Spec 0.4: this record is retired. Present only on the operator path
+    /// when true; the agent path never lists a retired record.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub retired: bool,
 }
 
 /// The whole roster plus the envelope-level context a reader needs.
 #[derive(Clone, Debug, Serialize)]
 pub struct Roster {
-    /// The requested record kind (`"person"`, `"org"`, `"deal"`).
-    pub kind: &'static str,
+    /// The requested filter: `"all"` or a core/pack type name.
+    pub kind: String,
+    /// The record kinds included by this call.
+    pub kinds: Vec<String>,
     /// Whether the operator-only visibility flag was set.
     pub for_operator: bool,
     pub records: Vec<RosterEntry>,
     /// Pack names in scope for this call, sorted. For an unscoped call,
-    /// every enabled pack. Entries are core-owned identity records, so the
-    /// scope does not remove them today; it is reported for contract
-    /// consistency with `find` / `context` and validates `--packs`.
+    /// every enabled pack. Core identity entries remain; a pack-type
+    /// record is filtered out when its declaring pack is out of scope.
     pub scope: Vec<String>,
 }
 
-/// Build the roster for `kind`.
+/// Core identity kinds `--kind all` always lists. Notes, interactions, and
+/// edges are not roster kinds; `deal` is listable but not an edge endpoint.
+const ALL_KINDS: &[&str] = &["person", "org", "deal"];
+
+/// Whether `name` is a roster kind this vault can list. `all` and core
+/// identity kinds are always valid; a declared pack type is valid (even when
+/// it is not in the default list), a retired or unknown type is valid when
+/// records of it exist so the operator can see orphans. Core notes,
+/// interactions, and edges are not roster kinds.
+pub fn is_roster_kind(vault: &Vault, name: &str) -> bool {
+    if name == "all" || ALL_KINDS.contains(&name) {
+        return true;
+    }
+    if matches!(name, "note" | "interaction" | "edge") {
+        return false;
+    }
+    vault.type_registry().get(name).is_some()
+        || vault
+            .records
+            .values()
+            .any(|record| record.kind.as_str() == name)
+}
+
+/// Build the roster for `kind` (`None` = `all`).
 ///
-/// A record is listed when it is in the §12 cleared set, or — with
-/// `for_operator` — when its own mode is `no-ai: true` (the only reason a
-/// record is added by the flag: a `no-ai: notes` person already clears).
-///
-/// The flag adds records by their *own* mode only, so with `--for-operator`
-/// a deal or org that is uncleared only because it links to a `no-ai` person
-/// stays hidden — only the person roster is the complete case. Showing
-/// those requires a per-kind "uncleared because of a reference" rule that
-/// the §12 allowlist does not expose as a single check.
+/// `all` lists the three core identity kinds plus every declared type whose
+/// declaration sets `roster = true` (or a retired tombstone with it). An
+/// explicit name lists that declared type even when `roster = false`, and
+/// also lists an orphaned type with records so the operator can see it.
+/// Scope filters pack-owned records.
 pub fn build_roster(
     vault: &Vault,
-    kind: RecordKind,
+    kind: Option<&str>,
     scope: &PackScope,
     for_operator: bool,
 ) -> Roster {
-    let cleared = cleared_record_ids(vault);
+    let cleared = if for_operator {
+        cleared_record_ids_for_operator(vault)
+    } else {
+        cleared_record_ids(vault)
+    };
     let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
     let scope_names = scope.names(&enabled);
+    let spec = vault
+        .spec_version()
+        .unwrap_or(crate::config::SpecVersion::V01);
+
+    let mut all_kinds: Vec<String> = ALL_KINDS.iter().map(|kind| (*kind).to_owned()).collect();
+    for decl in vault.type_registry().all() {
+        if !ALL_KINDS.contains(&decl.name) && decl.roster {
+            all_kinds.push(decl.name.to_owned());
+        }
+    }
+    let kinds: Vec<String> = match kind {
+        Some(kind) => vec![kind.to_owned()],
+        None => all_kinds,
+    };
+    let included = |name: &str| kinds.iter().any(|kind| kind == name);
 
     let mut sortable: Vec<(String, RecordId, RosterEntry)> = Vec::new();
     for rec in vault.records.values() {
-        if rec.kind != kind {
+        if !included(rec.kind.as_str()) {
             continue;
         }
-        if !cleared.contains(&rec.id) && !(for_operator && rec.no_ai()) {
+        if !cleared.contains(&rec.id) {
+            continue;
+        }
+        if !scope.allows(&record_owners(rec, &Default::default(), &enabled, spec)) {
             continue;
         }
         let name = rec.name.clone().unwrap_or_else(|| rec.id.to_string());
         let no_ai = rec.no_ai_mode().map(|m| m.as_str()).unwrap_or("false");
+        let orphan = match vault.type_registry().get(rec.kind.as_str()) {
+            Some(decl) if decl.retired => Some("removed".to_owned()),
+            Some(decl) if !decl.enabled => match decl.owner {
+                TypeOwner::Pack(pack) => Some(pack.to_owned()),
+                TypeOwner::Retired(_) => Some("removed".to_owned()),
+                TypeOwner::Core => None,
+            },
+            Some(_) => None,
+            None => Some("unknown".to_owned()),
+        };
         sortable.push((
             crate::search::case_fold(&name),
             rec.id.clone(),
@@ -91,14 +151,17 @@ pub fn build_roster(
                 id: rec.id.to_string(),
                 name,
                 no_ai,
-                kind: rec.kind.as_str(),
+                kind: rec.kind.as_str().to_owned(),
+                orphan,
+                retired: vault.is_retired(&rec.id),
             },
         ));
     }
     sortable.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
     Roster {
-        kind: kind.as_str(),
+        kind: kind.map_or_else(|| "all".to_owned(), str::to_owned),
+        kinds,
         for_operator,
         records: sortable.into_iter().map(|(_, _, entry)| entry).collect(),
         scope: scope_names,
@@ -118,7 +181,7 @@ mod tests {
     #[test]
     fn roster_without_flag_is_the_cleared_set() {
         let vault = demo_vault();
-        let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, false);
+        let roster = build_roster(&vault, Some("person"), &PackScope::All, false);
         let names: Vec<&str> = roster.records.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
@@ -126,6 +189,7 @@ mod tests {
         );
         assert!(roster.records.iter().all(|r| r.no_ai == "false"));
         assert_eq!(roster.kind, "person");
+        assert_eq!(roster.kinds, vec!["person".to_owned()]);
         assert!(!roster.for_operator);
         assert!(roster.scope.contains(&"personal@0.2".to_string()));
     }
@@ -133,7 +197,7 @@ mod tests {
     #[test]
     fn operator_roster_lists_the_demo_people_with_tri_state() {
         let vault = demo_vault();
-        let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, true);
+        let roster = build_roster(&vault, Some("person"), &PackScope::All, true);
         let names: Vec<&str> = roster.records.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
@@ -166,7 +230,7 @@ mod tests {
             .unwrap();
         }
         let vault = crate::vault::load_vault(dir.path()).unwrap();
-        let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, false);
+        let roster = build_roster(&vault, Some("person"), &PackScope::All, false);
         let ids: Vec<&str> = roster.records.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -191,7 +255,7 @@ mod tests {
         std::fs::create_dir_all(d.parent().unwrap()).unwrap();
         std::fs::write(&d, format!("---\nid: {id}\ntype: person\n---\n\n")).unwrap();
         let vault = crate::vault::load_vault(dir.path()).unwrap();
-        let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, false);
+        let roster = build_roster(&vault, Some("person"), &PackScope::All, false);
         assert_eq!(roster.records.len(), 1);
         assert_eq!(roster.records[0].name, id);
     }
@@ -215,7 +279,7 @@ mod tests {
         )
         .unwrap();
         let vault = crate::vault::load_vault(dir.path()).unwrap();
-        let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, false);
+        let roster = build_roster(&vault, Some("person"), &PackScope::All, false);
         assert_eq!(roster.records.len(), 1);
         assert_eq!(roster.records[0].no_ai, "notes");
     }
@@ -243,14 +307,110 @@ mod tests {
         )
         .unwrap();
         let vault = crate::vault::load_vault(dir.path()).unwrap();
-        let orgs = build_roster(&vault, RecordKind::Org, &PackScope::All, false);
+        let orgs = build_roster(&vault, Some("org"), &PackScope::All, false);
         assert_eq!(orgs.records.len(), 1);
         assert_eq!(orgs.records[0].name, "Example Org");
         assert_eq!(orgs.records[0].kind, "org");
         assert_eq!(orgs.records[0].no_ai, "false");
-        let deals = build_roster(&vault, RecordKind::Deal, &PackScope::All, false);
+        assert_eq!(orgs.kinds, vec!["org".to_owned()]);
+        let deals = build_roster(&vault, Some("deal"), &PackScope::All, false);
         assert_eq!(deals.records.len(), 1);
         assert_eq!(deals.records[0].name, "Example Deal");
         assert_eq!(deals.records[0].kind, "deal");
+        assert_eq!(deals.kinds, vec!["deal".to_owned()]);
+    }
+
+    /// #813: the default roster is the three identity kinds. Notes,
+    /// interactions, and edges are not roster kinds; deals are listable but
+    /// never edge endpoints.
+    #[test]
+    fn roster_all_lists_only_identity_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.2\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        )
+        .unwrap();
+        let person = "p-01J9Z3K4QF0000000000000001";
+        let other = "p-01J9Z3K4QF0000000000000002";
+        let org = "o-01J9Z3K4QF0000000000000003";
+        let deal = "d-01J9Z3K4QF0000000000000004";
+        let note = "n-01J9Z3K4QF0000000000000005";
+        for (rel, body) in [
+            (
+                format!("people/{person}/profile.md"),
+                format!("---\nid: {person}\ntype: person\nname: Ada Example\n---\n"),
+            ),
+            (
+                format!("people/{other}/profile.md"),
+                format!("---\nid: {other}\ntype: person\nname: Bea Example\n---\n"),
+            ),
+            (
+                format!("orgs/{org}/org.md"),
+                format!("---\nid: {org}\ntype: org\nname: Example Org\n---\n"),
+            ),
+            (
+                format!("deals/{deal}/deal.md"),
+                format!("---\nid: {deal}\ntype: deal\nname: Example Deal\n---\n"),
+            ),
+            (
+                format!("notes/{note}/note.md"),
+                format!("---\nid: {note}\ntype: note\nperson: {person}\ndate: 2026-10-01\n---\n"),
+            ),
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let vault = crate::vault::load_vault(dir.path()).unwrap();
+        let roster = build_roster(&vault, None, &PackScope::All, false);
+        assert_eq!(roster.kind, "all");
+        assert_eq!(
+            roster.kinds,
+            vec!["person".to_owned(), "org".to_owned(), "deal".to_owned()]
+        );
+        assert_eq!(
+            roster
+                .records
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Ada Example", "Bea Example", "Example Deal", "Example Org"]
+        );
+        assert_eq!(
+            roster
+                .records
+                .iter()
+                .map(|entry| entry.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["person", "person", "deal", "org"]
+        );
+        assert!(
+            roster.records.iter().all(|entry| entry.id != note),
+            "notes are not roster kinds"
+        );
+    }
+
+    #[test]
+    fn agent_roster_hides_retired_and_operator_shows_the_badge() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/vaults/corrections-0.4");
+        let vault = crate::vault::load_vault(&root).unwrap();
+        let agent = build_roster(&vault, Some("person"), &PackScope::All, false);
+        let retired = RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
+        assert!(agent
+            .records
+            .iter()
+            .all(|entry| entry.id != retired.to_string()));
+        assert!(agent.records.iter().all(|entry| !entry.retired));
+
+        let operator = build_roster(&vault, Some("person"), &PackScope::All, true);
+        let entry = operator
+            .records
+            .iter()
+            .find(|entry| entry.id == retired.to_string())
+            .expect("operator roster must include a retired record");
+        assert!(entry.retired);
+        assert!(!agent.records.iter().any(|entry| entry.retired));
     }
 }

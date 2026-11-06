@@ -7,6 +7,12 @@ everyday life — a friend, family, a partner, a mentor — with birthdays,
 keep-in-touch cadences, relationship edges, and `touch` ledger lines for
 calls, texts, meals, and meetings.
 
+The vault is spec 0.2. Alongside the person↔person edges it carries one org,
+Example Studio, and a `works_at` person→org edge from Dana Example. That
+gives `context o-01M3TC5H00MPJG000000000901` a real org bundle and makes
+`record list` (which defaults to every identity kind) show the org without
+an explicit `--kind org`.
+
 The built-in `personal@0.2` pack is implicit: it is enabled without being
 listed in `packs = [...]`. The `[checks]` block sets the personal nudge
 keys and pins `as_of = "2026-10-08"` so the demo findings stay stable.

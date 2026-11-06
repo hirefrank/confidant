@@ -45,6 +45,19 @@ after that explicit key press. Turning it off drops the operator roster and
 context before reloading, so a failed reload cannot leave hidden content on
 screen without the banner.
 
+Spec 0.4 adds a `[retired]` badge to the operator roster. A retired record
+stays visible there (with its `no_ai` badge too, when it has one) so the
+operator can find and unretire it, but it is absent from the agent roster
+and `context` returns no bundle for it. The TUI only renders what the CLI's
+effective view returns: superseded ledger lines are already gone from
+`context` touchpoints and pack state, and the TUI never re-adds one.
+
+Places and things are not in the People workspace yet: the TUI stays
+person-only, and `entity.fields` is additive CLI JSON it ignores. Use
+`confidant record list --kind place|thing` (operator path) and
+`confidant context pl-…|th-…` from the CLI until a dedicated place/thing
+view exists.
+
 ## Editing
 
 Editing is always operator-only, independent of operator mode: from the
@@ -54,6 +67,15 @@ read `no-ai` records even while the roster view is un-badged (operator
 mode off); the badges and banner describe the roster/context view, not the
 edit path.
 
+Corrections and retirement are **not** TUI keybindings. The TUI remains
+read-only for the correction model: use `confidant retract`, `confidant
+correct`, or `confidant record retire|unretire` from the CLI. This is
+deliberate — a retraction is an attributed, check-gated commit and should
+not be a stray keypress in a browsing UI. `record show --for-edit` still
+works on a retired record and prints the retired hint on stderr; the TUI's
+edit path receives the same JSON with `retired: true` and does not change
+its behavior.
+
 The text is staged in 0600 scratch under `<vault>/.confidant/conflicts/<id>/`,
 opens in `$EDITOR`/`$VISUAL` (run as a single program, so `EDITOR="code -w"`
 does not work — the same limitation as the CLI's own `--edit` flows), and is
@@ -62,14 +84,14 @@ explicit `y` confirm. A no-op edit commits nothing.
 
 ## Quick capture
 
-Quick capture is `s` (session), `t` (touch), and `n` (note). Each opens a
+Quick capture is `t` (touch) and `n` (note). Each opens a
 form pre-filled with the selected person's id, so a ULID never has to be
 typed, and `Enter` runs the CLI's `--dry-run` preview; `y` writes it (one
 commit) and any other key cancels and writes nothing. A note body is staged
 in the same 0600 gitignored scratch as the editor flow and removed after the
 write.
 
-Search moved to `f` (it was `s`). The Review Queue workspace (`2`) carries a
+Search is `f`. The Review Queue workspace (`2`) carries a
 badge with its pending count — proposal manifests and unresolved conflicts —
 so a queued item is visible from every workspace.
 

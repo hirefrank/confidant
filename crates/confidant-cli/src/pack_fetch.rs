@@ -572,12 +572,12 @@ impl PackReport {
         // escaped for one line (#499).
         lines.push(format!(
             "  verbs          {}",
-            join_claims(m.verbs.iter().map(|v| match v.id_type {
+            join_claims(m.verbs.iter().map(|v| match v.id_type.as_ref() {
                 // `package` is the only ID prefix without a record type.
                 Some(id_type) => format!(
                     "{} ({})",
                     escape_line(&v.name),
-                    id_type.record_type().unwrap_or("package")
+                    escape_line(id_type.as_str())
                 ),
                 None => escape_line(&v.name),
             }))

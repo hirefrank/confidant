@@ -197,6 +197,10 @@ pub struct Hit {
     pub line: u32,
     #[serde(default)]
     pub excerpt: String,
+    /// Stable ledger line reference (#746), present only for parsed ledger
+    /// hits. Absent on record hits and older CLI output.
+    #[serde(default, rename = "ref")]
+    pub line_ref: Option<String>,
 }
 
 /// Output of `qmd-query.py --vault V <query>` (TUI Search view, #212 3a).
@@ -230,6 +234,10 @@ pub struct SearchHit {
     pub line: u32,
     #[serde(default)]
     pub excerpt: String,
+    /// Stable ledger line reference (#746), absent on record hits and older
+    /// qmd/find output.
+    #[serde(default, rename = "ref")]
+    pub line_ref: Option<String>,
     /// Provenance of the match: `"qmd"` or `"find"`. Anything else is
     /// dropped at render time (fail closed).
     #[serde(default)]
@@ -352,6 +360,10 @@ pub struct RosterEntry {
     pub no_ai: NoAiMode,
     #[serde(default)]
     pub kind: String,
+    /// Spec 0.4: the record is retired. Present only in operator mode; the
+    /// agent roster never lists a retired record. Old CLI output omits it.
+    #[serde(default)]
+    pub retired: bool,
 }
 
 /// Output of `confidant record show <id> --for-edit --json --no-input`
@@ -372,6 +384,9 @@ pub struct EditSource {
     pub path: String,
     #[serde(default)]
     pub no_ai: bool,
+    /// Spec 0.4: the record is retired. Additive; old CLI output omits it.
+    #[serde(default)]
+    pub retired: bool,
     #[serde(default)]
     pub text: String,
 }
@@ -383,6 +398,7 @@ impl std::fmt::Debug for EditSource {
             .field("kind", &self.kind)
             .field("path", &self.path)
             .field("no_ai", &self.no_ai)
+            .field("retired", &self.retired)
             .field("text", &"<redacted>")
             .finish()
     }
@@ -634,6 +650,59 @@ mod tests {
         assert_eq!(plain.no_ai, None);
     }
 
+    /// #814: the roster schema widened to dynamic pack type names; the TUI
+    /// ignores `orphan`, and People keeps requesting `--kind person` only.
+    #[test]
+    fn roster_accepts_pack_type_names_without_changing_people() {
+        let roster: Roster = serde_json::from_str(
+            r#"{"kind": "place", "for_operator": true, "scope": ["place-pack@0.1"],
+                "records": [{"id": "pl-1", "name": "Example Studio", "no_ai": "false",
+                             "kind": "place", "orphan": "removed"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(roster.kind, "place");
+        assert_eq!(roster.records[0].kind, "place");
+        assert_eq!(roster.records[0].name, "Example Studio");
+        assert!(!roster.records[0].retired, "absent retired defaults false");
+    }
+
+    #[test]
+    fn retired_roster_entry_and_ledger_refs_deserialize() {
+        let roster: Roster = serde_json::from_str(
+            r#"{"kind": "person", "for_operator": true,
+                "records": [{"id": "p-1", "name": "Retired Example",
+                             "no_ai": "false", "kind": "person", "retired": true}]}"#,
+        )
+        .unwrap();
+        assert!(roster.records[0].retired);
+
+        let hit: Hit = serde_json::from_str(
+            r#"{"id": "p-1", "path": "ledger/2026/10.cfd", "line": 2,
+                "excerpt": "2026-10-01 touch p-1 call",
+                "ref": "line:87d93568b0d238e8e63086bdf1703f496a2824bc829655b1238332f31c8016c7"}"#,
+        )
+        .unwrap();
+        assert!(hit.line_ref.as_deref().unwrap().starts_with("line:"));
+        let record: Hit = serde_json::from_str(r#"{"path": "people/p-1/profile.md"}"#).unwrap();
+        assert!(record.line_ref.is_none());
+    }
+
+    #[test]
+    fn context_ignores_additive_entity_fields_and_retired_shapes() {
+        // Core 0.4 adds `entity` and omits retired targets; the TUI keeps
+        // rendering the deprecated `person` alias unchanged.
+        let ctx: Context = serde_json::from_str(
+            r#"{"person": {"id": "p-1", "name": "Ada Example", "no_ai": false},
+                "entity": {"id": "p-1", "kind": "person", "name": "Ada Example",
+                           "fields": {"kind": "work"}},
+                "touchpoints": [{"date": "2026-10-01", "kind": "call"}],
+                "packs": {}, "aliases": [], "scope": []}"#,
+        )
+        .unwrap();
+        assert_eq!(ctx.person.id, "p-1");
+        assert_eq!(ctx.touchpoints.len(), 1);
+    }
+
     #[test]
     fn badge_matches_cli_human_output() {
         assert_eq!(NoAiMode::False.badge(), None);
@@ -651,6 +720,7 @@ mod tests {
             kind: "person".to_owned(),
             path: "people/p-1/profile.md".to_owned(),
             no_ai: true,
+            retired: false,
             text: "SENTINEL-SECRET-BODY".to_owned(),
         };
         let debug = format!("{source:?}");

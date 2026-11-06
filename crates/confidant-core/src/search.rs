@@ -6,12 +6,12 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::check::{sort_findings, Finding, FindingCode, Severity};
+use crate::config::SpecVersion;
 use crate::error::DomainError;
 use crate::id::{
-    add_bare_ulid_windows, person_id_from_path, scan_ids, scan_prefixed_line, IdToken, Prefix,
-    PrefixedScan, RecordId,
+    add_bare_ulid_windows, scan_ids, scan_prefixed_line, IdToken, Prefix, PrefixedScan, RecordId,
 };
-use crate::ledger::ledger_line_verb;
+use crate::ledger::{ledger_line_verb, parse_line, parse_retract, RetractParse};
 use crate::record::{parse_ref_id, parse_with_list, unquote, FrontmatterRef, RecordKind};
 use crate::scope::{
     note_linkage_owners, owner_of_field, owners_of_ledger_text, record_owners, OwnerKey, PackScope,
@@ -41,6 +41,10 @@ pub struct SearchHit {
     /// to report.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator_only: Option<bool>,
+    /// Stable line reference for a ledger hit (#746), when the line parsed.
+    /// Absent on record hits and malformed ledger lines.
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub line_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -54,13 +58,19 @@ struct RecordFacts {
     fm_malformed: bool,
     fm_bad_ref: bool,
     fm_bare_ulids: Vec<String>,
-    path_person: Option<RecordId>,
+    path_entity: Option<RecordId>,
     body_start_line: u32,
     /// Tokenized once from BOM-stripped source; 1-based line numbers.
     line_tokens: Vec<(u32, Vec<IdToken>)>,
 }
 
 /// Indexes built once per search so the allowlist is a worklist, not nested scans.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetractGate {
+    Target(usize),
+    Dangling,
+}
+
 struct Allowlist<'a> {
     vault: &'a Vault,
     cleared: HashSet<RecordId>,
@@ -70,6 +80,10 @@ struct Allowlist<'a> {
     strong_by_ulid: HashMap<Arc<str>, Vec<RecordId>>,
     ledger_at: HashMap<(&'a str, u32), usize>,
     ledger_tokens: Vec<Vec<IdToken>>,
+    /// Per raw ledger line: the target a valid `retract` line points at.
+    /// `None` means "not a retraction (or malformed)", `Dangling` means a
+    /// parsed retraction whose target is missing (fail closed).
+    retract_gates: Vec<Option<RetractGate>>,
     named_ledger_lines: BTreeMap<RecordId, Vec<usize>>,
     ledger_ok: Vec<bool>,
     /// Operator mode only (#593): per ledger line, `true` when the operator
@@ -84,6 +98,10 @@ struct Allowlist<'a> {
     /// the same operator read path as `record show --for-edit` (spec §12). Never
     /// set on an agent path; `false` is the §12 allowlist.
     operator: bool,
+    /// Whether retirement removes a record from the cleared set (#746).
+    /// `true` for the agent path and the "no-ai only" comparison set;
+    /// `false` for the full operator path.
+    honor_retirement: bool,
     /// Operator mode only (#572): ids the agent allowlist hides but the
     /// operator allowlist does not — hidden solely by `no-ai` (their own or
     /// inherited). Used to badge a hit. Empty on the agent path.
@@ -92,6 +110,8 @@ struct Allowlist<'a> {
     enabled: Vec<&'a dyn crate::packs::Pack>,
     /// Note id → packs owning a ledger line that references it.
     linkage: HashMap<RecordId, BTreeSet<OwnerKey>>,
+    /// Vault spec; core edge-kind ownership depends on it (#813).
+    spec: SpecVersion,
 }
 
 /// Unicode case-insensitive substring scan. Hits are ordered by path, then line.
@@ -176,6 +196,7 @@ fn search_with(
                     .copied()
                     .unwrap_or(false)
                     .then_some(true),
+                line_ref: line.line_ref.map(|line_ref| line_ref.to_string()),
             });
         }
     }
@@ -240,7 +261,7 @@ pub fn cleared_record_owners(vault: &Vault) -> BTreeMap<String, BTreeSet<OwnerKe
         if allow.cleared.contains(&rec.id) {
             out.insert(
                 rec.path.clone(),
-                record_owners(rec, &allow.linkage, &allow.enabled),
+                record_owners(rec, &allow.linkage, &allow.enabled, allow.spec),
             );
         }
     }
@@ -286,6 +307,15 @@ pub fn allowlist_is_fixed_point(vault: &Vault) -> bool {
 }
 
 impl<'a> Allowlist<'a> {
+    /// A record type is enabled when it is core or declared by an enabled
+    /// pack. Disabled, retired, and undeclared types fail closed for agents.
+    fn type_enabled(&self, rec: &crate::record::Record) -> bool {
+        self.vault
+            .type_registry()
+            .get(rec.kind.as_str())
+            .is_some_and(|decl| decl.enabled)
+    }
+
     /// The §12 agent allowlist: `no-ai` records are excluded.
     fn build(vault: &'a Vault, scope: &PackScope) -> Self {
         Self::build_with(vault, scope, false)
@@ -294,6 +324,18 @@ impl<'a> Allowlist<'a> {
     /// `operator` ignores `no-ai` in the cleared-set fixpoint (#572). Only
     /// ever `true` for `find --for-operator` / `context --for-operator`.
     fn build_with(vault: &'a Vault, scope: &PackScope, operator: bool) -> Self {
+        Self::build_with_flags(vault, scope, operator, !operator)
+    }
+
+    /// `honor_retirement=false` is the full operator path; `true` is the
+    /// agent path and the intermediate "operator, but retirement still
+    /// applies" set used only to compute the `no-ai` badge.
+    fn build_with_flags(
+        vault: &'a Vault,
+        scope: &PackScope,
+        operator: bool,
+        honor_retirement: bool,
+    ) -> Self {
         let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
         let linkage = note_linkage_owners(vault, &enabled);
         let mut by_path = BTreeMap::new();
@@ -304,6 +346,29 @@ impl<'a> Allowlist<'a> {
         for (idx, line) in vault.ledger_lines.iter().enumerate() {
             ledger_at.insert((line.file.as_str(), line.line), idx);
         }
+        // A retraction line is only searchable when its target line is too:
+        // the ref must not become an oracle for a hidden fact (#746).
+        let retract_gates: Vec<Option<RetractGate>> = vault
+            .ledger_lines
+            .iter()
+            .map(|line| match parse_line(&line.text) {
+                Ok(Some(entry)) if entry.verb == "retract" => match parse_retract(&entry) {
+                    RetractParse::Ok(spec) => {
+                        let target = vault.corrections().retraction_for(&spec.target);
+                        match target.and_then(|r| {
+                            vault.ledger_lines.iter().position(|candidate| {
+                                candidate.file == r.target_file && candidate.line == r.target_line
+                            })
+                        }) {
+                            Some(idx) => Some(RetractGate::Target(idx)),
+                            None => Some(RetractGate::Dangling),
+                        }
+                    }
+                    RetractParse::Malformed => None,
+                },
+                _ => None,
+            })
+            .collect();
 
         let mut strong_by_ulid: HashMap<Arc<str>, Vec<RecordId>> = HashMap::new();
         for id in vault.records.keys() {
@@ -355,7 +420,10 @@ impl<'a> Allowlist<'a> {
             let lines = record_prefixed
                 .remove(&rec.id)
                 .expect("prefixed scan for every record");
-            facts.insert(rec.id.clone(), record_facts(rec, lines, &vault_ulids));
+            facts.insert(
+                rec.id.clone(),
+                record_facts(rec, lines, &vault_ulids, vault.type_registry()),
+            );
         }
         let ledger_tokens: Vec<Vec<IdToken>> = vault
             .ledger_lines
@@ -368,6 +436,9 @@ impl<'a> Allowlist<'a> {
             .collect();
         let mut named_ledger_lines: BTreeMap<RecordId, Vec<usize>> = BTreeMap::new();
         for (idx, toks) in ledger_tokens.iter().enumerate() {
+            if vault.is_voided_line(&vault.ledger_lines[idx]) {
+                continue;
+            }
             for tok in toks {
                 for id in ids_named_by(tok, &by_ulid, &strong_by_ulid) {
                     if !ledger_named_prefix(id.prefix()) {
@@ -389,14 +460,17 @@ impl<'a> Allowlist<'a> {
             strong_by_ulid,
             ledger_at,
             ledger_tokens,
+            retract_gates,
             named_ledger_lines,
             ledger_ok: Vec::new(),
             ledger_operator_only: Vec::new(),
             scope: scope.clone(),
             operator,
+            honor_retirement,
             no_ai_hidden: HashSet::new(),
             enabled,
             linkage,
+            spec: vault.spec_version().unwrap_or(SpecVersion::V01),
         };
         allow.cleared = compute_cleared(&allow);
         // Operator mode only (#593): the agent's ledger allowlist, from the
@@ -404,40 +478,53 @@ impl<'a> Allowlist<'a> {
         // here so the ledger badge reuses the operator-minus-agent
         // difference, never a second notion of "hidden by no-ai".
         let mut agent_ledger_ok: Option<Vec<bool>> = None;
-        if operator {
+        let mut no_ai_only_ledger_ok: Option<Vec<bool>> = None;
+        if operator && !honor_retirement {
             // The badge set: everything the operator allowlist adds over
             // the agent allowlist is hidden solely by `no-ai`. The operator
             // rules are a strict relaxation of the agent rules, so the
             // agent set is a subset.
             let agent = Allowlist::build_with(vault, scope, false);
-            let hidden: HashSet<RecordId> =
-                allow.cleared.difference(&agent.cleared).cloned().collect();
+            // Compare against the operator set that still honors
+            // retirement, so a retired record is never mis-badged
+            // `no-ai: "true"` and a retired line is not `operator_only`.
+            let no_ai_only = Allowlist::build_with_flags(vault, scope, true, true);
+            let hidden: HashSet<RecordId> = no_ai_only
+                .cleared
+                .difference(&agent.cleared)
+                .cloned()
+                .collect();
             allow.no_ai_hidden = hidden;
-            agent_ledger_ok = Some(
-                allow
-                    .vault
-                    .ledger_lines
-                    .iter()
-                    .zip(allow.ledger_tokens.iter())
-                    .map(|(line, toks)| {
-                        line.searchable && tokens_allowed_with(toks, &agent.cleared, &allow)
-                    })
-                    .collect(),
-            );
+            agent_ledger_ok = Some(agent.ledger_ok.clone());
+            no_ai_only_ledger_ok = Some(no_ai_only.ledger_ok.clone());
         }
         allow.ledger_ok = allow
             .vault
             .ledger_lines
             .iter()
-            .zip(allow.ledger_tokens.iter())
-            .map(|(line, toks)| line.searchable && tokens_allowed(toks, &allow))
+            .enumerate()
+            .map(|(idx, line)| {
+                let toks = &allow.ledger_tokens[idx];
+                line.searchable
+                    && !allow.vault.is_voided_line(line)
+                    && line_allowed_with(toks, Some(idx), &allow.cleared, &allow)
+            })
             .collect();
         if let Some(agent_ok) = agent_ledger_ok {
             allow.ledger_operator_only = allow
                 .ledger_ok
                 .iter()
                 .zip(agent_ok)
-                .map(|(operator, agent)| *operator && !agent)
+                .enumerate()
+                .map(|(idx, (operator, agent))| {
+                    *operator
+                        && !agent
+                        // A line hidden by retirement is not "hidden solely
+                        // by no-ai"; the no-ai-only set still includes it.
+                        && no_ai_only_ledger_ok
+                            .as_ref()
+                            .is_none_or(|ok| ok.get(idx).copied().unwrap_or(false))
+                })
                 .collect();
         }
         allow
@@ -458,6 +545,8 @@ fn compute_cleared(allow: &Allowlist<'_>) -> HashSet<RecordId> {
         .records
         .values()
         .filter(|rec| (allow.operator || !rec.no_ai()) && !tainted.contains(&rec.id))
+        .filter(|rec| !allow.honor_retirement || !allow.vault.is_retired(&rec.id))
+        .filter(|rec| allow.operator || allow.type_enabled(rec))
         .filter(|rec| rec.person().is_none_or(|person| !tainted.contains(&person)))
         .filter(|rec| allow.operator || !inherits_notes_no_ai(rec, allow, &components))
         .map(|rec| rec.id.clone())
@@ -518,6 +607,9 @@ fn still_cleared(
     if tainted.contains(id) {
         return false;
     }
+    if allow.honor_retirement && allow.vault.is_retired(id) {
+        return false;
+    }
     if facts.fm_malformed || facts.fm_bad_ref {
         return false;
     }
@@ -527,11 +619,14 @@ fn still_cleared(
         return false;
     }
     if let Some(rec) = allow.vault.records.get(id) {
+        if !allow.operator && !allow.type_enabled(rec) {
+            return false;
+        }
         if !allow.operator && inherits_notes_no_ai(rec, allow, components) {
             return false;
         }
     }
-    if let Some(person) = &facts.path_person {
+    if let Some(person) = &facts.path_entity {
         if !cleared.contains(person) {
             return false;
         }
@@ -544,7 +639,7 @@ fn still_cleared(
     if let Some(idxs) = allow.named_ledger_lines.get(id) {
         if idxs
             .iter()
-            .any(|&idx| !tokens_allowed_with(&allow.ledger_tokens[idx], cleared, allow))
+            .any(|&idx| !line_allowed_with(&allow.ledger_tokens[idx], Some(idx), cleared, allow))
         {
             return false;
         }
@@ -593,7 +688,7 @@ fn inherits_notes_no_ai(
         }
     }
     if let Some(facts) = allow.facts.get(&rec.id) {
-        if let Some(ref person) = facts.path_person {
+        if let Some(ref person) = facts.path_entity {
             if person_has_notes_mode(person) {
                 return true;
             }
@@ -827,6 +922,9 @@ fn pkg_open_lines(allow: &Allowlist<'_>) -> Vec<OpenLine> {
         .iter()
         .zip(allow.ledger_tokens.iter())
     {
+        if allow.vault.is_voided_line(line) {
+            continue;
+        }
         // Only a pack's declared `open_verb` opens a package. A line that
         // merely contains `package` (a note reference, a stray argument)
         // must not clear a package ID.
@@ -850,7 +948,12 @@ fn pkg_open_lines(allow: &Allowlist<'_>) -> Vec<OpenLine> {
                 Prefix::Package => {
                     pkgs.insert(id.clone());
                 }
-                Prefix::Org | Prefix::Deal | Prefix::Interaction | Prefix::Note | Prefix::Edge => {}
+                Prefix::Org
+                | Prefix::Deal
+                | Prefix::Interaction
+                | Prefix::Note
+                | Prefix::Edge
+                | Prefix::Pack(_) => {}
             }
         }
         if !people.is_empty() || !pkgs.is_empty() {
@@ -885,7 +988,7 @@ fn reverse_deps(
                     }
                 }
             }
-            if let Some(person) = &facts.path_person {
+            if let Some(person) = &facts.path_entity {
                 link(person.clone(), rec.id.clone());
             }
         }
@@ -915,6 +1018,7 @@ fn record_facts(
     rec: &crate::record::Record,
     mut lines: Vec<(u32, PrefixedScan)>,
     vault_ulids: &HashSet<Arc<str>>,
+    types: &crate::record_type::TypeRegistry,
 ) -> RecordFacts {
     let text = rec.source.trim_start_matches('\u{feff}');
     let mut fm_ids = Vec::new();
@@ -946,7 +1050,7 @@ fn record_facts(
         fm_malformed,
         fm_bad_ref,
         fm_bare_ulids,
-        path_person: person_id_from_path(&rec.path),
+        path_entity: crate::id::entity_id_from_path(&rec.path, types),
         body_start_line: rec.body_start_line,
         line_tokens,
     }
@@ -958,7 +1062,7 @@ fn ledger_named_prefix(prefix: Prefix) -> bool {
         // An edge id named in a ledger line does not uncleared the edge:
         // §12's named-line rule covers notes, interactions, and deals
         // only. Edge linkage lives in front matter (`a` / `b`).
-        Prefix::Person | Prefix::Org | Prefix::Package | Prefix::Edge => false,
+        Prefix::Person | Prefix::Org | Prefix::Package | Prefix::Edge | Prefix::Pack(_) => false,
     }
 }
 
@@ -1005,6 +1109,30 @@ fn ids_named_by<'a>(
 
 fn tokens_allowed(toks: &[IdToken], allow: &Allowlist<'_>) -> bool {
     tokens_allowed_with(toks, &allow.cleared, allow)
+}
+
+/// A ledger line is allowed only when its own tokens are cleared and, for a
+/// `retract` line, its target line is allowed too (#746 privacy rule).
+fn line_allowed_with(
+    toks: &[IdToken],
+    idx: Option<usize>,
+    cleared: &HashSet<RecordId>,
+    allow: &Allowlist<'_>,
+) -> bool {
+    if !tokens_allowed_with(toks, cleared, allow) {
+        return false;
+    }
+    let Some(gate) = idx.and_then(|idx| allow.retract_gates.get(idx).copied().flatten()) else {
+        return true;
+    };
+    match gate {
+        RetractGate::Target(target_idx) => {
+            let target = &allow.vault.ledger_lines[target_idx];
+            target.searchable
+                && tokens_allowed_with(&allow.ledger_tokens[target_idx], cleared, allow)
+        }
+        RetractGate::Dangling => false,
+    }
 }
 
 fn tokens_allowed_with(
@@ -1084,9 +1212,12 @@ fn finding_kept_verbatim(finding: &Finding, allow: &Allowlist<'_>) -> bool {
                 return false;
             }
             let rec = &allow.vault.records[id];
-            return allow
-                .scope
-                .allows(&record_owners(rec, &allow.linkage, &allow.enabled));
+            return allow.scope.allows(&record_owners(
+                rec,
+                &allow.linkage,
+                &allow.enabled,
+                allow.spec,
+            ));
         }
         return false;
     }
@@ -1094,9 +1225,12 @@ fn finding_kept_verbatim(finding: &Finding, allow: &Allowlist<'_>) -> bool {
         if let Ok(id) = RecordId::parse(raw) {
             if let Some(rec) = allow.vault.records.get(&id) {
                 return allow.cleared.contains(&id)
-                    && allow
-                        .scope
-                        .allows(&record_owners(rec, &allow.linkage, &allow.enabled));
+                    && allow.scope.allows(&record_owners(
+                        rec,
+                        &allow.linkage,
+                        &allow.enabled,
+                        allow.spec,
+                    ));
             }
         }
     }
@@ -1130,7 +1264,7 @@ fn scan_record(
     };
     // Body lines share the record's owners; front-matter lines filter
     // per-field (#178). Computed once: the body owner set.
-    let body_owners = record_owners(rec, &allow.linkage, &allow.enabled);
+    let body_owners = record_owners(rec, &allow.linkage, &allow.enabled, allow.spec);
     let body_visible = allow.scope.allows(&body_owners);
     // #178 fix round (Silas review on #246): notes and interactions are
     // visible as whole records only. Per-field front-matter filtering
@@ -1143,7 +1277,7 @@ fn scan_record(
     // to filter.
     if matches!(
         rec.kind,
-        RecordKind::Note | RecordKind::Interaction | RecordKind::Edge
+        RecordKind::Note | RecordKind::Interaction | RecordKind::Edge | RecordKind::Pack { .. }
     ) && !body_visible
     {
         return;
@@ -1185,6 +1319,7 @@ fn scan_record(
                 // `operator_only` is the ledger-line marker; record hits
                 // already carry `no_ai`.
                 operator_only: None,
+                line_ref: None,
             });
         }
     }
@@ -1623,5 +1758,44 @@ mod tests {
             .collect();
         assert!(!visible.is_empty());
         assert!(visible.iter().all(|h| h.operator_only.is_none()));
+    }
+    #[test]
+    fn hidden_edge_is_not_cleared_for_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.3\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        )
+        .unwrap();
+        let person = "p-01M3TC5H00MPJG000000000000";
+        let org = "o-01M3TC5H00MPJG000000000001";
+        let edge = "e-01M3TC5H00MPJG000000000002";
+        for (rel, body) in [
+            (
+                format!("people/{person}/profile.md"),
+                format!("---\nid: {person}\ntype: person\nname: Dana Example\n---\n"),
+            ),
+            (
+                format!("orgs/{org}/org.md"),
+                format!("---\nid: {org}\ntype: org\nname: Example Studio\n---\n"),
+            ),
+            (
+                format!("edges/{edge}/edge.md"),
+                format!(
+                    "---\nid: {edge}\ntype: edge\na: {person}\nb: {org}\nkind: works_at\nno-ai: true\n---\n"
+                ),
+            ),
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let vault = crate::vault::load_vault(dir.path()).unwrap();
+        let id = super::RecordId::parse(edge).unwrap();
+        assert!(!super::cleared_record_ids(&vault).contains(&id));
+        assert!(super::cleared_record_ids_for_operator(&vault).contains(&id));
+        assert!(!super::cleared_record_paths(&vault)
+            .iter()
+            .any(|path| path == &format!("edges/{edge}/edge.md")));
     }
 }

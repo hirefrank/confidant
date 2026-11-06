@@ -43,6 +43,14 @@ fn person(root: &Path, id: &str, name: &str) {
     );
 }
 
+fn org(root: &Path, id: &str, name: &str) {
+    write(
+        root,
+        &format!("orgs/{id}/org.md"),
+        &format!("---\nid: {id}\ntype: org\nname: {name}\n---\n\nFake org.\n"),
+    );
+}
+
 fn note(root: &Path, id: &str, person: &str, date: &str) {
     write(
         root,
@@ -61,6 +69,26 @@ fn vault_toml(root: &Path, checks: &str) {
         "confidant.toml",
         &format!(
             r#"spec = "0.1"
+packs = ["example-pack@0.1"]
+vault_id = "test-vault"
+
+[checks]
+as_of = "2026-10-08"
+{checks}
+"#
+        ),
+    );
+}
+
+/// The same fixture vault at spec 0.2 (#813). The example pack lists both
+/// spec versions, so it loads in either.
+fn vault_toml_02(root: &Path, checks: &str) {
+    install_example_pack(root);
+    write(
+        root,
+        "confidant.toml",
+        &format!(
+            r#"spec = "0.2"
 packs = ["example-pack@0.1"]
 vault_id = "test-vault"
 
@@ -146,6 +174,173 @@ fn demo_vault_reports_the_personal_nudges() {
     let codes: Vec<&str> = report.findings.iter().map(|f| f.code.as_str()).collect();
     assert_eq!(codes, vec!["W_CADENCE_OVERDUE", "W_DATE_UPCOMING"]);
     assert!(report.summary.records >= 9);
+}
+
+/// The checked-in spec 0.3 fixture: a declared `place` pack type, two
+/// places, a visible `visited` edge, a hidden edge, and an `entity:` note.
+fn place_03_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/place-0.3")
+}
+
+#[test]
+fn place_03_fixture_matches_golden() {
+    let json = report_json(&place_03_fixture(), None);
+    assert_eq!(json["ok"], true, "{json}");
+    assert_eq!(codes(&json), Vec::<String>::new(), "{json}");
+    assert_golden("place-0.3.json", &json);
+}
+
+/// The fixture is also the privacy regression case: the hidden `visited`
+/// edge and the note that names it stay out of the agent cleared set, while
+/// both places, the visible edge, and the entity-attached note remain.
+#[test]
+fn place_03_fixture_hides_only_the_no_ai_edge_and_its_note() {
+    let vault = load_vault(&place_03_fixture()).unwrap();
+    let hidden = confidant_core::RecordId::parse("e-01M3TC5H00MPJG000000000105").unwrap();
+    let hidden_note = confidant_core::RecordId::parse("n-01M3TC5H00MPJG000000000107").unwrap();
+    let visible = confidant_core::RecordId::parse("e-01M3TC5H00MPJG000000000104").unwrap();
+    let entity_note = confidant_core::RecordId::parse("n-01M3TC5H00MPJG000000000106").unwrap();
+    let place = confidant_core::RecordId::parse("pl-01M3TC5H00MPJG000000000102").unwrap();
+
+    let cleared = confidant_core::cleared_record_ids(&vault);
+    assert!(!cleared.contains(&hidden));
+    assert!(!cleared.contains(&hidden_note));
+    assert!(cleared.contains(&visible));
+    assert!(cleared.contains(&entity_note));
+    assert!(cleared.contains(&place));
+
+    let operator = confidant_core::cleared_record_ids_for_operator(&vault);
+    assert!(operator.contains(&hidden));
+    assert!(operator.contains(&hidden_note));
+}
+
+/// The checked-in spec 0.4 personal fixture (#745): the default
+/// `personal@0.3` types, their fields and edges, an `entity:` note, and a
+/// no-ai place. Fake data only.
+fn personal_04_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/personal-0.4")
+}
+
+#[test]
+fn personal_04_fixture_matches_golden() {
+    let json = report_json(&personal_04_fixture(), None);
+    assert_eq!(json["ok"], true, "{json}");
+    assert_eq!(codes(&json), Vec::<String>::new(), "{json}");
+    assert_golden("personal-0.4.json", &json);
+}
+
+/// The checked-in spec 0.4 corrections fixture (#746): a duplicate touch, a
+/// corrected touch, a malformed touch that is retracted, a retired person
+/// with a note, and a no-ai person with a hidden retraction.
+fn corrections_04_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/corrections-0.4")
+}
+
+#[test]
+fn corrections_04_fixture_matches_golden() {
+    let json = report_json(&corrections_04_fixture(), None);
+    assert_eq!(json["ok"], true, "{json}");
+    assert_eq!(codes(&json), Vec::<String>::new(), "{json}");
+    assert_golden("corrections-0.4.json", &json);
+}
+
+#[test]
+fn corrections_04_fixture_hides_superseded_and_retired_from_agent_reads() {
+    let root = corrections_04_fixture();
+    let vault = load_vault(&root).unwrap();
+    assert!(confidant_core::allowlist_is_fixed_point(&vault));
+
+    let ada = confidant_core::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+    let bea = confidant_core::RecordId::parse("p-01M3TC5H00MPJG000H24000001").unwrap();
+    let cam = confidant_core::RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
+    let di = confidant_core::RecordId::parse("p-01M3TC5H00MPJG003333000003").unwrap();
+    let cleared = confidant_core::cleared_record_ids(&vault);
+    assert!(cleared.contains(&ada));
+    assert!(cleared.contains(&bea));
+    assert!(
+        !cleared.contains(&cam),
+        "retired record must not be cleared"
+    );
+    assert!(!cleared.contains(&di), "no-ai record must not be cleared");
+
+    let scope = confidant_core::PackScope::All;
+    let agent = confidant_core::search(&vault, "call", &scope).unwrap();
+    assert_eq!(agent.hits.len(), 1, "{:?}", agent.hits);
+    assert_eq!(agent.hits[0].path, "ledger/2026/10.cfd");
+    assert_eq!(agent.hits[0].line, 2, "the duplicate occurrence is skipped");
+    assert!(agent.hits[0].line_ref.is_some());
+
+    let malformed = confidant_core::search(&vault, "notakind", &scope).unwrap();
+    assert!(malformed.hits.is_empty(), "{:?}", malformed.hits);
+    let retired = confidant_core::search(&vault, "Retired note", &scope).unwrap();
+    assert!(retired.hits.is_empty(), "{:?}", retired.hits);
+    let hidden = confidant_core::search(&vault, "Di Hidden", &scope).unwrap();
+    assert!(hidden.hits.is_empty(), "{:?}", hidden.hits);
+
+    // The retraction for the hidden person is hidden with its target; the
+    // visible retractions remain searchable.
+    let retractions = confidant_core::search(&vault, "wrong-kind", &scope).unwrap();
+    assert_eq!(retractions.hits.len(), 1, "{:?}", retractions.hits);
+    assert_eq!(retractions.hits[0].line, 4);
+
+    let cleared_lines = confidant_core::cleared_ledger_lines(&vault);
+    let october = cleared_lines
+        .get("ledger/2026/10.cfd")
+        .cloned()
+        .unwrap_or_default();
+    assert!(october.contains(&2));
+    assert!(!october.contains(&3), "duplicate touch is superseded");
+    assert!(!october.contains(&4), "replaced touch is superseded");
+    assert!(
+        !october.contains(&6),
+        "retracted malformed touch is superseded"
+    );
+    assert!(!october.contains(&7), "no-ai touch is hidden");
+    let november = cleared_lines
+        .get("ledger/2026/11.cfd")
+        .cloned()
+        .unwrap_or_default();
+    assert!(november.contains(&2) && november.contains(&3) && november.contains(&4));
+    assert!(
+        !november.contains(&5),
+        "retraction of a hidden target is hidden"
+    );
+
+    let operator = confidant_core::search_for_operator(&vault, "wrong-kind", &scope).unwrap();
+    assert_eq!(operator.hits.len(), 2, "{:?}", operator.hits);
+    assert!(operator
+        .hits
+        .iter()
+        .any(|hit| hit.line == 5 && hit.operator_only == Some(true)));
+    assert!(operator
+        .hits
+        .iter()
+        .any(|hit| hit.line == 4 && hit.operator_only.is_none()));
+}
+
+#[test]
+fn retract_is_unknown_before_spec_04() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.3\"\npacks = []\nvault_id = \"test-vault\"\n",
+    );
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 touch {ADA} call\n"),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/11.cfd",
+        &format!(
+            "2026-11-02 retract {ADA} line:87d93568b0d238e8e63086bdf1703f496a2824bc829655b1238332f31c8016c7 reason:duplicate\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_UNKNOWN_VERB"], "{json}");
 }
 
 /// The `balance_mismatch` golden vault's records and ledger, shared by the
@@ -627,6 +822,46 @@ fn unsupported_spec_stops_after_spec_findings() {
     // compiled-only registry must not report the listed pack as unknown.
     assert!(!c.contains(&"E_PACK_UNKNOWN".into()), "{c:?}");
     assert!(!c.contains(&"E_PARSE".into()), "{c:?}");
+}
+
+/// #821: a ≤0.7 encrypted vault is one clear finding, not a stream of parse
+/// errors, and the finding carries no file path, id, or record content.
+#[test]
+fn legacy_encrypted_vault_is_one_clear_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\nvault_id = \"test-vault\"\n",
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Robin Example\nenc: xchacha20poly1305\nkey_id: {ADA}/e0\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\n\nAQID\n"
+        ),
+    );
+    std::fs::create_dir_all(dir.path().join("keys")).unwrap();
+    std::fs::write(dir.path().join("keys/operator.toml"), "fake operator\n").unwrap();
+    write(dir.path(), "ledger/2026/10.cfd", "enc: xchacha20poly1305\n");
+
+    let vault = load_vault(dir.path()).unwrap();
+    let report = check_vault(&vault, &CheckOptions::default());
+    assert!(!report.ok);
+    assert_eq!(report.summary.errors, 1);
+    assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+    let finding = &report.findings[0];
+    assert_eq!(finding.code, FindingCode::VaultLegacyEncrypted);
+    assert_eq!(finding.code.as_str(), "E_VAULT_LEGACY_ENCRYPTED");
+    assert!(finding.file.is_none());
+    assert!(finding.line.is_none());
+    assert!(finding.id.is_none());
+    assert!(finding.message.contains("encrypted Confidant ≤0.7"));
+    assert!(finding.message.contains("confidant init"));
+    let dumped = serde_json::to_string(&report).unwrap();
+    assert!(!dumped.contains("people/"), "{dumped}");
+    assert!(!dumped.contains("Robin Example"), "{dumped}");
+    assert!(!dumped.contains("E_PARSE"), "{dumped}");
 }
 
 /// #497: an unsupported spec skips external-pack resolution entirely, so a
@@ -4412,6 +4647,12 @@ fn two_people(dir: &Path) {
     person(dir, BEA, "Bea Demo");
 }
 
+fn two_people_02(dir: &Path) {
+    vault_toml_02(dir, DEFAULT_CHECKS);
+    person(dir, ADA, "Ada Example");
+    person(dir, BEA, "Bea Demo");
+}
+
 #[test]
 fn edge_valid_passes() {
     let dir = tempfile::tempdir().unwrap();
@@ -4651,6 +4892,202 @@ fn edge_wrong_type_end_is_rejected() {
     edge(dir.path(), EDGE1, ADA, ORG, "married");
     let json = report_json(dir.path(), None);
     assert_eq!(codes(&json), vec!["E_WRONG_ID_TYPE"]);
+}
+
+// ---------------------------------------------------------------------------
+// #813: entity endpoints (0.2) and frozen 0.1 semantics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn edge_person_to_org_passes_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    org(dir.path(), ORG, "Example Org");
+    for (idx, kind) in ["works_at", "founder_of", "investor_in", "advisor_to"]
+        .iter()
+        .enumerate()
+    {
+        let id = format!("e-01M3TC5H00MPJG00E4{idx:08}");
+        edge(dir.path(), &id, ADA, ORG, kind);
+    }
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_person_to_org_is_rejected_in_01() {
+    // 0.1 semantics are frozen: an org end is still E_WRONG_ID_TYPE and
+    // `works_at` is still outside the 0.1 core kind list.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    org(dir.path(), ORG, "Example Org");
+    edge(dir.path(), EDGE1, ADA, ORG, "works_at");
+    let json = report_json(dir.path(), None);
+    let mut got = codes(&json);
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["E_UNKNOWN_EDGE_KIND", "E_WRONG_ID_TYPE"],
+        "{json}"
+    );
+}
+
+#[test]
+fn edge_end_must_be_an_entity_type_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    for bad in [NOTE, IXN2, DEAL, EDGE1, PKG] {
+        edge(dir.path(), EDGE1, ADA, bad, "married");
+        let json = report_json(dir.path(), None);
+        assert_eq!(codes(&json), vec!["E_WRONG_ID_TYPE"], "{bad}: {json}");
+        let message = json["findings"][0]["message"].as_str().unwrap();
+        assert!(message.contains("person or org"), "{message}");
+    }
+}
+
+#[test]
+fn edge_kind_endpoint_mismatch_is_rejected_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    org(dir.path(), ORG, "Example Org");
+
+    // Directed person→org kind, reversed: both ends are the wrong type.
+    edge(dir.path(), EDGE1, ORG, ADA, "works_at");
+    let json = report_json(dir.path(), None);
+    assert_eq!(
+        codes(&json),
+        vec!["E_WRONG_ID_TYPE", "E_WRONG_ID_TYPE"],
+        "{json}"
+    );
+    assert!(
+        json["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not allowed"),
+        "{json}"
+    );
+
+    // A person↔person kind does not take an org end.
+    edge(dir.path(), EDGE1, ADA, ORG, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_WRONG_ID_TYPE"], "{json}");
+}
+
+#[test]
+fn edge_person_person_still_passes_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    for (idx, kind) in ["married", "introduced", "colleague"].iter().enumerate() {
+        let id = format!("e-01M3TC5H00MPJG00E5{idx:08}");
+        edge(dir.path(), &id, ADA, BEA, kind);
+    }
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_merge_self_is_rejected_in_02_only() {
+    // 0.2 canonicalizes the pair: ADA merged into BEA turns ADA→BEA into
+    // a self-edge.
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {ADA} into {BEA}\n"),
+    );
+    edge(dir.path(), EDGE1, ADA, BEA, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_SELF_EDGE"], "{json}");
+
+    // 0.1 keeps the raw comparison, so the same data passes.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {ADA} into {BEA}\n"),
+    );
+    edge(dir.path(), EDGE1, ADA, BEA, "married");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_merge_duplicate_is_rejected_in_02_only() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    person(dir.path(), CAM, "Cam Sample");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {ADA} into {BEA}\n"),
+    );
+    edge(dir.path(), EDGE1, BEA, CAM, "married");
+    edge(dir.path(), EDGE2, ADA, CAM, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_DUPLICATE_EDGE"], "{json}");
+
+    // Frozen 0.1: the raw pairs differ, so there is no duplicate.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    person(dir.path(), CAM, "Cam Sample");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {ADA} into {BEA}\n"),
+    );
+    edge(dir.path(), EDGE1, BEA, CAM, "married");
+    edge(dir.path(), EDGE2, ADA, CAM, "married");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_missing_end_fix_names_both_entity_types_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    write(
+        dir.path(),
+        &format!("edges/{EDGE1}/edge.md"),
+        &format!("---\nid: {EDGE1}\ntype: edge\na: {ADA}\nkind: married\n---\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_FRONTMATTER"], "{json}");
+    let fix = json["findings"][0]["fix"].as_str().unwrap();
+    assert!(fix.contains("p-<ULID> or o-<ULID>"), "{fix}");
+}
+
+#[test]
+fn edge_pack_declared_org_endpoint_passes_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    org(dir.path(), ORG, "Example Org");
+    // `backs` is org→person, declared by the example pack.
+    edge(dir.path(), EDGE1, ORG, ADA, "backs");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+
+    // Reversed fails both endpoint checks.
+    edge(dir.path(), EDGE1, ADA, ORG, "backs");
+    let json = report_json(dir.path(), None);
+    assert_eq!(
+        codes(&json),
+        vec!["E_WRONG_ID_TYPE", "E_WRONG_ID_TYPE"],
+        "{json}"
+    );
+}
+
+#[test]
+fn edge_pack_declared_org_endpoint_is_person_only_in_01() {
+    // 0.1 ignores a pack's endpoint declaration: every edge end is a
+    // person ID.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    org(dir.path(), ORG, "Example Org");
+    edge(dir.path(), EDGE1, ORG, ADA, "backs");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_WRONG_ID_TYPE"], "{json}");
 }
 
 #[test]
@@ -5043,6 +5480,26 @@ fn personal_edge_kind_is_valid_when_enabled() {
 }
 
 #[test]
+fn unknown_edge_kind_fix_lists_the_valid_kinds() {
+    let dir = personal_vault();
+    person(dir.path(), ADA, "Ada Example");
+    person(dir.path(), BEA, "Bea Demo");
+    // Misspelled kind under personal@0.1: the pack is already enabled, so
+    // "enable the pack" cannot be the fix — the valid kinds should be listed.
+    edge(dir.path(), EDGE1, ADA, BEA, "freind");
+    let vault = load_vault(dir.path()).unwrap();
+    let report = check_vault(&vault, &CheckOptions::default());
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.code == FindingCode::UnknownEdgeKind)
+        .unwrap_or_else(|| panic!("expected unknown edge kind: {:?}", report.findings));
+    let fix = finding.fix.as_deref().unwrap_or_default();
+    assert!(fix.contains("friend"), "{fix}");
+    assert!(!fix.contains("freind"), "{fix}");
+}
+
+#[test]
 fn personal_touch_note_integrity_checks_note_owner() {
     let dir = personal_vault();
     person(dir.path(), ADA, "Ada Example");
@@ -5147,10 +5604,10 @@ fn plaintext_vault_notes_mode_hides_unflagged_notes_and_interactions_from_find_a
     // context: person name and profile are shown; only the explicit-false note is included.
     let ada_id = confidant_core::id::RecordId::parse(ADA).unwrap();
     let ctx = build_context(&vault, &ada_id, true, &PackScope::All, false).unwrap();
-    assert_eq!(ctx.person.name.as_deref(), Some("Ada Example"));
-    assert!(!ctx.person.no_ai);
-    assert!(ctx
-        .person
+    let ctx_person = ctx.person.as_ref().unwrap();
+    assert_eq!(ctx_person.name.as_deref(), Some("Ada Example"));
+    assert!(!ctx_person.no_ai);
+    assert!(ctx_person
         .profile
         .as_deref()
         .unwrap_or("")
@@ -5402,6 +5859,35 @@ fn external_pack_installed_checks_clean() {
     assert!(json["ok"].as_bool().unwrap(), "expected clean: {json}");
     assert!(codes(&json).is_empty(), "{json:?}");
     assert_eq!(json["summary"]["records"].as_u64().unwrap(), 1);
+}
+
+/// #813: a pack that lists only 0.1 fails closed in a 0.2 vault. The
+/// control (the same pack in 0.1) is clean, so the failure is the spec
+/// gate, not the pack bytes.
+#[test]
+fn external_pack_listing_only_01_fails_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.2\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"test-vault\"\n",
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"E_PACK_VERSION".to_string()),
+        "{json:?}"
+    );
+
+    // Control: the same pin loads in a 0.1 vault.
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", "");
+    let json = report_json(dir.path(), None);
+    assert!(
+        !codes(&json).contains(&"E_PACK_VERSION".to_string()),
+        "{json:?}"
+    );
 }
 
 /// #438/#449: a `[[pack]]` claim that collides with an enabled pack is
@@ -7504,7 +7990,41 @@ fn personal_view_0_2(root: &Path, person: &str, as_of: &str) -> Value {
     let vault = load_vault(root).unwrap();
     let id = confidant_core::id::RecordId::parse(person).unwrap();
     let as_of = chrono::NaiveDate::parse_from_str(as_of, "%Y-%m-%d").unwrap();
-    build_personal_view(&vault, &id, &id, as_of, &fields_0_2()).expect("view serializes")
+    build_personal_view(
+        &vault,
+        &id,
+        &id,
+        as_of,
+        &fields_0_2(),
+        &["touch", "session"],
+    )
+    .expect("view serializes")
+}
+
+/// #799 step 1: the personal view's contact classification is the pack's
+/// declared `event_verbs`, not a core `touch || session` literal. A verb
+/// outside the declared list does not move `last_touch`.
+#[test]
+fn personal_view_contact_verbs_are_pack_declared() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 touch {ADA} call\n2026-10-05 session {ADA} 60m paid\n"),
+    );
+    let vault = load_vault(dir.path()).unwrap();
+    let ada = confidant_core::id::RecordId::parse(ADA).unwrap();
+    let as_of = chrono::NaiveDate::parse_from_str("2026-10-08", "%Y-%m-%d").unwrap();
+    let fields = fields_0_2();
+
+    let touch_only = build_personal_view(&vault, &ada, &ada, as_of, &fields, &["touch"]).unwrap();
+    assert_eq!(touch_only["last_touch"], "2026-10-01");
+
+    let both =
+        build_personal_view(&vault, &ada, &ada, as_of, &fields, &["touch", "session"]).unwrap();
+    assert_eq!(both["last_touch"], "2026-10-05");
 }
 
 /// A person carrying the whole 0.2 field set (fake data). `no_ai` adds
@@ -7716,7 +8236,8 @@ fn context_view_merged_person_uses_canonical() {
     let bea = confidant_core::id::RecordId::parse(BEA).unwrap();
     let as_of = chrono::NaiveDate::parse_from_str("2026-10-08", "%Y-%m-%d").unwrap();
     let fields = fields_0_2();
-    let view = build_personal_view(&vault, &ada, &ada, as_of, &fields).unwrap();
+    let view =
+        build_personal_view(&vault, &ada, &ada, as_of, &fields, &["touch", "session"]).unwrap();
 
     // Ada's own relationship wins over Bea's.
     assert_eq!(view["relationship"], "friend", "{view}");
@@ -7727,7 +8248,8 @@ fn context_view_merged_person_uses_canonical() {
     assert_eq!(view["last_touch"], "2026-10-05", "{view}");
 
     // Asking for the merged-away id serves the same canonical view.
-    let folded = build_personal_view(&vault, &bea, &ada, as_of, &fields).unwrap();
+    let folded =
+        build_personal_view(&vault, &bea, &ada, as_of, &fields, &["touch", "session"]).unwrap();
     assert_eq!(folded, view);
 }
 
@@ -7860,8 +8382,9 @@ fn context_view_cleared_person_hides_touch_content() {
     let vault = load_vault(dir.path()).unwrap();
     let ada = confidant_core::id::RecordId::parse(ADA).unwrap();
     let bundle = build_context(&vault, &ada, true, &PackScope::All, false).unwrap();
-    assert!(bundle.person.name.is_none());
-    assert!(bundle.person.profile.is_none());
+    let bundle_person = bundle.person.as_ref().unwrap();
+    assert!(bundle_person.name.is_none());
+    assert!(bundle_person.profile.is_none());
     assert!(bundle.interactions.is_empty(), "{:?}", bundle.interactions);
     let dumped = serde_json::to_string(&bundle).unwrap();
     for leak in ["AI_HIDDEN_PROFILE", "AI_HIDDEN_IXN", "AI_HIDDEN_BODY"] {
@@ -9873,7 +10396,7 @@ fn shipped_example_note_ref_codes_are_pack_own() {
 fn shipped_example_pack_hash_is_stable() {
     let pack = read_pack_dir(&example_pack_dir()).expect("shipped pack dir must read");
     assert_eq!(
-        pack.hash, "sha256:924c427db3318b575c07fcf19038d9f81f303195109c2945c0c9f078aba4438e",
+        pack.hash, "sha256:deff06ac326c0d789e1c8c82f460a3b4978c4d059b9ecabeb2a76d2c864a4749",
         "the example-pack fixture changed; update this pin in the same commit"
     );
     assert_eq!(pack.files.len(), 3);

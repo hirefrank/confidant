@@ -9,8 +9,55 @@ use crate::check::{Finding, FindingCode, Severity};
 use crate::error::DomainError;
 use crate::ledger::parse_strict_date;
 
-pub const SPEC_VERSION: &str = "0.1";
+/// The spec version new vaults are written with (`confidant init`).
+/// Vaults declare their own version in `confidant.toml`; this binary reads
+/// every version in [`SpecVersion`].
+pub const SPEC_VERSION: &str = "0.4";
 pub const MAX_GAP_DAYS: u64 = 3650;
+
+/// A vault spec version this binary can read.
+///
+/// The spec version and the CLI version are independent (ADR-1). 0.1
+/// vaults keep the original, person-only edge rules; 0.2 adds entity
+/// endpoints; 0.3 adds pack-declared record types; 0.4 adds ledger
+/// corrections and record retirement. A version not listed here is
+/// `E_SPEC_UNSUPPORTED`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum SpecVersion {
+    V01,
+    V02,
+    V03,
+    V04,
+}
+
+impl SpecVersion {
+    /// The newest version, written by `confidant init`.
+    pub const LATEST: Self = Self::V04;
+
+    pub fn parse(spec: &str) -> Option<Self> {
+        match spec {
+            "0.1" => Some(Self::V01),
+            "0.2" => Some(Self::V02),
+            "0.3" => Some(Self::V03),
+            "0.4" => Some(Self::V04),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V01 => "0.1",
+            Self::V02 => "0.2",
+            Self::V03 => "0.3",
+            Self::V04 => "0.4",
+        }
+    }
+
+    /// Whether this binary implements `spec`.
+    pub fn is_supported(spec: &str) -> bool {
+        Self::parse(spec).is_some()
+    }
+}
 
 /// `[checks]` severity keys, from the pack manifests (#345, #433).
 /// `as_of` stays core-owned and is listed separately in `KNOWN_TOP_LEVEL`.
@@ -62,6 +109,10 @@ pub struct VaultConfig {
     pub vault_id: String,
     #[serde(default)]
     pub checks: ChecksConfig,
+    /// Types whose pack was removed (spec 0.3). Defined here so orphaned
+    /// records stay parseable; `pack remove` starts writing these with #699.
+    #[serde(default)]
+    pub retired_types: Vec<crate::record_type::RetiredTypeConfig>,
 }
 
 /// `[checks]` table. Unknown keys are `E_CONFIG` findings.
@@ -348,7 +399,7 @@ impl VaultConfig {
                     format!("unknown [checks] key '{key}'"),
                 )
                 .at_file("confidant.toml")
-                .with_fix("See spec/0.1.md for the keys defined in 0.1"),
+                .with_fix("See the enabled packs' manifests for the [checks] keys they declare"),
             );
         }
 
@@ -374,7 +425,7 @@ impl VaultConfig {
                                 format!("unknown [checks] key '{top_key}'"),
                             )
                             .at_file("confidant.toml")
-                            .with_fix("See spec/0.1.md for the keys defined in 0.1"),
+                            .with_fix("See the enabled packs' manifests for the [checks] keys they declare"),
                         ),
                     }
                 }
@@ -468,8 +519,27 @@ pub fn parse_iso_date(s: &str) -> Result<chrono::NaiveDate, DomainError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{VaultConfig, MAX_GAP_DAYS};
+    use super::{SpecVersion, VaultConfig, MAX_GAP_DAYS};
     use crate::check::{Finding, Severity};
+
+    #[test]
+    fn spec_versions_parse_and_gate() {
+        assert_eq!(SpecVersion::parse("0.1"), Some(SpecVersion::V01));
+        assert_eq!(SpecVersion::parse("0.2"), Some(SpecVersion::V02));
+        assert_eq!(SpecVersion::parse("0.3"), Some(SpecVersion::V03));
+        assert_eq!(SpecVersion::parse("0.4"), Some(SpecVersion::V04));
+        assert_eq!(SpecVersion::parse(""), None);
+        assert_eq!(SpecVersion::LATEST, SpecVersion::V04);
+        assert_eq!(SpecVersion::V01.as_str(), "0.1");
+        assert_eq!(SpecVersion::V02.as_str(), "0.2");
+        assert_eq!(SpecVersion::V03.as_str(), "0.3");
+        assert_eq!(SpecVersion::V04.as_str(), "0.4");
+        assert!(SpecVersion::is_supported("0.1"));
+        assert!(SpecVersion::is_supported("0.2"));
+        assert!(SpecVersion::is_supported("0.3"));
+        assert!(SpecVersion::is_supported("0.4"));
+        assert!(!SpecVersion::is_supported("0.5"));
+    }
 
     /// Run config validation with the neutral external example-pack manifest
     /// appended, the way a vault load does for an external pack (#438).
@@ -841,7 +911,7 @@ example-pack.bogus = "warning"
             .fix
             .as_deref()
             .unwrap_or("")
-            .contains("spec/0.1.md"));
+            .contains("packs' manifests"));
     }
 
     #[test]
@@ -864,7 +934,7 @@ otherpack.thing = "error"
         for f in &findings {
             assert!(f.message.starts_with("unknown [checks] key"), "{f:?}");
             assert!(
-                f.fix.as_deref().unwrap_or("").contains("spec/0.1.md"),
+                f.fix.as_deref().unwrap_or("").contains("packs' manifests"),
                 "{f:?}"
             );
         }
@@ -904,7 +974,7 @@ example-pack.require_duration = "error"
         // Proves the [checks] machinery is generic, not per-pack.
         let example_manifest = PackManifest {
             manifest_version: 1,
-            record_types: Vec::new(),
+            record_types: Default::default(),
             balance_metrics: Vec::new(),
             finding_codes: Vec::new(),
             pack: PackInfo {

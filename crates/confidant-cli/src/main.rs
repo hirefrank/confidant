@@ -1,7 +1,7 @@
 //! `confidant` — local-first, git-backed, plaintext relationship memory.
 //!
 //! Read commands (`check`, `find`, `context`, `doctor`, `schema`, `help`)
-//! never mutate the vault. Write commands (`log session`, `import`,
+//! never mutate the vault. Write commands (`log touch`, `import`,
 //! `note add`) funnel through the [`write`] pipeline: one commit per write,
 //! `check` runs before every commit and a failing check blocks the write.
 //! `mcp` is a thin stdio JSON-RPC wrapper around this binary — never a
@@ -22,7 +22,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use confidant_core::check::parse_fail_on;
 use confidant_core::config::parse_iso_date;
 use confidant_core::config::UserConfig;
@@ -30,17 +30,22 @@ use confidant_core::context::build_context;
 use confidant_core::discover::{load_user_config, resolve, Discovery};
 use confidant_core::error::DomainError;
 use confidant_core::id::{Prefix, RecordId};
-use confidant_core::ledger::{parse_duration_minutes, parse_strict_date};
+use confidant_core::ledger::{
+    format_entry, line_fingerprint, parse_line, parse_strict_date, LineRef, RetractReason,
+};
 use confidant_core::packs::dir::read_pack_dir;
 use confidant_core::packs::lock::read_lockfile;
-use confidant_core::record::{main_record_path, Record, RecordKind};
-use confidant_core::schema::contract_schema;
+use confidant_core::record::{main_record_path_with, Record, RecordKind};
+use confidant_core::record_type::{RecordSchema, TypeRegistry};
+use confidant_core::schema::{contract_schema, record_types_json};
 use confidant_core::scope::{owner_labels, parse_pack_list, resolve_scope, PackScope};
 use confidant_core::write::{
-    apply_write, apply_write_repairing, require_git_repo, FileChange, PendingWrite, WriteOptions,
-    WriteOutcome,
+    apply_write, apply_write_repairing, require_git_repo, DryRunCheck, FileChange, PendingWrite,
+    WriteOptions, WriteOutcome,
 };
-use confidant_core::{check_vault, load_vault, search, search_for_operator, CheckOptions};
+use confidant_core::{
+    check_vault, load_vault, search, search_for_operator, CheckOptions, SpecVersion,
+};
 use serde_json::Value;
 
 /// Attach a `DomainError` fix hint to an `anyhow::Error`.
@@ -69,10 +74,12 @@ impl FixExt for anyhow::Error {
     disable_help_subcommand = true,
     about = "Relationship memory you own: plain-text records in a git repo.",
     after_help = "Examples:\n  \
-        confidant check --vault ./examples/demo-vault\n  \
-        confidant log session p-01H… 60m paid --json --no-input\n  \
-        confidant context p-01H… --json\n  \
-        CONFIDANT_VAULT=./examples/demo-vault confidant find goals --json"
+        Start here:        confidant setup --agent auto\n  \
+        Everyday:          confidant log touch p-01H… meal --json --no-input\n  \
+        Repair:            confidant retract p-01H… --line line:<hex> --reason duplicate\n  \
+        Integrations:      confidant mcp\n  \
+        Advanced / rare:   confidant schema --json\n  \
+        Demo vault:        confidant check --vault ./examples/demo-vault"
 )]
 struct Cli {
     /// Vault directory.
@@ -174,12 +181,78 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Retract a ledger line without editing or deleting it (#746).
+    ///
+    /// Appends one attributed `DATE retract …` line. The original stays in
+    /// the ledger and in git history; `check` and agent reads skip it.
+    /// Operator-only; never exposed over MCP.
+    Retract {
+        /// The target line's subject id (p-…, o-…, d-…, …).
+        subject: String,
+        /// Target line reference: line:<64 hex>, a unique ≥12-hex prefix,
+        /// optionally with #<occurrence>. Omit to use the bulk selector
+        /// (`--verb` + `--match-date` + `--keep`).
+        #[arg(long, value_name = "REF")]
+        line: Option<String>,
+        /// 1-based occurrence for byte-identical lines (default from the
+        /// ref, else 1).
+        #[arg(long)]
+        occurrence: Option<u32>,
+        /// Closed reason: duplicate, wrong-date, wrong-kind, wrong-person,
+        /// wrong-amount, wrong-note, wrong-record, typo, or other.
+        #[arg(long)]
+        reason: String,
+        /// Optional replacement line reference (a correction without
+        /// `correct`'s inline replacement text).
+        #[arg(long, value_name = "REF")]
+        replace: Option<String>,
+        /// Bulk selector: only lines dated this YYYY-MM-DD.
+        #[arg(long, value_name = "DATE")]
+        match_date: Option<String>,
+        /// Bulk selector: only this ledger verb (e.g. touch, session).
+        #[arg(long)]
+        verb: Option<String>,
+        /// Bulk selector: only touch lines of this kind.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Bulk selector: keep the first N lines per identity group and
+        /// retract the rest (default 1; 0 retracts the whole group).
+        #[arg(long)]
+        keep: Option<usize>,
+        /// Retraction date YYYY-MM-DD (default today).
+        #[arg(long)]
+        date: Option<String>,
+    },
+    /// Correct a ledger line: append a replacement and retract the original.
+    ///
+    /// Writes both lines in one commit. The original stays in the ledger and
+    /// in git history. Operator-only; never exposed over MCP.
+    Correct {
+        /// The target line's subject id (p-…, o-…, d-…, …).
+        subject: String,
+        /// Target line reference (see `retract --line`).
+        #[arg(long, value_name = "REF")]
+        line: String,
+        /// 1-based occurrence for byte-identical lines.
+        #[arg(long)]
+        occurrence: Option<u32>,
+        /// The full replacement ledger line, e.g.
+        /// `2026-10-08 touch p-… call`.
+        #[arg(long, value_name = "LEDGER-LINE")]
+        replacement: String,
+        /// Closed reason token (see `retract --reason`).
+        #[arg(long)]
+        reason: String,
+        /// Correction date YYYY-MM-DD (default today).
+        #[arg(long)]
+        date: Option<String>,
+    },
     /// Manage notes (one commit per write).
     Note {
         #[command(subcommand)]
         action: NoteAction,
     },
-    /// Create person/org/deal/interaction records from a file (one commit).
+    /// Create or manage records (one commit per write).
     Record {
         #[command(subcommand)]
         action: RecordAction,
@@ -191,17 +264,21 @@ enum Command {
         #[command(subcommand)]
         action: PackAction,
     },
-    /// Context bundle for one person (honors no-ai).
+    /// Context bundle for one entity: a person, org, or declared entity type
+    /// (honors no-ai).
     ///
     /// Operator-only flag: `--for-operator` includes `no-ai` records the
     /// default (agent) allowlist hides. It is never passed by MCP.
     Context {
-        /// Opaque person id (p-…) or an exact display name (cleared people
-        /// only; see `confidant resolve`).
+        /// Opaque entity id (p-…, o-…, or a declared pack type id) or an
+        /// exact person display name (cleared people only; see `confidant
+        /// resolve`). Non-person names are not resolved by name; use `find`
+        /// for the id.
+        #[arg(value_name = "ENTITY")]
         person: String,
-        /// Strip private data: name, profile, bodies, and the personal pack's
-        /// PII fields (`birthday`, `dates`, `relationship`, `location`,
-        /// `emails`, `phones`, `links`, `tags`).
+        /// Strip private data: name, profile, bodies, edge endpoint names,
+        /// and the personal pack's PII fields (`birthday`, `dates`,
+        /// `relationship`, `location`, `emails`, `phones`, `links`, `tags`).
         #[arg(long)]
         exclude_private: bool,
         /// Include `no-ai` records, read through the operator path (the same
@@ -211,6 +288,14 @@ enum Command {
     },
     /// Vault health checks.
     Doctor,
+    /// One-screen readiness rollup and the completion brief for this install.
+    ///
+    /// Reports CLI/TUI versions, vault discovery and writability, skill
+    /// links, system-of-record instructions, git sync state, QMD corpus
+    /// state, and binary staleness. Optional layers report `absent`, never
+    /// a false `ok` (#709, #716, #733). Exits 1 when a required check is
+    /// not `ok`; warnings on optional layers do not fail it.
+    Status,
     /// Show how the vault compares with its git upstream (fetch, report).
     ///
     /// Read-only by default: fetch the upstream remote, report ahead/behind
@@ -242,8 +327,9 @@ enum Command {
     /// (`people/`, `orgs/`, `deals/`, `interactions/`, `notes/`, `edges/`,
     /// `ledger/`) are created, and a minimal `confidant.toml` is written
     /// (its `packs` list comes from the global `--packs` flag, defaulting
-    /// to `[]`) and committed. When git has no identity at all, a
-    /// repo-local fallback identity is set so the skeleton commit works.
+    /// to `[]`) and committed. A neutral repo-local git identity is set
+    /// (even when a global one exists, so it never leaks into the vault's
+    /// history); a per-vault identity already in `.git/config` is kept.
     /// `--remote <url>` then adds `origin` (it does not push). Only packs
     /// built into this binary (today the implicit `personal@0.2`) may be
     /// listed: an external pack is vendored into an existing vault by
@@ -283,6 +369,9 @@ enum Command {
         /// Copy skills instead of symlinking.
         #[arg(long, default_value_t = false)]
         copy: bool,
+        /// Do not write the system-of-record rule into agent instruction files.
+        #[arg(long, default_value_t = false)]
+        no_instructions: bool,
         /// Show every path as it is created/linked.
         #[arg(long, short = 'v', default_value_t = false)]
         verbose: bool,
@@ -345,29 +434,6 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum LogAction {
-    /// Append a session ledger line, e.g. `log session p-… 60m paid`.
-    Session {
-        /// Opaque person id (p-…) or an exact display name (cleared people
-        /// only; see `confidant resolve`).
-        person: String,
-        /// Duration like 60m or 1h30m.
-        duration: String,
-        /// Billing tag (paid, pps, comp).
-        tag: Option<String>,
-        /// Session date YYYY-MM-DD (default today).
-        #[arg(long)]
-        date: Option<String>,
-        /// Session note text (creates a note record).
-        #[arg(long)]
-        note: Option<String>,
-        /// Source token, stored as src:<value>.
-        #[arg(long)]
-        src: Option<String>,
-        /// Log even when an identical session (same person, date,
-        /// duration, tag) is already in the ledger (#747).
-        #[arg(long)]
-        force: bool,
-    },
     /// Append a personal touchpoint ledger line, e.g. `log touch p-… meal`.
     Touch {
         /// Opaque person id (p-…) or an exact display name (cleared people
@@ -494,22 +560,39 @@ enum RecordAction {
         #[arg(long)]
         file: PathBuf,
     },
-    /// List the vault's records of one kind, one entry each.
+    /// Retire a record: keep its file and history, remove it from agent reads.
     ///
-    /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
-    /// a fixed tool whitelist), and without `--for-operator` it lists only
-    /// the §12 cleared set, so `no-ai: true` records are absent. With
+    /// Writes canonical `retired: true` in one commit. Operator-only; never
+    /// exposed over MCP. Refuses a merged-away id.
+    Retire {
+        /// Opaque record id (p-…, o-…, d-…, i-…, e-…).
+        id: String,
+    },
+    /// Undo a retirement: remove `retired: true` in one commit.
+    Unretire {
+        /// Opaque record id (p-…, o-…, d-…, i-…, e-…).
+        id: String,
+    },
+    /// List the vault's records, one entry each.
+    ///
+    /// Defaults to every identity kind (`person`, `org`, `deal`), so orgs
+    /// are visible without already knowing to ask for them. Operator-only:
+    /// this command is never exposed over MCP (`mcp.rs` maps a fixed tool
+    /// whitelist), and without `--for-operator` it lists only the §12
+    /// cleared set, so `no-ai: true` records are absent. With
     /// `--for-operator` an operator may see them, with a tri-state
     /// `no_ai` (`"true"`, `"notes"`, `"false"`). The resolved vault path
     /// stays in the JSON envelope (ADR-7).
     List {
-        /// Include `no-ai` records, read through the operator path (the same
-        /// mechanism as `record show --for-edit`).
+        /// Include `no-ai` records and orphaned pack-type records, read
+        /// through the operator path (the same mechanism as `record show
+        /// --for-edit`).
         #[arg(long)]
         for_operator: bool,
-        /// Record kind to list.
-        #[arg(long, value_enum, default_value_t = RosterKind::Person)]
-        kind: RosterKind,
+        /// Record kind to list: all (default), person, org, deal, or a
+        /// declared pack type name.
+        #[arg(long, default_value = "all")]
+        kind: String,
     },
     /// Print one record's text, to prepare an edit.
     ///
@@ -569,33 +652,21 @@ impl Side {
     }
 }
 
-/// Record kinds `record list --kind` accepts (#558).
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-pub(crate) enum RosterKind {
-    Person,
-    Org,
-    Deal,
-}
-
-impl RosterKind {
-    /// The core record kind this filter names.
-    pub(crate) fn record_kind(self) -> RecordKind {
-        match self {
-            RosterKind::Person => RecordKind::Person,
-            RosterKind::Org => RecordKind::Org,
-            RosterKind::Deal => RecordKind::Deal,
-        }
-    }
-}
-
 #[derive(Subcommand, Debug)]
 enum NoteAction {
-    /// Create a note record under people/<person>/notes/.
+    /// Create a note record under people/<person>/notes/ or notes/<id>/note.md.
+    #[command(group(
+        clap::ArgGroup::new("note_subject").required(true).multiple(false)
+    ))]
     Add {
         /// Opaque person id (p-…) or an exact display name (cleared people
         /// only; see `confidant resolve`).
-        #[arg(long)]
-        person: String,
+        #[arg(long, group = "note_subject")]
+        person: Option<String>,
+        /// Opaque entity id (p-…, o-…, or a declared entity). Writes a
+        /// top-level note with `entity:` so it can attach to any entity.
+        #[arg(long, group = "note_subject")]
+        entity: Option<String>,
         /// Note date YYYY-MM-DD (default today).
         #[arg(long)]
         date: Option<String>,
@@ -648,9 +719,19 @@ enum NoteAction {
     },
 }
 
+/// Parse argv with the journey-grouped top-level help attached (#721).
+///
+/// `Cli::try_parse()` builds the derive command directly; this keeps the
+/// same parse path but swaps in the human help template. `help --json` and
+/// `help <command>` still read `Cli::command()` and are unchanged.
+fn parse_cli() -> Result<Cli, clap::Error> {
+    let mut matches = grouped_help_command().try_get_matches()?;
+    Cli::from_arg_matches_mut(&mut matches)
+}
+
 fn main() -> ExitCode {
     let json_hint = std::env::args_os().any(|a| a == "--json");
-    let cli = match Cli::try_parse() {
+    let cli = match parse_cli() {
         Ok(cli) => cli,
         Err(err) => {
             if json_hint && err.use_stderr() {
@@ -724,6 +805,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             | Command::Agents { .. }
             | Command::Which { .. }
             | Command::Routing
+            | Command::Status
             | Command::Tui { .. }
             | Command::BenchGen { .. }
             | Command::Pack { .. }
@@ -824,13 +906,17 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Allowlist => {
             let root = vault_root.unwrap();
+            if let Err(err) = legacy_vault_gate(&root) {
+                print_error(json, Some(&root.display().to_string()), &err)?;
+                return Ok(ExitCode::from(err.exit_code() as u8));
+            }
             // Spec 4: the allowlist is a read path — records participate,
             // uncleared ones are excluded by omission.
             let vault = match load_vault_for_reads(&root, json, false) {
                 Ok(v) => v,
                 Err(code) => return Ok(code),
             };
-            if vault.config.spec != confidant_core::SPEC_VERSION {
+            if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
                 print_error(
                     json,
                     Some(&vault.root.display().to_string()),
@@ -920,25 +1006,6 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Log { action } => {
             let root = vault_root.unwrap();
             match action {
-                LogAction::Session {
-                    person,
-                    duration,
-                    tag,
-                    date,
-                    note,
-                    src,
-                    force,
-                } => cmd_log_session(
-                    &cli,
-                    &root,
-                    person,
-                    duration,
-                    tag.clone(),
-                    date.clone(),
-                    note.clone(),
-                    src.clone(),
-                    *force,
-                ),
                 LogAction::Touch {
                     person,
                     kind,
@@ -967,6 +1034,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             match action {
                 NoteAction::Add {
                     person,
+                    entity,
                     date,
                     no_ai,
                     id,
@@ -974,7 +1042,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 } => cmd_note_add(
                     &cli,
                     &root,
-                    person,
+                    person.as_deref(),
+                    entity.as_deref(),
                     date.clone(),
                     *no_ai,
                     id.as_deref(),
@@ -1031,13 +1100,63 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             )
             .map_err(pack_fetch::escape_domain_error),
         },
+        Command::Retract {
+            subject,
+            line,
+            occurrence,
+            reason,
+            replace,
+            match_date,
+            verb,
+            kind,
+            keep,
+            date,
+        } => {
+            let root = vault_root.unwrap();
+            cmd_retract(
+                &cli,
+                &root,
+                subject,
+                line.as_deref(),
+                *occurrence,
+                reason.to_string(),
+                replace.as_deref(),
+                match_date.as_deref(),
+                verb.as_deref(),
+                kind.as_deref(),
+                *keep,
+                date.as_deref(),
+            )
+        }
+        Command::Correct {
+            subject,
+            line,
+            occurrence,
+            replacement,
+            reason,
+            date,
+        } => {
+            let root = vault_root.unwrap();
+            cmd_correct(
+                &cli,
+                &root,
+                subject,
+                line,
+                *occurrence,
+                replacement.to_string(),
+                reason.to_string(),
+                date.as_deref(),
+            )
+        }
         Command::Record { action } => {
             let root = vault_root.unwrap();
             match action {
                 RecordAction::Add { file } => cmd_record_add(&cli, &root, file),
                 RecordAction::Edit { id, file } => cmd_record_edit(&cli, &root, id, file),
+                RecordAction::Retire { id } => cmd_record_retire(&cli, &root, id, true),
+                RecordAction::Unretire { id } => cmd_record_retire(&cli, &root, id, false),
                 RecordAction::List { for_operator, kind } => {
-                    cmd_record_list(&cli, &root, kind.record_kind(), *for_operator)
+                    cmd_record_list(&cli, &root, kind, *for_operator)
                 }
                 RecordAction::Show { id, for_edit } => cmd_record_show(&cli, &root, id, *for_edit),
                 RecordAction::Resolve {
@@ -1063,6 +1182,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let root = vault_root.unwrap();
             cmd_doctor(&cli, &root)
         }
+        Command::Status => cmd_status(&cli, vault_root.as_deref()),
         Command::Sync { pull, push, yes } => {
             let root = vault_root.unwrap();
             cmd_sync(&cli, &root, *pull, *push, *yes)
@@ -1077,8 +1197,17 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             agent,
             force,
             copy,
+            no_instructions,
             verbose,
-        } => cmd_setup(&cli, agent, *force, *copy, *verbose),
+        } => cmd_setup(
+            &cli,
+            agent,
+            *force,
+            *copy,
+            *no_instructions,
+            *verbose,
+            vault_root.as_deref(),
+        ),
         Command::Update {
             agent,
             force,
@@ -1086,7 +1215,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         } => cmd_update(&cli, agent, *force, *verbose),
         Command::Agents { verbose } => cmd_agents(&cli, *verbose),
         Command::Which { skills_dir } => cmd_which(&cli, *skills_dir),
-        Command::Routing => cmd_routing(&cli),
+        Command::Routing => cmd_routing(&cli, vault_root.as_deref()),
         Command::Tui { args } => cmd_tui(&cli, args),
         Command::Mcp => {
             let root = vault_root.unwrap();
@@ -1140,6 +1269,21 @@ fn load_vault_for_reads(
             let _ = print_error(json, Some(&root.display().to_string()), &err);
             Err(ExitCode::from(err.exit_code() as u8))
         }
+    }
+}
+
+/// Refuse a vault written by the encrypted Confidant (≤0.7) (#821).
+///
+/// The sniff is read-only and returns only a boolean; the command error
+/// carries the same message as the `check` finding and the `doctor` check.
+/// Every agent-facing read calls this after loading and before reading
+/// content, so a legacy vault fails closed instead of returning an empty or
+/// partial result.
+fn legacy_vault_gate(root: &Path) -> Result<(), DomainError> {
+    if confidant_core::vault::is_legacy_encrypted_vault(root) {
+        Err(DomainError::vault_legacy_encrypted())
+    } else {
+        Ok(())
     }
 }
 
@@ -2626,6 +2770,10 @@ fn cmd_find(
             "find requires a non-empty query",
         )));
     }
+    if let Err(err) = legacy_vault_gate(root) {
+        print_error(json, Some(&root.display().to_string()), &err)?;
+        return Ok(ExitCode::from(err.exit_code() as u8));
+    }
     // Operator mode (#572) loads through the operator read path (the same
     // mechanism as `record show --for-edit`); the default stays the agent
     // read path (`no-ai` records are then excluded by the §12 allowlist).
@@ -2634,7 +2782,7 @@ fn cmd_find(
         Err(code) => return Ok(code),
     };
     let vault_path = vault.root.display().to_string();
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         print_error(
             json,
             Some(&vault_path),
@@ -2701,9 +2849,14 @@ fn cmd_find(
         }
         for hit in &hits {
             let id = hit.id.as_deref().unwrap_or("-");
+            let ref_col = hit
+                .line_ref
+                .as_deref()
+                .map(|line_ref| format!("\t{line_ref}"))
+                .unwrap_or_default();
             writeln!(
                 io::stdout(),
-                "{id}\t{}:{}\t{}",
+                "{id}\t{}:{}\t{}{ref_col}",
                 hit.path,
                 hit.line,
                 hit.excerpt
@@ -2851,7 +3004,7 @@ fn finish_write(
             }
             Ok(ExitCode::SUCCESS)
         }
-        WriteOutcome::DryRun { preview } => {
+        WriteOutcome::DryRun { preview, checks } => {
             if cli.json {
                 let changes: Vec<serde_json::Value> = preview
                     .iter()
@@ -2867,6 +3020,10 @@ fn finish_write(
                     "command": command,
                     "dry_run": true,
                     "commit": serde_json::Value::Null,
+                    "checks": {
+                        "pre": checks.pre.as_str(),
+                        "post": checks.post.as_str(),
+                    },
                     "changes": changes,
                 });
                 if let serde_json::Value::Object(e) = extra {
@@ -2874,7 +3031,13 @@ fn finish_write(
                 }
                 print_json(&ok_envelope(Some(root), obj))?;
             } else {
-                println!("dry run — no files written, no commit:");
+                let pre = match checks.pre {
+                    DryRunCheck::Passed => "pre-check passed",
+                    DryRunCheck::Skipped => "pre-check skipped (repairing write)",
+                };
+                println!(
+                    "dry run — no files written, no commit; {pre}, post-check skipped (it needs the applied tree):"
+                );
                 for p in &preview {
                     println!("--- {} ({})", p.path, p.action);
                     println!("{}", p.content);
@@ -2997,6 +3160,12 @@ fn resolve_person_arg(
     if let Ok(id) = RecordId::parse(raw) {
         if let Some(r) = vault.records.get(&id) {
             if r.kind == RecordKind::Person {
+                if vault.is_retired(&id) {
+                    return Err(anyhow::Error::new(DomainError::invalid(format!(
+                        "{id} is retired"
+                    )))
+                    .with_fix("Run `confidant record unretire <id>` before writing to it"));
+                }
                 return Ok(ResolvedPersonArg {
                     id,
                     matched_name: None,
@@ -3095,11 +3264,11 @@ fn require_log_verb(vault: &confidant_core::vault::Vault, verb: &str) -> anyhow:
     Err(refuse_unknown_verb(verb))
 }
 
-/// #747: semantic idempotency for `log touch` / `log session`. Returns
-/// the existing line's vault-relative file and line number when an
-/// identical line is already in the ledger, so the refusal can point at
-/// it. The caller runs this after building the canonical request but
-/// before applying anything, so a refusal writes nothing.
+/// #747: semantic idempotency for `log touch`. Returns the existing
+/// line's vault-relative file and line number when an identical line is
+/// already in the ledger, so the refusal can point at it. The caller runs
+/// this after building the canonical request but before applying anything,
+/// so a refusal writes nothing.
 /// `note:` and `src:` never make a line distinct — a
 /// backfill that re-adds the same contact with a fresh note or
 /// provenance is still the same touchpoint.
@@ -3112,24 +3281,6 @@ fn find_duplicate_touch(
     vault.entries.iter().find_map(|sourced| {
         let (id, d, k) = confidant_core::touch::touch_identity(&sourced.entry)?;
         (id == *person && d == *date && k == kind).then_some((sourced.file.clone(), sourced.line))
-    })
-}
-
-fn find_duplicate_session(
-    vault: &confidant_core::Vault,
-    person: &RecordId,
-    date: &chrono::NaiveDate,
-    duration: &str,
-    tag: Option<&str>,
-) -> Option<(String, u32)> {
-    let minutes = parse_duration_minutes(duration)?;
-    // Tags compare lowercased, matching `session_identity`, so a
-    // historical `Paid` line matches a `paid` re-log.
-    let tag = tag.unwrap_or("").to_ascii_lowercase();
-    vault.entries.iter().find_map(|sourced| {
-        let (id, d, m, t) = confidant_core::ledger::session_identity(&sourced.entry)?;
-        (id == *person && d == *date && m == minutes && t == tag)
-            .then_some((sourced.file.clone(), sourced.line))
     })
 }
 
@@ -3148,156 +3299,6 @@ fn defer_to_write_path(root: &Path, cli: &Cli, canonical: &str) -> anyhow::Resul
     }
     let (id_hash, _) = confidant_core::write::idempotency_digests(rid, canonical);
     Ok(confidant_core::write::find_request_commit(root, &id_hash, cli.no_input)?.is_some())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cmd_log_session(
-    cli: &Cli,
-    root: &Path,
-    person_raw: &str,
-    duration: &str,
-    tag: Option<String>,
-    date_raw: Option<String>,
-    note: Option<String>,
-    src: Option<String>,
-    force: bool,
-) -> anyhow::Result<ExitCode> {
-    let vault = vault_or!(root, cli.json);
-    require_log_verb(&vault, "session")?;
-    let person = resolve_person_arg(root, &vault, person_raw)?;
-    announce_resolved_person(cli, &person);
-    let Some(minutes) = parse_duration_minutes(duration) else {
-        return Err(anyhow::Error::new(DomainError::usage(format!(
-            "bad duration '{duration}'; use like 60m or 1h30m"
-        ))));
-    };
-    // #747 review: the billing tag is a closed vocabulary — a
-    // free-form token would silently count as untagged in balance
-    // math, and `Paid` would be a distinct session from `paid`.
-    // Validate before the refusal, like touch kinds are validated
-    // before comparison, so the refusal never compares raw tags.
-    // #747 round 3: the vocabulary is the union of the enabled packs'
-    // `session-checks` billing tags for verb `session`, falling back
-    // to the core default (`paid`, `pps`, `comp`) when no enabled pack
-    // declares any — so a pack that bills under different tags is no
-    // longer overruled at log time. Fail-closed enforcement is
-    // unchanged: an unlisted tag still fails, in any case.
-    if let Some(t) = &tag {
-        let tags = confidant_core::packs::session_billing_tags_for_vault(&vault);
-        if !tags.iter().any(|valid| valid == t) {
-            return Err(anyhow::Error::new(DomainError::usage(format!(
-                "bad session tag '{t}'; use one of: {}",
-                tags.join(", ")
-            ))));
-        }
-    }
-    let date = parse_date_arg(&date_raw)?;
-
-    // An inline --note becomes its own note record, referenced from the line.
-    let mut changes = Vec::new();
-    let mut note_arg: Option<String> = None;
-    let mut note_body: Option<String> = None;
-    if let Some(text) = note {
-        let nid = RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
-            .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?;
-        let rel = PathBuf::from(format!("people/{}/notes/{nid}.md", person.id));
-        let rec = Record {
-            id: nid.clone(),
-            kind: RecordKind::Note,
-            path: rel.display().to_string(),
-            name: None,
-            fields: BTreeMap::from([
-                ("person".to_owned(), person.id.to_string()),
-                ("date".to_owned(), date.to_string()),
-            ]),
-            body: text.clone(),
-            source: String::new(),
-            body_start_line: 0,
-            field_lines: BTreeMap::new(),
-        };
-        let contents = confidant_core::format_record(&rec);
-        changes.push(FileChange::WriteFile {
-            path: rel,
-            contents,
-        });
-        note_arg = Some(format!("note:{nid}"));
-        note_body = Some(text);
-    }
-
-    let mut parts = vec![
-        date.to_string(),
-        "session".to_owned(),
-        person.id.to_string(),
-        duration.to_owned(),
-    ];
-    if let Some(t) = &tag {
-        parts.push(t.clone());
-    }
-    if let Some(n) = &note_arg {
-        parts.push(n.clone());
-    }
-    if let Some(s) = &src {
-        parts.push(format!("src:{s}"));
-    }
-    let line = parts.join(" ");
-    changes.push(FileChange::AppendLines {
-        path: month_path(&date),
-        lines: vec![line.clone()],
-    });
-
-    let canonical = format!(
-        "log-session/v1\nperson={}\ndate={date}\nduration={duration}\ntag={}\nnote={}\nsrc={}\n",
-        person.id,
-        tag.as_deref().unwrap_or(""),
-        note_body.as_deref().unwrap_or(""),
-        src.as_deref().unwrap_or(""),
-    );
-    let summary = format!(
-        "session {} {duration}{}",
-        person.id,
-        tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default()
-    );
-    // #747: refuse an identical session before applying or queueing
-    // anything, unless --force or the write path owns the decision
-    // (a known --request-id replays or conflicts there).
-    if !force {
-        if let Some((file, line)) =
-            find_duplicate_session(&vault, &person.id, &date, duration, tag.as_deref())
-        {
-            if !defer_to_write_path(root, cli, &canonical)? {
-                return Err(anyhow::Error::new(
-                    DomainError::already_exists(format!(
-                        // #747 review: name the normalized minutes, not
-                        // the raw typed duration — re-logging `1h`
-                        // against a stored `60m` line reports a `60m`
-                        // session, so the message points at the line
-                        // matched.
-                        "a {minutes}m{} session for {} on {date} is already in the ledger ({file}:{line})",
-                        tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default(),
-                        person.id,
-                    ))
-                    .with_file(file)
-                    .with_line(line)
-                    .with_fix("Pass --force to log a genuinely separate session anyway"),
-                ));
-            }
-        }
-    }
-    let outcome = apply_record_write(
-        root,
-        &vault,
-        PendingWrite {
-            changes,
-            summary,
-            canonical_request: canonical,
-        },
-        &write_options(cli),
-    )?;
-    let mut extra = serde_json::json!({"lines": [line]});
-    if let Some(echo) = person.echo_json() {
-        extra["person"] = echo;
-    }
-    finish_write(cli, root, "log-session", outcome, extra)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3566,6 +3567,689 @@ fn run_offered_command(
     }
 }
 
+fn parse_line_ref_parts(raw: &str) -> anyhow::Result<(String, Option<u32>)> {
+    let raw = raw.trim();
+    let raw = raw.strip_prefix("line:").unwrap_or(raw);
+    let (hash, anchor) = match raw.split_once('#') {
+        Some((hash, n)) => {
+            let n: u32 = n.parse().map_err(|_| {
+                anyhow::Error::new(DomainError::usage(format!(
+                    "bad line occurrence '{n}'; use #<positive integer>"
+                )))
+            })?;
+            if n == 0 {
+                return Err(anyhow::Error::new(DomainError::usage(
+                    "line occurrences are 1-based",
+                )));
+            }
+            (hash, Some(n))
+        }
+        None => (raw, None),
+    };
+    if hash.len() < 12 || hash.len() > 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "not a line ref; use line:<64 lowercase hex>, a unique ≥12-hex prefix, or append #<occurrence>",
+        )));
+    }
+    if hash.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "line refs are lowercase hex; use the value `find --json` prints",
+        )));
+    }
+    Ok((hash.to_owned(), anchor))
+}
+
+/// Resolve a CLI line ref (full hash or unique prefix) against parsed ledger
+/// entries. Occurrence defaults to 1; `--occurrence` and `#<n>` must agree
+/// when both are given.
+fn lookup_line_ref<'a>(
+    vault: &'a confidant_core::vault::Vault,
+    raw: &str,
+    occurrence: Option<u32>,
+) -> anyhow::Result<&'a confidant_core::vault::SourcedEntry> {
+    if occurrence == Some(0) {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "line occurrences are 1-based",
+        )));
+    }
+    let (hash, anchor) = parse_line_ref_parts(raw)?;
+    let occurrence = match (occurrence, anchor) {
+        (Some(flag), Some(anchor)) if flag != anchor => {
+            return Err(anyhow::Error::new(DomainError::usage(format!(
+                "--occurrence {flag} conflicts with the ref's #{anchor}"
+            ))))
+        }
+        (Some(flag), _) => flag,
+        (None, Some(anchor)) => anchor,
+        (None, None) => 1,
+    };
+    let mut hashes: BTreeSet<String> = BTreeSet::new();
+    let mut found = None;
+    for sourced in &vault.entries {
+        let candidate = sourced.line_ref.hash_hex();
+        let hash_matches = if hash.len() == 64 {
+            candidate == hash
+        } else {
+            candidate.starts_with(&hash)
+        };
+        if hash_matches {
+            hashes.insert(candidate);
+            if sourced.line_ref.occurrence() == occurrence {
+                found = Some(sourced);
+            }
+        }
+    }
+    if hashes.len() > 1 {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "line ref prefix matches more than one line; use more hex characters",
+        )));
+    }
+    found.ok_or_else(|| {
+        anyhow::Error::new(DomainError::not_found(
+            "no ledger line matches that ref and occurrence",
+        ))
+        .with_fix("Run `confidant find <text> --json` and copy the `ref` it prints")
+    })
+}
+
+fn parse_retract_reason(raw: &str) -> anyhow::Result<RetractReason> {
+    RetractReason::parse(raw).ok_or_else(|| {
+        anyhow::Error::new(DomainError::usage(format!(
+            "bad retract reason '{raw}'; use duplicate, wrong-date, wrong-kind, wrong-person, wrong-amount, wrong-note, wrong-record, typo, or other"
+        )))
+    })
+}
+
+fn require_spec_04(vault: &confidant_core::vault::Vault, command: &str) -> anyhow::Result<()> {
+    if vault
+        .spec_version()
+        .is_some_and(|spec| spec >= SpecVersion::V04)
+    {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(DomainError::invalid(format!(
+        "{command} requires a spec 0.4 vault"
+    )))
+    .with_fix("Change `spec` in confidant.toml to \"0.4\" after updating every device"))
+}
+
+fn ledger_correction_line(
+    date: chrono::NaiveDate,
+    subject: &RecordId,
+    target: LineRef,
+    reason: RetractReason,
+    replacement: Option<LineRef>,
+) -> String {
+    let mut line = format!("{date} retract {subject} line:{}", target.hash_hex());
+    if target.occurrence() != 1 {
+        line.push_str(&format!(" occurrence:{}", target.occurrence()));
+    }
+    line.push_str(&format!(" reason:{reason}"));
+    if let Some(replacement) = replacement {
+        line.push_str(&format!(" replace:{}", replacement.hash_hex()));
+    }
+    line
+}
+
+fn apply_ledger_correction(
+    cli: &Cli,
+    root: &Path,
+    changes: BTreeMap<PathBuf, Vec<String>>,
+    summary: String,
+    canonical_request: String,
+    extra: serde_json::Value,
+) -> anyhow::Result<ExitCode> {
+    if !cli.dry_run {
+        require_git_repo(root, cli.no_input)?;
+        for path in changes.keys() {
+            if !root.join(path).exists() {
+                continue;
+            }
+            let rel = path.to_string_lossy();
+            let status = confidant_core::write::git(
+                root,
+                &["status", "--porcelain", "--", &rel],
+                cli.no_input,
+            )?;
+            if !status.trim().is_empty() {
+                return Err(anyhow::Error::new(DomainError::conflict(format!(
+                    "{} has uncommitted changes; appending would commit them too",
+                    path.display()
+                )))
+                .with_fix("Commit, stash, or discard your changes to that file, then retry"));
+            }
+        }
+    }
+    let pending = PendingWrite {
+        changes: changes
+            .into_iter()
+            .map(|(path, lines)| FileChange::AppendLines { path, lines })
+            .collect(),
+        summary,
+        canonical_request,
+    };
+    let outcome = apply_write_repairing(root, pending, &write_options(cli))?;
+    finish_write(
+        cli,
+        root,
+        if extra["command"] == "correct" {
+            "correct"
+        } else {
+            "retract"
+        },
+        outcome,
+        extra,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_retract_bulk(
+    cli: &Cli,
+    root: &Path,
+    vault: &confidant_core::vault::Vault,
+    subject: &RecordId,
+    reason_raw: &str,
+    match_date: Option<&str>,
+    verb: Option<&str>,
+    kind: Option<&str>,
+    keep: Option<usize>,
+    date_raw: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let Some(match_date_raw) = match_date else {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "bulk retract needs --match-date and --verb, or a single --line",
+        )));
+    };
+    let match_date = parse_strict_date(match_date_raw).ok_or_else(|| {
+        anyhow::Error::new(DomainError::usage(format!(
+            "--match-date is not YYYY-MM-DD: {match_date_raw}"
+        )))
+    })?;
+    let Some(verb) = verb else {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "bulk retract needs --verb (for example touch)",
+        )));
+    };
+    if kind.is_some() && verb != "touch" {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "--kind only applies to touch lines",
+        )));
+    }
+    let reason = parse_retract_reason(reason_raw)?;
+    let date = parse_date_arg(&date_raw.map(str::to_owned))?;
+    let keep = keep.unwrap_or(1);
+
+    let mut groups: BTreeMap<String, Vec<&confidant_core::vault::SourcedEntry>> = BTreeMap::new();
+    for sourced in vault.effective_entries() {
+        if sourced.entry.id != *subject
+            || sourced.entry.verb != verb
+            || sourced.entry.date != match_date
+        {
+            continue;
+        }
+        if let Some(kind_filter) = kind {
+            if confidant_core::touch::extract_touch_kind(&sourced.entry).as_deref()
+                != Some(kind_filter)
+            {
+                continue;
+            }
+        }
+        let identity = match verb {
+            "touch" => {
+                let kind =
+                    confidant_core::touch::extract_touch_kind(&sourced.entry).unwrap_or_default();
+                format!("touch|{}|{match_date}|{kind}", sourced.entry.id)
+            }
+            _ => format!("fp|{}", sourced.line_ref.hash_hex()),
+        };
+        groups.entry(identity).or_default().push(sourced);
+    }
+    let mut targets: Vec<&confidant_core::vault::SourcedEntry> = Vec::new();
+    for mut group in groups.into_values() {
+        group.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+        targets.extend(group.into_iter().skip(keep));
+    }
+    targets.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    if targets.iter().any(|s| s.entry.date > date) {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "a selected line is dated after the retraction date",
+        ))
+        .with_fix("Pass a later --date"));
+    }
+    let lines: Vec<String> = targets
+        .iter()
+        .map(|s| ledger_correction_line(date, subject, s.line_ref, reason, None))
+        .collect();
+    // Selector-only canonical request: a retry with the same selector and a
+    // known --request-id can replay even though every target is now voided.
+    let canonical = format!(
+        "retract-bulk/v1\nsubject={subject}\nmatch_date={match_date}\nverb={verb}\nkind={}\nkeep={keep}\nreason={reason}\ndate={date}\n",
+        kind.unwrap_or("")
+    );
+    if targets.is_empty() && !defer_to_write_path(root, cli, &canonical)? {
+        return Err(anyhow::Error::new(DomainError::already_exists(
+            "no effective lines match that bulk selector",
+        ))
+        .with_fix("Widen the selector, or check that the lines are not already retracted"));
+    }
+    let mut changes: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    if !lines.is_empty() {
+        changes
+            .entry(month_path(&date))
+            .or_default()
+            .extend(lines.clone());
+    }
+    let target_refs: Vec<String> = targets.iter().map(|s| s.line_ref.to_string()).collect();
+    apply_ledger_correction(
+        cli,
+        root,
+        changes,
+        format!("retract {subject} batch"),
+        canonical,
+        serde_json::json!({
+            "command": "retract",
+            "subject": subject.to_string(),
+            "reason": reason.as_str(),
+            "targets": target_refs,
+            "lines": lines,
+            "date": date.to_string(),
+            "bulk": true,
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_retract(
+    cli: &Cli,
+    root: &Path,
+    subject_raw: &str,
+    line_raw: Option<&str>,
+    occurrence: Option<u32>,
+    reason_raw: String,
+    replace_raw: Option<&str>,
+    match_date: Option<&str>,
+    verb: Option<&str>,
+    kind: Option<&str>,
+    keep: Option<usize>,
+    date_raw: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let vault = vault_or!(root, cli.json);
+    require_spec_04(&vault, "retract")?;
+    let subject = RecordId::parse(subject_raw).map_err(|_| {
+        anyhow::Error::new(DomainError::usage(format!(
+            "not a record id: {subject_raw}"
+        )))
+        .with_fix("Pass the target line's subject id, e.g. p-<ULID>")
+    })?;
+    let Some(line_raw) = line_raw else {
+        return cmd_retract_bulk(
+            cli,
+            root,
+            &vault,
+            &subject,
+            &reason_raw,
+            match_date,
+            verb,
+            kind,
+            keep,
+            date_raw,
+        );
+    };
+    if match_date.is_some() || verb.is_some() || kind.is_some() || keep.is_some() {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "bulk selectors cannot be combined with --line",
+        ))
+        .with_fix("Pass either --line, or --verb with --match-date"));
+    }
+    let target = lookup_line_ref(&vault, line_raw, occurrence)?;
+    if target.entry.id != subject {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "target line's subject is {}, not {subject_raw}",
+            target.entry.id
+        )))
+        .with_fix("Use the target line's own subject id"));
+    }
+    if matches!(target.entry.verb.as_str(), "retract" | "merge") {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "merge and retract lines cannot be retracted",
+        ))
+        .with_fix("Only a fact line can be retracted"));
+    }
+    let date = parse_date_arg(&date_raw.map(str::to_owned))?;
+    if target.entry.date > date {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "target line is dated {}, after the retraction date {date}",
+            target.entry.date
+        )))
+        .with_fix("Pass a --date on or after the target line's date"));
+    }
+    let reason = parse_retract_reason(&reason_raw)?;
+    let replacement = match replace_raw {
+        Some(raw) => {
+            let replacement = lookup_line_ref(&vault, raw, None)?;
+            if replacement.line_ref.occurrence() != 1 {
+                return Err(anyhow::Error::new(DomainError::invalid(
+                    "a replacement must be a unique line (occurrence 1)",
+                ))
+                .with_fix("Use `correct` with an inline replacement line instead"));
+            }
+            if replacement.entry.id != subject {
+                return Err(anyhow::Error::new(DomainError::invalid(
+                    "replacement line's subject does not match the target",
+                ))
+                .with_fix("A replacement must keep the target line's subject id"));
+            }
+            if replacement.entry.date > date {
+                return Err(anyhow::Error::new(DomainError::invalid(
+                    "replacement line is dated after the retraction",
+                ))
+                .with_fix("Pass a later --date or choose an earlier replacement"));
+            }
+            if vault.corrections().is_voided(&replacement.line_ref) {
+                return Err(anyhow::Error::new(DomainError::invalid(
+                    "replacement line is already superseded",
+                ))
+                .with_fix("Choose a line that is effective at the retraction date"));
+            }
+            if matches!(replacement.entry.verb.as_str(), "retract" | "merge") {
+                return Err(anyhow::Error::new(DomainError::invalid(
+                    "a replacement cannot be a merge or retract line",
+                ))
+                .with_fix("Replace a fact with another fact line"));
+            }
+            if replacement.line_ref == target.line_ref {
+                return Err(anyhow::Error::new(DomainError::invalid(
+                    "a line cannot replace itself",
+                ))
+                .with_fix("Choose a different replacement line"));
+            }
+            Some(replacement.line_ref)
+        }
+        None => None,
+    };
+    let retraction = ledger_correction_line(date, &subject, target.line_ref, reason, replacement);
+    let mut changes: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    changes
+        .entry(month_path(&date))
+        .or_default()
+        .push(retraction.clone());
+    let canonical = format!(
+        "retract/v1\nsubject={subject}\ntarget={}\nreason={}\nreplace={}\ndate={date}\n",
+        target.line_ref,
+        reason,
+        replacement.map(|r| r.to_string()).unwrap_or_default()
+    );
+    if vault.corrections().is_voided(&target.line_ref)
+        && !defer_to_write_path(root, cli, &canonical)?
+    {
+        return Err(anyhow::Error::new(DomainError::already_exists(
+            "that line is already retracted",
+        ))
+        .with_fix("Repeat with the original --request-id, or choose a different line"));
+    }
+    apply_ledger_correction(
+        cli,
+        root,
+        changes,
+        format!("retract {}", target.line_ref.short()),
+        canonical,
+        serde_json::json!({
+            "command": "retract",
+            "target": target.line_ref.to_string(),
+            "subject": subject.to_string(),
+            "reason": reason.as_str(),
+            "lines": [retraction],
+            "date": date.to_string(),
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_correct(
+    cli: &Cli,
+    root: &Path,
+    subject_raw: &str,
+    line_raw: &str,
+    occurrence: Option<u32>,
+    replacement_raw: String,
+    reason_raw: String,
+    date_raw: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let vault = vault_or!(root, cli.json);
+    require_spec_04(&vault, "correct")?;
+    let subject = RecordId::parse(subject_raw).map_err(|_| {
+        anyhow::Error::new(DomainError::usage(format!(
+            "not a record id: {subject_raw}"
+        )))
+    })?;
+    let target = lookup_line_ref(&vault, line_raw, occurrence)?;
+    if target.entry.id != subject {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "target line's subject does not match",
+        ))
+        .with_fix("Use the target line's own subject id"));
+    }
+    if matches!(target.entry.verb.as_str(), "retract" | "merge") {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "merge and retract lines cannot be corrected",
+        ))
+        .with_fix("Only a fact line can be corrected"));
+    }
+    let date = parse_date_arg(&date_raw.map(str::to_owned))?;
+    if target.entry.date > date {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "target line is dated after the correction",
+        ))
+        .with_fix("Pass a --date on or after the target line's date"));
+    }
+    let reason = parse_retract_reason(&reason_raw)?;
+    let replacement_entry = parse_line(&replacement_raw)
+        .map_err(|err| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "replacement is not a valid ledger line: {err}"
+            )))
+            .with_fix("Use a line like `2026-10-08 touch p-<ULID> call`")
+        })?
+        .ok_or_else(|| {
+            anyhow::Error::new(DomainError::invalid(
+                "replacement is a blank or comment line, not a fact",
+            ))
+        })?;
+    if replacement_entry.id != subject {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "replacement line's subject does not match the target",
+        ))
+        .with_fix("A correction cannot move a fact between people"));
+    }
+    if matches!(replacement_entry.verb.as_str(), "retract" | "merge") {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "a replacement cannot be a merge or retract line",
+        ))
+        .with_fix("Replace a fact with another fact line"));
+    }
+    if replacement_entry.date > date {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "replacement line is dated after the correction",
+        ))
+        .with_fix("Pass a later --date or change the replacement date"));
+    }
+    if replacement_entry == target.entry {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "replacement is identical to the original line",
+        ))
+        .with_fix("Change the fact, or use `retract` to void it without a replacement"));
+    }
+    let replacement_text = format_entry(&replacement_entry);
+    let fingerprint = line_fingerprint(&replacement_entry);
+    let canonical = format!(
+        "correct/v1\nsubject={subject}\ntarget={}\nreason={}\nreplacement={replacement_text}\ndate={date}\n",
+        target.line_ref,
+        reason
+    );
+    if vault
+        .effective_entries()
+        .any(|s| line_fingerprint(&s.entry) == fingerprint)
+        && !defer_to_write_path(root, cli, &canonical)?
+    {
+        return Err(anyhow::Error::new(DomainError::already_exists(
+            "that replacement line already exists",
+        ))
+        .with_fix("Use `retract` without a replacement, or change the replacement"));
+    }
+    if vault.corrections().is_voided(&target.line_ref)
+        && !defer_to_write_path(root, cli, &canonical)?
+    {
+        return Err(anyhow::Error::new(DomainError::already_exists(
+            "that line is already retracted",
+        ))
+        .with_fix("Repeat with the original --request-id, or choose a different line"));
+    }
+    let occurrence = vault
+        .entries
+        .iter()
+        .filter(|s| line_fingerprint(&s.entry) == fingerprint)
+        .count() as u32
+        + 1;
+    let replacement_ref = LineRef::new(fingerprint, occurrence);
+    let retraction = ledger_correction_line(
+        date,
+        &subject,
+        target.line_ref,
+        reason,
+        Some(replacement_ref),
+    );
+    let mut changes: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    changes
+        .entry(month_path(&replacement_entry.date))
+        .or_default()
+        .push(replacement_text.clone());
+    changes
+        .entry(month_path(&date))
+        .or_default()
+        .push(retraction.clone());
+    apply_ledger_correction(
+        cli,
+        root,
+        changes,
+        format!("correct {}", target.line_ref.short()),
+        canonical,
+        serde_json::json!({
+            "command": "correct",
+            "target": target.line_ref.to_string(),
+            "subject": subject.to_string(),
+            "reason": reason.as_str(),
+            "replacement": replacement_ref.to_string(),
+            "lines": [replacement_text, retraction],
+            "date": date.to_string(),
+        }),
+    )
+}
+
+fn cmd_record_retire(
+    cli: &Cli,
+    root: &Path,
+    id_raw: &str,
+    retire: bool,
+) -> anyhow::Result<ExitCode> {
+    let vault = vault_or!(root, cli.json);
+    require_spec_04(
+        &vault,
+        if retire {
+            "record retire"
+        } else {
+            "record unretire"
+        },
+    )?;
+    let id = RecordId::parse(id_raw).map_err(|_| {
+        anyhow::Error::new(DomainError::usage(format!("not a record id: {id_raw}")))
+    })?;
+    if id.prefix() == Prefix::Package {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "a package is a ledger id, not a record",
+        )));
+    }
+    let canonical = confidant_core::canonical_record_id(&vault, &id);
+    if canonical != id {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "{id} is merged into {canonical}"
+        )))
+        .with_fix(&format!("Retire {canonical} instead")));
+    }
+    let Some(record) = vault.records.get(&id) else {
+        return Err(anyhow::Error::new(DomainError::not_found(format!(
+            "no record with id {id_raw}"
+        ))));
+    };
+    if record.is_retired() == retire {
+        return finish_write(
+            cli,
+            root,
+            if retire {
+                "record-retire"
+            } else {
+                "record-unretire"
+            },
+            WriteOutcome::Unchanged,
+            serde_json::json!({
+                "id": id.to_string(),
+                "path": record.path,
+                "retired": retire,
+            }),
+        );
+    }
+    let mut updated = record.clone();
+    if retire {
+        updated
+            .fields
+            .insert("retired".to_owned(), "true".to_owned());
+    } else {
+        updated.fields.remove("retired");
+    }
+    let text = confidant_core::format_record(&updated);
+    let rel = PathBuf::from(&record.path);
+    // The record already loaded and validated from this path; a note may
+    // live under `people/<person>/notes/`, which the generic main-path
+    // derivation does not know. Writing the existing path keeps every
+    // record type (including notes) addressable without a parallel path
+    // resolver.
+    let pending = PendingWrite {
+        changes: vec![FileChange::WriteFile {
+            path: rel.clone(),
+            contents: text.clone(),
+        }],
+        summary: if retire {
+            format!("record {id} retire")
+        } else {
+            format!("record {id} unretire")
+        },
+        canonical_request: format!(
+            "{}/v1\npath={}\nbody={text}",
+            if retire {
+                "record-retire"
+            } else {
+                "record-unretire"
+            },
+            rel.display()
+        ),
+    };
+    let outcome = apply_record_write(root, &vault, pending, &write_options(cli))?;
+    finish_write(
+        cli,
+        root,
+        if retire {
+            "record-retire"
+        } else {
+            "record-unretire"
+        },
+        outcome,
+        serde_json::json!({
+            "id": id.to_string(),
+            "path": rel.display().to_string(),
+            "retired": retire,
+        }),
+    )
+}
+
 fn cmd_import(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
     let text = std::fs::read_to_string(file).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
@@ -3672,18 +4356,18 @@ fn cmd_import(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_note_add(
     cli: &Cli,
     root: &Path,
-    person_raw: &str,
+    person_raw: Option<&str>,
+    entity_raw: Option<&str>,
     date_raw: Option<String>,
     no_ai: bool,
     forced_id: Option<&str>,
     body_file: &Path,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
-    let person = resolve_person_arg(root, &vault, person_raw)?;
-    announce_resolved_person(cli, &person);
     let date = parse_date_arg(&date_raw)?;
     let body = std::fs::read_to_string(body_file).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
@@ -3691,6 +4375,51 @@ fn cmd_note_add(
             body_file.display()
         )))
     })?;
+    let (subject_id, subject_kind, subject_name) = match (person_raw, entity_raw) {
+        (Some(person_raw), None) => {
+            let person = resolve_person_arg(root, &vault, person_raw)?;
+            announce_resolved_person(cli, &person);
+            (
+                person.id.clone(),
+                "person",
+                Some(person.matched_name.clone()),
+            )
+        }
+        (None, Some(entity_raw)) => {
+            let id = RecordId::parse(entity_raw).map_err(|_| {
+                anyhow::Error::new(DomainError::usage(format!(
+                    "not an entity id: {entity_raw}"
+                )))
+            })?;
+            let Some(decl) = vault.type_registry().get_by_prefix(id.prefix()) else {
+                return Err(anyhow::Error::new(DomainError::invalid(format!(
+                    "no entity with id {entity_raw}"
+                ))));
+            };
+            if !decl.entity || !decl.enabled {
+                return Err(anyhow::Error::new(DomainError::invalid(format!(
+                    "type does not accept entity notes: {entity_raw}"
+                ))));
+            }
+            if vault.is_retired(&id) {
+                return Err(
+                    anyhow::Error::new(DomainError::invalid(format!("{id} is retired")))
+                        .with_fix("Run `confidant record unretire <id>` before adding notes"),
+                );
+            }
+            if !vault.records.contains_key(&id) {
+                return Err(anyhow::Error::new(DomainError::not_found(format!(
+                    "no record with id {id}"
+                ))));
+            }
+            (id, "entity", None)
+        }
+        _ => {
+            return Err(anyhow::Error::new(DomainError::usage(
+                "pass exactly one of --person or --entity",
+            )))
+        }
+    };
 
     // #611: the TUI passes the manifest's own note id so the reviewed
     // dry-run and the commit name the same note. Without `--id` the id is
@@ -3700,9 +4429,18 @@ fn cmd_note_add(
         None => RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
             .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?,
     };
-    let rel = PathBuf::from(format!("people/{}/notes/{nid}.md", person.id));
+    let rel = if subject_kind == "person" {
+        PathBuf::from(format!("people/{subject_id}/notes/{nid}.md"))
+    } else {
+        PathBuf::from(format!("notes/{nid}/note.md"))
+    };
+    let subject_key = if subject_kind == "person" {
+        "person"
+    } else {
+        "entity"
+    };
     let mut fields = BTreeMap::from([
-        ("person".to_owned(), person.id.to_string()),
+        (subject_key.to_owned(), subject_id.to_string()),
         ("date".to_owned(), date.to_string()),
     ]);
     if no_ai {
@@ -3719,10 +4457,8 @@ fn cmd_note_add(
         body_start_line: 0,
         field_lines: BTreeMap::new(),
     };
-    let canonical_request = format!(
-        "note-add/v1\nperson={}\ndate={date}\nno_ai={no_ai}\nbody={body}",
-        person.id
-    );
+    let canonical_request =
+        format!("note-add/v1\n{subject_key}={subject_id}\ndate={date}\nno_ai={no_ai}\nbody={body}");
     // A forced id must not overwrite an existing note. A genuine retry
     // (progress file lost after the commit) is recognized by its
     // request-id trailer, and apply_write reports it idempotent; only an
@@ -3739,7 +4475,7 @@ fn cmd_note_add(
                 path: rel.clone(),
                 contents: confidant_core::format_record(&rec),
             }],
-            summary: format!("note {} {nid}", person.id),
+            summary: format!("note {subject_id} {nid}"),
             canonical_request,
         },
         &write_options(cli),
@@ -3748,8 +4484,12 @@ fn cmd_note_add(
         "id": nid.to_string(),
         "path": rel.display().to_string(),
     });
-    if let Some(echo) = person.echo_json() {
-        extra["person"] = echo;
+    if subject_kind == "person" {
+        if let Some(name) = subject_name {
+            extra["person"] = serde_json::json!({"id": subject_id.to_string(), "name": name});
+        }
+    } else {
+        extra["entity"] = serde_json::json!(subject_id.to_string());
     }
     finish_write(cli, root, "note-add", outcome, extra)
 }
@@ -3852,7 +4592,7 @@ fn cmd_note_show(cli: &Cli, root: &Path, id_raw: &str, for_edit: bool) -> anyhow
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         return Err(anyhow::Error::new(DomainError::spec_unsupported(
             &vault.config.spec,
         )));
@@ -3880,11 +4620,18 @@ fn cmd_note_show(cli: &Cli, root: &Path, id_raw: &str, for_edit: bool) -> anyhow
                 "type": rec.kind.as_str(),
                 "path": rec.path,
                 "no_ai": rec.no_ai(),
+                "retired": rec.is_retired(),
                 "for_edit": true,
                 "text": text,
             }),
         ))?;
     } else {
+        if rec.is_retired() {
+            writeln!(
+                io::stderr(),
+                "note: this record is retired; it is hidden from agent reads. Use `confidant record unretire {id}` to restore it."
+            )?;
+        }
         // Byte-for-byte on stdout, so it can be redirected into an editor
         // or a file and edited in place.
         print!("{text}");
@@ -3909,7 +4656,7 @@ fn cmd_note_edit(
     edit: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         return Err(anyhow::Error::new(DomainError::spec_unsupported(
             &vault.config.spec,
         )));
@@ -4034,6 +4781,17 @@ fn cmd_note_edit(
     )
 }
 
+/// Parse with the vault's spec and declared types. Writes use this so a 0.3
+/// vault can author edge `no-ai` and pack-type records; `require_declared`
+/// is true for `record add` and false for edits of an orphaned type.
+fn record_schema(vault: &confidant_core::Vault, require_declared: bool) -> RecordSchema<'_> {
+    RecordSchema {
+        spec: vault.spec_version().unwrap_or(SpecVersion::V02),
+        types: Some(vault.type_registry()),
+        require_declared,
+    }
+}
+
 fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     let text = std::fs::read_to_string(file).map_err(|e| {
@@ -4046,14 +4804,26 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "record.md".to_owned());
-    let rec = confidant_core::parse_record(&text, &provisional)
+    let schema = record_schema(&vault, true);
+    let rec = confidant_core::record::parse_record_with_schema(&text, &provisional, &schema)
         .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
     if rec.kind == RecordKind::Note {
         return Err(anyhow::Error::new(DomainError::usage(
             "record add does not create notes; use `confidant note add --body-file`",
         )));
     }
-    let rel = main_record_path(&rec)
+    if let Some(decl) = vault.type_registry().get(rec.kind.as_str()) {
+        if !decl.enabled {
+            return Err(anyhow::Error::new(
+                DomainError::invalid(format!(
+                    "type '{}' belongs to a disabled or removed pack",
+                    rec.kind.as_str()
+                ))
+                .with_fix("Enable the pack that declares this type, or remove the record"),
+            ));
+        }
+    }
+    let rel = main_record_path_with(&rec, Some(vault.type_registry()))
         .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
     if root.join(&rel).exists() {
         return Err(anyhow::Error::new(
@@ -4224,7 +4994,7 @@ pub(crate) fn reject_unsupported_prefix(id: &RecordId) -> anyhow::Result<()> {
 fn cmd_record_list(
     cli: &Cli,
     root: &Path,
-    kind: RecordKind,
+    kind: &str,
     for_operator: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = match load_vault_for_reads(root, cli.json, for_operator) {
@@ -4232,7 +5002,7 @@ fn cmd_record_list(
         Err(code) => return Ok(code),
     };
     let vault_path = vault.root.display().to_string();
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         print_error(
             cli.json,
             Some(&vault_path),
@@ -4247,7 +5017,15 @@ fn cmd_record_list(
             return Ok(ExitCode::from(err.exit_code() as u8));
         }
     };
-    let roster = confidant_core::build_roster(&vault, kind, &scope, for_operator);
+    if !confidant_core::roster::is_roster_kind(&vault, kind) {
+        let err = DomainError::usage(format!(
+            "unknown record kind '{kind}'; use all, person, org, deal, or a declared type"
+        ));
+        print_error(cli.json, Some(&vault_path), &err)?;
+        return Ok(ExitCode::from(err.exit_code() as u8));
+    }
+    let filter = (kind != "all").then_some(kind);
+    let roster = confidant_core::build_roster(&vault, filter, &scope, for_operator);
     if cli.json {
         print_json(&ok_envelope(
             Some(&vault.root),
@@ -4265,18 +5043,24 @@ fn cmd_record_list(
                 "notes" => "\t[no-ai: notes]",
                 _ => "",
             };
+            let orphan = entry
+                .orphan
+                .as_deref()
+                .map(|reason| format!("\t[orphan: {reason}]"))
+                .unwrap_or_default();
+            let retired = if entry.retired { "\t[retired]" } else { "" };
             // Escape the name so a tab, newline, or terminal escape in a
             // display name cannot break the one-entry-per-line layout
             // (`escape_line` also neutralizes bidi/format characters).
             // `--json` is untouched: there the name is a JSON string.
             writeln!(
                 io::stdout(),
-                "{}\t{}{badge}",
+                "{}\t{}{badge}{orphan}{retired}",
                 entry.id,
                 confidant_core::packs::untrusted::escape_line(&entry.name)
             )?;
         }
-        let noun = if kind == RecordKind::Person {
+        let noun = if kind == "person" {
             "people"
         } else {
             "records"
@@ -4285,7 +5069,7 @@ fn cmd_record_list(
             io::stdout(),
             "{} {noun} ({})",
             roster.records.len(),
-            kind.as_str()
+            roster.kind
         )?;
         // A scoped call names the scope that applied (like `context`).
         if matches!(scope, PackScope::Only(_)) && !scope_names.is_empty() {
@@ -4321,7 +5105,7 @@ fn cmd_record_show(
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         return Err(anyhow::Error::new(DomainError::spec_unsupported(
             &vault.config.spec,
         )));
@@ -4360,11 +5144,18 @@ fn cmd_record_show(
                 "type": rec.kind.as_str(),
                 "path": rec.path,
                 "no_ai": rec.no_ai(),
+                "retired": rec.is_retired(),
                 "for_edit": true,
                 "text": text,
             }),
         ))?;
     } else {
+        if rec.is_retired() {
+            writeln!(
+                io::stderr(),
+                "note: this record is retired; it is hidden from agent reads. Use `confidant record unretire {id}` to restore it."
+            )?;
+        }
         // Byte-for-byte on stdout, so it can be redirected into an editor
         // or a file and edited in place.
         print!("{text}");
@@ -4382,7 +5173,7 @@ fn cmd_record_resolve(
     edit: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         return Err(anyhow::Error::new(DomainError::spec_unsupported(
             &vault.config.spec,
         )));
@@ -4400,7 +5191,7 @@ fn cmd_record_resolve(
     // stays untouched, not the scratch dir. (#487 item 1.)
     sweep_stale_scratch(root);
     if show {
-        let sides = load_sides(root, &id)?;
+        let sides = load_sides(root, &vault, &id)?;
         let ours_text = String::from_utf8_lossy(&sides.ours_bytes);
         let theirs_text = String::from_utf8_lossy(&sides.theirs_bytes);
         if cli.json {
@@ -4425,7 +5216,7 @@ fn cmd_record_resolve(
         // #454: install one side byte for byte, stage it, print the next
         // git step. Both sides were read by `load_sides`, so the
         // operator has seen what they discard (CD7).
-        let sides = load_sides(root, &id)?;
+        let sides = load_sides(root, &vault, &id)?;
         // #465: `--dry-run` verifies both sides are readable (same
         // CD7 read the real write needs) but writes nothing.
         if cli.dry_run {
@@ -4473,7 +5264,7 @@ fn cmd_record_resolve(
         // #455: hand-merge from a file outside the vault. The operator's
         // file is validated like `record edit --file` and written
         // through the same path; it is staged, never committed (CD6).
-        let sides = load_sides(root, &id)?;
+        let sides = load_sides(root, &vault, &id)?;
         // CD5: refuse ANY path inside the vault tree, no `.confidant/`
         // exception, so a plaintext merge file cannot be committed by
         // accident.
@@ -4491,6 +5282,10 @@ fn cmd_record_resolve(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "record.md".to_owned());
+        let existing_path = vault
+            .records
+            .get(&id)
+            .map(|record| PathBuf::from(&record.path));
         let prepared = prepare_record_write(
             root,
             PrepareSpec {
@@ -4501,6 +5296,9 @@ fn cmd_record_resolve(
                 summary: format!("record-resolve {id}"),
                 canonical_prefix: "record-resolve/v1",
                 allow_conflict: true,
+                spec: vault.spec_version().unwrap_or(SpecVersion::V02),
+                types: Some(vault.type_registry()),
+                existing_path: existing_path.as_deref(),
             },
         )?;
         // Defense in depth: the merged record must name the conflicted
@@ -4535,7 +5333,7 @@ fn cmd_record_resolve(
         // #465: `--dry-run --edit` creates no scratch and installs nothing;
         // `load_sides` is the same conflict read the real edit would do.
         if cli.dry_run {
-            let sides = load_sides(root, &id)?;
+            let sides = load_sides(root, &vault, &id)?;
             return print_resolve_dry_run(
                 cli,
                 root,
@@ -4683,7 +5481,7 @@ fn cmd_resolve_edit(
     id: &RecordId,
     id_raw: &str,
 ) -> anyhow::Result<ExitCode> {
-    let sides = load_sides(root, id)?;
+    let sides = load_sides(root, _vault, id)?;
     // Fail fast if no editor is configured, before creating any scratch
     // files (which would hold plaintext).
     resolve_editor()?;
@@ -4703,6 +5501,10 @@ fn cmd_resolve_edit(
         &format!("the merged record from {}", merged_path.display()),
     )
     .map_err(anyhow::Error::new)?;
+    let existing_path = _vault
+        .records
+        .get(id)
+        .map(|record| PathBuf::from(&record.path));
     let prepared = prepare_record_write(
         root,
         PrepareSpec {
@@ -4713,6 +5515,9 @@ fn cmd_resolve_edit(
             summary: format!("record-resolve {id}"),
             canonical_prefix: "record-resolve/v1",
             allow_conflict: true,
+            spec: _vault.spec_version().unwrap_or(SpecVersion::V02),
+            types: Some(_vault.type_registry()),
+            existing_path: existing_path.as_deref(),
         },
     )?;
     if prepared.rel != sides.path {
@@ -4748,6 +5553,13 @@ pub(crate) struct PrepareSpec<'a> {
     /// expects them. The check runs before the no-ai restamp planning,
     /// which cannot read a conflicted file (#412 Q6).
     pub allow_conflict: bool,
+    /// Vault spec for edge `no-ai` and other format-version rules.
+    pub spec: SpecVersion,
+    /// Declared types for pack-type records.
+    pub types: Option<&'a TypeRegistry>,
+    /// Existing path, used to edit an orphan/retired type whose declaration
+    /// is no longer in the registry.
+    pub existing_path: Option<&'a Path>,
 }
 
 /// The validated record and its planned write, shared by `record edit` and
@@ -4792,9 +5604,20 @@ fn prepare_record_write(root: &Path, spec: PrepareSpec<'_>) -> anyhow::Result<Pr
         summary,
         canonical_prefix,
         allow_conflict,
+        spec,
+        types,
+        existing_path,
     } = spec;
-    let rec = confidant_core::parse_record(text, provisional)
-        .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
+    let rec = confidant_core::record::parse_record_with_schema(
+        text,
+        provisional,
+        &RecordSchema {
+            spec,
+            types,
+            require_declared: false,
+        },
+    )
+    .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
     if rec.id != *id {
         return Err(anyhow::Error::new(
             DomainError::invalid(format!("the file's id is {}, not {id_raw}", rec.id))
@@ -4840,8 +5663,18 @@ fn prepare_record_write(root: &Path, spec: PrepareSpec<'_>) -> anyhow::Result<Pr
             }
         }
     }
-    let rel = main_record_path(&rec)
-        .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
+    let rel = match main_record_path_with(&rec, types) {
+        Ok(path) => path,
+        Err(err) => {
+            if let Some(existing) = existing_path {
+                existing.to_path_buf()
+            } else {
+                return Err(anyhow::Error::new(
+                    DomainError::invalid(err.message).with_fix(err.fix),
+                ));
+            }
+        }
+    };
     if !root.join(&rel).exists() {
         return Err(anyhow::Error::new(
             DomainError::not_found(format!("no record file at {}", rel.display()))
@@ -4913,6 +5746,10 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
     // Shared validation + write planning (#455). The fail-closed ladder
     // below is edit-specific: the resolve path already verified the
     // conflict and read both sides via `load_sides` (CD7).
+    let existing_path = vault
+        .records
+        .get(&id)
+        .map(|record| PathBuf::from(&record.path));
     let prepared = prepare_record_write(
         root,
         PrepareSpec {
@@ -4923,6 +5760,9 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
             summary: format!("record {id}"),
             canonical_prefix: "record-edit/v1",
             allow_conflict: false,
+            spec: vault.spec_version().unwrap_or(SpecVersion::V02),
+            types: Some(vault.type_registry()),
+            existing_path: existing_path.as_deref(),
         },
     )?;
     let rec = &prepared.rec;
@@ -4943,6 +5783,10 @@ fn cmd_context(
     include_private: bool,
     for_operator: bool,
 ) -> anyhow::Result<ExitCode> {
+    if let Err(err) = legacy_vault_gate(root) {
+        print_error(cli.json, Some(&root.display().to_string()), &err)?;
+        return Ok(ExitCode::from(err.exit_code() as u8));
+    }
     // Operator mode (#572) loads through the operator read path (the same
     // mechanism as `record show --for-edit`); the default stays the agent
     // read path.
@@ -4950,13 +5794,25 @@ fn cmd_context(
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
+    // The bundle now parses edges, whose kind list depends on the vault
+    // spec. Fail closed on a spec this binary does not implement instead of
+    // rendering a partial bundle.
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
+        print_error(
+            cli.json,
+            Some(&vault.root.display().to_string()),
+            &DomainError::spec_unsupported(&vault.config.spec),
+        )?;
+        return Ok(ExitCode::from(1));
+    }
     // #537: a `p-<ULID>` keeps its exact previous behaviour (unsupported id
     // shapes still fall through to the cannot-search / ⚠2b / not-found
     // branches below); a non-id argument is an exact display name resolved
     // against the cleared set and canonicalized. Id args are not
     // canonicalized here — `context` already folds merge groups when it
-    // builds the bundle.
-    let person = match RecordId::parse(person_raw) {
+    // builds the bundle. #813: an `o-<ULID>` is an org target; an org name
+    // is not resolved by name in phase 1.
+    let target = match RecordId::parse(person_raw) {
         Ok(id) => id,
         Err(_) => match confidant_core::resolve::resolve_person(&vault, person_raw) {
             Ok(m) => m.id,
@@ -4970,11 +5826,11 @@ fn cmd_context(
             return Ok(ExitCode::from(err.exit_code() as u8));
         }
     };
-    let bundle = match build_context(&vault, &person, include_private, &scope, for_operator) {
+    let bundle = match build_context(&vault, &target, include_private, &scope, for_operator) {
         Some(b) => b,
         None => {
             return Err(anyhow::Error::new(DomainError::not_found(format!(
-                "no person with id {person_raw}"
+                "no entity with id {person_raw}"
             )))
             .context("use `confidant find <name>` to look up the id"));
         }
@@ -4986,30 +5842,34 @@ fn cmd_context(
         if for_operator {
             println!("{OPERATOR_MODE_BANNER}");
         }
-        let p = &bundle.person;
+        let e = &bundle.entity;
         // Operator mode carries the tri-state; the agent path still only
-        // knows the boolean.
-        let badge = match p.no_ai_mode {
+        // knows the boolean. `"false"` is an explicit visible record, not a
+        // hidden one, so it gets no badge.
+        let badge = match e.no_ai_mode {
             Some("notes") => " [no-ai: notes]",
-            Some(_) => " [no-ai]",
-            None if p.no_ai => " [no-ai]",
+            Some("true") => " [no-ai]",
+            Some(_) => "",
+            None if e.no_ai => " [no-ai]",
             None => "",
         };
-        println!(
-            "{} {}{badge}",
-            p.id,
-            p.name.as_deref().unwrap_or("(name withheld)"),
-        );
+        let name = e.name.as_deref().unwrap_or("(name withheld)");
+        if e.kind == "person" {
+            println!("{} {name}{badge}", e.id);
+        } else {
+            println!("{} {name} ({}){badge}", e.id, e.kind);
+        }
         // #178: show the scope that applied, so a scoped bundle is never
         // mistaken for the whole record.
         if !bundle.scope.is_empty() && matches!(scope, PackScope::Only(_)) {
             println!("scope: {}", bundle.scope.join(", "));
         }
         println!(
-            "notes: {}, interactions: {}, touchpoints: {}",
+            "notes: {}, interactions: {}, touchpoints: {}, edges: {}",
             bundle.notes.len(),
             bundle.interactions.len(),
-            bundle.touchpoints.len()
+            bundle.touchpoints.len(),
+            bundle.edges.len()
         );
         if !bundle.aliases.is_empty() {
             println!("aliases: {}", bundle.aliases.join(", "));
@@ -5027,6 +5887,7 @@ fn cmd_context(
 /// An ambiguous name fails closed with `E_AMBIGUOUS_PERSON` (candidate ids
 /// are opaque, never names).
 fn cmd_resolve(cli: &Cli, root: &Path, query: &str) -> anyhow::Result<ExitCode> {
+    legacy_vault_gate(root).map_err(anyhow::Error::new)?;
     let vault = match load_vault_for_reads(root, cli.json, false) {
         Ok(v) => v,
         Err(code) => return Ok(code),
@@ -5091,6 +5952,7 @@ fn validate_alias_kind(kind: &str) -> anyhow::Result<()> {
 /// cleared people sharing a value fail closed with `E_AMBIGUOUS_PERSON`.
 fn cmd_alias_resolve(cli: &Cli, root: &Path, kind: &str, value: &str) -> anyhow::Result<ExitCode> {
     validate_alias_kind(kind)?;
+    legacy_vault_gate(root).map_err(anyhow::Error::new)?;
     let vault = match load_vault_for_reads(root, cli.json, false) {
         Ok(v) => v,
         Err(code) => return Ok(code),
@@ -5133,6 +5995,18 @@ struct DoctorCheck {
     /// Actionable next step for a non-ok check, serialized as `fix` (the
     /// ADR-7 error-envelope field name). `None` when nothing needs doing.
     fix: Option<String>,
+}
+
+/// #809: a vault written by the encrypted Confidant (≤0.7) cannot be read
+/// as plaintext. One clear check replaces the stream of record and ledger
+/// parse errors the normal checks would report.
+fn legacy_encrypted_vault_check() -> DoctorCheck {
+    DoctorCheck {
+        id: "legacy-encrypted-vault",
+        status: "error",
+        message: confidant_core::error::LEGACY_ENCRYPTED_VAULT_MESSAGE.to_owned(),
+        fix: None,
+    }
 }
 
 /// Latest GitHub Release endpoint (#165). Release builds always use the
@@ -6300,7 +7174,7 @@ fn confirm_sync_write(cli: &Cli, yes: bool, question: &str) -> anyhow::Result<bo
 /// `unknown` is a stable fourth value, alongside the existing three.
 const DOCTOR_STATUS_UNKNOWN: &str = "unknown";
 
-fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
+fn collect_doctor_checks(cli: &Cli, root: &Path) -> Vec<DoctorCheck> {
     let mut checks: Vec<DoctorCheck> = Vec::new();
 
     checks.push(DoctorCheck {
@@ -6309,6 +7183,16 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
         message: format!("vault resolved to {}", root.display()),
         fix: None,
     });
+    checks.push(vault_access_check(root));
+
+    // #809: detect the encrypted ≤0.7 vault shape before loading it. One
+    // clear error beats a stream of parse and check findings, and the
+    // normal `spec` / `check` checks cannot say anything useful about a
+    // vault this binary has no reader for.
+    let legacy_encrypted = confidant_core::vault::is_legacy_encrypted_vault(root);
+    if legacy_encrypted {
+        checks.push(legacy_encrypted_vault_check());
+    }
 
     match require_git_repo(root, cli.no_input) {
         Ok(()) => checks.push(DoctorCheck {
@@ -6360,56 +7244,58 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
     // advisory: no remote/upstream stays `ok`, and a real difference warns.
     checks.push(local_commits_check(root, cli.no_input));
 
-    match load_vault(root) {
-        Ok(vault) => {
-            if vault.config.spec == confidant_core::SPEC_VERSION {
-                checks.push(DoctorCheck {
-                    id: "spec",
-                    status: "ok",
-                    message: "vault spec 0.1 supported".to_owned(),
-                    fix: None,
-                });
-            } else {
-                checks.push(DoctorCheck {
-                    id: "spec",
-                    status: "error",
-                    message: format!("unsupported vault spec: {}", vault.config.spec),
-                    fix: None,
-                });
+    if !legacy_encrypted {
+        match load_vault(root) {
+            Ok(vault) => {
+                if confidant_core::SpecVersion::is_supported(&vault.config.spec) {
+                    checks.push(DoctorCheck {
+                        id: "spec",
+                        status: "ok",
+                        message: format!("vault spec {} supported", vault.config.spec),
+                        fix: None,
+                    });
+                } else {
+                    checks.push(DoctorCheck {
+                        id: "spec",
+                        status: "error",
+                        message: format!("unsupported vault spec: {}", vault.config.spec),
+                        fix: None,
+                    });
+                }
+                let report = check_vault(&vault, &CheckOptions::default());
+                if report.summary.errors > 0 {
+                    checks.push(DoctorCheck {
+                        id: "check",
+                        status: "error",
+                        message: format!(
+                            "check reports {} error(s); writes are blocked until fixed",
+                            report.summary.errors
+                        ),
+                        fix: None,
+                    });
+                } else if report.summary.warnings > 0 {
+                    checks.push(DoctorCheck {
+                        id: "check",
+                        status: "warning",
+                        message: format!("check reports {} warning(s)", report.summary.warnings),
+                        fix: None,
+                    });
+                } else {
+                    checks.push(DoctorCheck {
+                        id: "check",
+                        status: "ok",
+                        message: "check is clean".to_owned(),
+                        fix: None,
+                    });
+                }
             }
-            let report = check_vault(&vault, &CheckOptions::default());
-            if report.summary.errors > 0 {
-                checks.push(DoctorCheck {
-                    id: "check",
-                    status: "error",
-                    message: format!(
-                        "check reports {} error(s); writes are blocked until fixed",
-                        report.summary.errors
-                    ),
-                    fix: None,
-                });
-            } else if report.summary.warnings > 0 {
-                checks.push(DoctorCheck {
-                    id: "check",
-                    status: "warning",
-                    message: format!("check reports {} warning(s)", report.summary.warnings),
-                    fix: None,
-                });
-            } else {
-                checks.push(DoctorCheck {
-                    id: "check",
-                    status: "ok",
-                    message: "check is clean".to_owned(),
-                    fix: None,
-                });
-            }
+            Err(e) => checks.push(DoctorCheck {
+                id: "vault-load",
+                status: "error",
+                message: format!("cannot load vault: {e}"),
+                fix: None,
+            }),
         }
-        Err(e) => checks.push(DoctorCheck {
-            id: "vault-load",
-            status: "error",
-            message: format!("cannot load vault: {e}"),
-            fix: None,
-        }),
     }
 
     // #165: staleness vs the latest GitHub Release. Warning-only: a stale
@@ -6429,6 +7315,9 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
         let latest = if offline { None } else { latest_release_tag() };
         checks.push(cli_staleness_check(latest, offline));
         checks.push(skills_links_check());
+        // #727: skill links only reach sessions that load a skill; the
+        // system-of-record rule belongs in the agent's always-on file.
+        checks.push(system_of_record_check(Some(root)));
         // #659: the optional TUI must match the CLI's agent contract.
         checks.push(tui_version_check());
         // #386/#657: qmd search availability. Missing qmd is `ok`; an
@@ -6436,7 +7325,36 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
         checks.push(qmd_search_check(root));
     }
 
+    checks
+}
+
+/// Count the doctor statuses without letting an unknown status silently
+/// disappear from the summary.
+fn doctor_status_counts(checks: &[DoctorCheck]) -> [(&'static str, usize); 4] {
+    [
+        ("ok", checks.iter().filter(|c| c.status == "ok").count()),
+        (
+            "warning",
+            checks.iter().filter(|c| c.status == "warning").count(),
+        ),
+        (
+            "error",
+            checks.iter().filter(|c| c.status == "error").count(),
+        ),
+        (
+            "unknown",
+            checks
+                .iter()
+                .filter(|c| c.status == DOCTOR_STATUS_UNKNOWN)
+                .count(),
+        ),
+    ]
+}
+
+fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
+    let checks = collect_doctor_checks(cli, root);
     let ok = !checks.iter().any(|c| c.status == "error");
+    let counts = doctor_status_counts(&checks);
     if cli.json {
         let items: Vec<serde_json::Value> = checks
             .iter()
@@ -6456,6 +7374,15 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
             .collect();
         let mut extra = serde_json::Map::new();
         extra.insert("checks".to_owned(), serde_json::Value::Array(items));
+        extra.insert(
+            "summary".to_owned(),
+            serde_json::json!({
+                "ok": counts[0].1,
+                "warning": counts[1].1,
+                "error": counts[2].1,
+                "unknown": counts[3].1,
+            }),
+        );
         let mut envelope = ok_envelope(Some(root), serde_json::Value::Object(extra));
         envelope["ok"] = serde_json::Value::Bool(ok);
         print_json(&envelope)?;
@@ -6466,12 +7393,871 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
                 println!("        fix: {fix}");
             }
         }
+        println!();
+        println!(
+            "Summary: {} ok, {} warning, {} error, {} unknown",
+            counts[0].1, counts[1].1, counts[2].1, counts[3].1
+        );
+        println!("Full readiness rollup: confidant status");
     }
     if ok {
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::from(1))
     }
+}
+
+/// `vault-access` reports what the permission bits say without attempting a
+/// write (`status` and `doctor` are read-only). A false `ok` would be worse
+/// than the honest caveat in the message.
+fn vault_access_check(root: &Path) -> DoctorCheck {
+    const ID: &str = "vault-access";
+    match std::fs::metadata(root) {
+        Ok(meta) if !meta.is_dir() => DoctorCheck {
+            id: ID,
+            status: "error",
+            message: "vault path is not a directory".to_owned(),
+            fix: None,
+        },
+        Ok(meta) if meta.permissions().readonly() => DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: "vault directory has no write permission; reads work, writes will fail"
+                .to_owned(),
+            fix: Some("Make the vault directory writable by this user".to_owned()),
+        },
+        Ok(_) => DoctorCheck {
+            id: ID,
+            status: "ok",
+            message:
+                "vault directory is readable and writable (permission bits; no write was attempted)"
+                    .to_owned(),
+            fix: None,
+        },
+        Err(err) => DoctorCheck {
+            id: ID,
+            status: "error",
+            message: format!("cannot inspect the vault directory: {err}"),
+            fix: None,
+        },
+    }
+}
+
+/// #727: is the system-of-record rule present in every detected agent's
+/// always-on file, and does it point at this vault? Missing or stale is a
+/// warning (setup fixes it); never an error, because a hand-written vault
+/// and a host with no agent are both valid.
+fn system_of_record_check(root: Option<&Path>) -> DoctorCheck {
+    const ID: &str = "system-of-record";
+    let home = match setup::home_dir() {
+        Ok(home) => home,
+        Err(err) => {
+            return DoctorCheck {
+                id: ID,
+                status: "warning",
+                message: format!("cannot determine home directory: {err:#}"),
+                fix: None,
+            };
+        }
+    };
+    let health = setup::system_of_record_health(&home, root);
+    if health.is_empty() {
+        return DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "no agents detected; run `confidant setup --agent auto` when one is installed"
+                .to_owned(),
+            fix: None,
+        };
+    }
+    let fix = root
+        .map(|root| {
+            format!(
+                "Run `confidant setup --agent auto --vault {}` to install or refresh the rule",
+                root.display()
+            )
+        })
+        .unwrap_or_else(|| {
+            "Run `confidant setup --agent auto --vault <path>` to install or refresh the rule"
+                .to_owned()
+        });
+    let missing: Vec<&setup::InstructionHealth> = health.iter().filter(|h| !h.installed).collect();
+    if !missing.is_empty() {
+        let paths: Vec<String> = missing
+            .iter()
+            .map(|h| format!("{} ({})", h.agent, h.path.display()))
+            .collect();
+        return DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!("system-of-record rule missing for {}", paths.join(", ")),
+            fix: Some(fix),
+        };
+    }
+    let stale: Vec<&setup::InstructionHealth> = health
+        .iter()
+        .filter(|h| h.installed && !h.matches_vault)
+        .collect();
+    if !stale.is_empty() {
+        let paths: Vec<String> = stale
+            .iter()
+            .map(|h| {
+                format!(
+                    "{} ({}, points at {})",
+                    h.agent,
+                    h.path.display(),
+                    h.pointer.as_deref().unwrap_or("no vault")
+                )
+            })
+            .collect();
+        return DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "system-of-record rule points at another vault for {}",
+                paths.join(", ")
+            ),
+            fix: Some(fix),
+        };
+    }
+    DoctorCheck {
+        id: ID,
+        status: "ok",
+        message: format!(
+            "system-of-record rule installed for {}",
+            health
+                .iter()
+                .map(|h| h.agent.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        fix: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `confidant status` (#716) and the completion brief (#733).
+// ---------------------------------------------------------------------------
+
+/// One line in the readiness rollup. `absent` is a fifth status for an
+/// optional layer that is not installed: it is never `ok`, and it does not
+/// fail readiness unless the check is required.
+#[derive(Debug, Clone)]
+struct ReadinessCheck {
+    id: &'static str,
+    status: &'static str,
+    message: String,
+    fix: Option<String>,
+    required: bool,
+}
+
+impl ReadinessCheck {
+    fn from_doctor(check: DoctorCheck, required: bool) -> Self {
+        ReadinessCheck {
+            id: check.id,
+            status: check.status,
+            message: check.message,
+            fix: check.fix,
+            required,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let mut item = serde_json::json!({
+            "id": self.id,
+            "status": self.status,
+            "message": self.message,
+            "required": self.required,
+        });
+        if let Some(fix) = &self.fix {
+            item["fix"] = Value::String(fix.clone());
+        }
+        item
+    }
+}
+
+/// Which doctor checks must be `ok` for setup to count as complete. Optional
+/// layers (TUI, QMD, remote, ahead/behind) may be absent or warning without
+/// blocking readiness; they are still reported.
+fn readiness_required(id: &str) -> bool {
+    matches!(
+        id,
+        "cli-staleness"
+            | "vault-discovery"
+            | "vault-access"
+            | "vault-load"
+            | "git-repo"
+            | "git-identity"
+            | "git-remote"
+            | "spec"
+            | "skills-links"
+            | "system-of-record"
+    )
+}
+
+fn readiness_checks(cli: &Cli, vault: Option<&Path>) -> Vec<ReadinessCheck> {
+    let mut checks: Vec<ReadinessCheck> = match vault {
+        Some(root) => collect_doctor_checks(cli, root)
+            .into_iter()
+            .map(|check| {
+                let required = readiness_required(check.id);
+                ReadinessCheck::from_doctor(check, required)
+            })
+            .collect(),
+        None => {
+            let offline = staleness_offline();
+            let latest = if offline { None } else { latest_release_tag() };
+            vec![
+                ReadinessCheck::from_doctor(cli_staleness_check(latest, offline), true),
+                ReadinessCheck::from_doctor(tui_version_check(), false),
+                ReadinessCheck {
+                    id: "vault-discovery",
+                    status: "absent",
+                    message: "no vault resolved; pass --vault, set CONFIDANT_VAULT, or run inside a vault"
+                        .to_owned(),
+                    fix: Some(
+                        "Pass `--vault <path>`, set `CONFIDANT_VAULT`, or run `confidant init --create`"
+                            .to_owned(),
+                    ),
+                    required: true,
+                },
+                ReadinessCheck::from_doctor(skills_links_check(), true),
+                ReadinessCheck::from_doctor(system_of_record_check(None), true),
+                ReadinessCheck {
+                    id: "qmd-search",
+                    status: "absent",
+                    message: "no vault to inspect for a search corpus; search is unavailable until a vault is set"
+                        .to_owned(),
+                    fix: None,
+                    required: false,
+                },
+            ]
+        }
+    };
+
+    // An optional layer that is not installed is `absent`, never a false
+    // `ok`. The doctor checks keep their historical `ok` for compatibility.
+    if find_on_path("confidant-tui").is_none() {
+        for check in &mut checks {
+            if check.id == "tui-version" {
+                check.status = "absent";
+            }
+        }
+    }
+    if vault.is_some() && find_on_path("qmd").is_none() {
+        for check in &mut checks {
+            if check.id == "qmd-search" {
+                check.status = "absent";
+            }
+        }
+    }
+
+    // A host with no agent has nothing to link or instruct; that is absent,
+    // not a failure of the install. A host that has agents but was never
+    // targeted is not set up: keep those checks required and non-ok.
+    let home = setup::home_dir().ok();
+    let agent_health = home
+        .as_deref()
+        .map(setup::agents_health)
+        .unwrap_or_default();
+    let detected = agent_health.iter().any(|agent| agent.detected);
+    let targeted = agent_health
+        .iter()
+        .any(|agent| agent.detected && agent.targeted);
+    if home.is_none() {
+        // `skills-links` already warns that home could not be determined;
+        // do not overwrite that with an optional "no agents" line.
+    } else if !detected {
+        for check in &mut checks {
+            if check.id == "skills-links" || check.id == "system-of-record" {
+                check.status = "absent";
+                check.required = false;
+                check.message =
+                    "no agents detected; install one, then run `confidant setup --agent auto`"
+                        .to_owned();
+                check.fix = None;
+            }
+        }
+    } else if !targeted {
+        for check in &mut checks {
+            if check.id == "skills-links" || check.id == "system-of-record" {
+                check.status = "absent";
+                check.message =
+                    "agents detected but setup has not linked them; run `confidant setup --agent auto`"
+                        .to_owned();
+            }
+        }
+    }
+    checks
+}
+
+fn readiness_summary(checks: &[ReadinessCheck]) -> Value {
+    let count = |status: &str| checks.iter().filter(|c| c.status == status).count();
+    // Any error blocks readiness, even from a check that is advisory for
+    // setup (a vault check error means writes are blocked). Optional
+    // warnings do not block; a warning on a required check does.
+    let ready = checks
+        .iter()
+        .all(|check| !check.required || check.status == "ok")
+        && !checks.iter().any(|check| check.status == "error");
+    serde_json::json!({
+        "ready": ready,
+        "ok": count("ok"),
+        "warning": count("warning"),
+        "absent": count("absent"),
+        "unknown": count(DOCTOR_STATUS_UNKNOWN),
+        "error": count("error"),
+    })
+}
+
+fn cmd_status(cli: &Cli, vault: Option<&Path>) -> anyhow::Result<ExitCode> {
+    let checks = readiness_checks(cli, vault);
+    let summary = readiness_summary(&checks);
+    let ready = summary["ready"].as_bool().unwrap_or(false);
+    let brief = completion_brief(cli, vault);
+    if cli.json {
+        let items: Vec<Value> = checks.iter().map(ReadinessCheck::to_json).collect();
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "readiness".to_owned(),
+            serde_json::json!({
+                "summary": summary,
+                "checks": items,
+            }),
+        );
+        extra.insert("brief".to_owned(), brief.to_json());
+        let mut envelope = ok_envelope(vault, Value::Object(extra));
+        envelope["ok"] = Value::Bool(ready);
+        print_json(&envelope)?;
+    } else {
+        println!("Confidant readiness");
+        for check in &checks {
+            let marker = if check.required { "" } else { " (optional)" };
+            println!(
+                "{:8} {:<18} {}{}",
+                check.status, check.id, check.message, marker
+            );
+            if let Some(fix) = &check.fix {
+                println!("         fix: {fix}");
+            }
+        }
+        println!();
+        let not_ready: Vec<&str> = checks
+            .iter()
+            .filter(|check| (check.required && check.status != "ok") || check.status == "error")
+            .map(|check| check.id)
+            .collect();
+        if ready {
+            println!("Ready: every required check is ok.");
+        } else {
+            println!("Not ready: {}.", not_ready.join(", "));
+        }
+        println!(
+            "          {} ok, {} warning, {} absent, {} unknown, {} error",
+            summary["ok"],
+            summary["warning"],
+            summary["absent"],
+            summary["unknown"],
+            summary["error"]
+        );
+        println!();
+        print_completion_brief(cli, vault);
+    }
+    Ok(if ready {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+struct BriefSection {
+    key: &'static str,
+    title: &'static str,
+    lines: Vec<String>,
+}
+
+struct CompletionBrief {
+    sections: Vec<BriefSection>,
+    routines: Vec<String>,
+}
+
+impl CompletionBrief {
+    fn to_json(&self) -> Value {
+        serde_json::json!({
+            "sections": self.sections.iter().map(|section| serde_json::json!({
+                "key": section.key,
+                "title": section.title,
+                "lines": section.lines,
+            })).collect::<Vec<_>>(),
+            "routines": self.routines,
+        })
+    }
+}
+
+fn completion_brief_json(cli: &Cli, vault: Option<&Path>) -> Value {
+    completion_brief(cli, vault).to_json()
+}
+
+fn print_completion_brief(cli: &Cli, vault: Option<&Path>) {
+    let brief = completion_brief(cli, vault);
+    println!("Completion brief");
+    for section in &brief.sections {
+        println!();
+        println!("{}", section.title);
+        for line in &section.lines {
+            println!("  {line}");
+        }
+    }
+    println!();
+    println!("Jumping-off routines");
+    for (index, routine) in brief.routines.iter().enumerate() {
+        println!("  {}. {routine}", index + 1);
+    }
+}
+
+fn machine_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            std::env::var("COMPUTERNAME")
+                .ok()
+                .filter(|name| !name.trim().is_empty())
+        })
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or_else(|| "this machine".to_owned())
+}
+
+fn format_system_time(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time)
+        .format("%Y-%m-%d %H:%M UTC")
+        .to_string()
+}
+
+fn completion_brief(cli: &Cli, vault: Option<&Path>) -> CompletionBrief {
+    let loaded = vault.and_then(|root| load_vault(root).ok());
+    let counts = loaded
+        .as_ref()
+        .map(|vault| {
+            let count = |kind: RecordKind| {
+                vault
+                    .records
+                    .values()
+                    .filter(|record| record.kind == kind)
+                    .count()
+            };
+            (
+                count(RecordKind::Person),
+                count(RecordKind::Org),
+                count(RecordKind::Deal),
+                count(RecordKind::Interaction),
+                count(RecordKind::Note),
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, 0));
+    let (people, orgs, deals, interactions, notes) = counts;
+    let cadence_warnings = loaded
+        .as_ref()
+        .map(|vault| {
+            check_vault(vault, &CheckOptions::default())
+                .findings
+                .iter()
+                .filter(|finding| {
+                    finding.code == confidant_core::check::FindingCode::CadenceOverdue
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    // Only infer branch/remote/fleet from the vault's own repository, never
+    // from a parent checkout that happens to contain it.
+    let has_git = vault.is_some_and(|root| root.join(".git").exists());
+    let branch = vault
+        .filter(|_| has_git)
+        .and_then(|root| current_branch(root, cli.no_input));
+
+    let mut sections = Vec::new();
+
+    // 1. The vault.
+    let mut vault_lines = Vec::new();
+    match (vault, loaded.as_ref()) {
+        (Some(root), Some(loaded)) => {
+            vault_lines.push(format!("Name: {}", loaded.config.vault_id));
+            vault_lines.push(format!("Location: {}", root.display()));
+            vault_lines.push(format!(
+                "Branch: {}",
+                branch
+                    .as_deref()
+                    .unwrap_or("unknown (git did not report a branch)")
+            ));
+            vault_lines.push(format!(
+                "Records: {people} people, {orgs} orgs, {deals} deals, \
+                 {interactions} interactions, {notes} notes."
+            ));
+        }
+        (Some(root), None) => {
+            vault_lines.push(format!("Location: {}", root.display()));
+            vault_lines.push(
+                "The vault could not be loaded. Run `confidant check` and fix the error before relying on it."
+                    .to_owned(),
+            );
+        }
+        (None, _) => {
+            vault_lines.push("No vault is configured on this machine.".to_owned());
+            vault_lines.push("New vault: `confidant init --create --no-input`.".to_owned());
+            vault_lines.push(
+                "Existing vault: set `CONFIDANT_VAULT` or pass `--vault <path>`, then re-run `confidant setup` so agent instructions get the pointer."
+                    .to_owned(),
+            );
+        }
+    }
+    sections.push(BriefSection {
+        key: "vault",
+        title: "The vault",
+        lines: vault_lines,
+    });
+
+    // 2. This machine.
+    let writable = vault
+        .and_then(|root| std::fs::metadata(root).ok())
+        .map(|meta| !meta.permissions().readonly())
+        .unwrap_or(false);
+    let mut machine_lines = vec![format!("Machine: {}", machine_name())];
+    if vault.is_some() {
+        machine_lines.push(format!(
+            "Can read this vault: {}",
+            if loaded.is_some() { "yes" } else { "no" }
+        ));
+        machine_lines.push(format!(
+            "Can write this vault: {} (permission bits; no write was attempted)",
+            if writable { "yes" } else { "no" }
+        ));
+    } else {
+        machine_lines
+            .push("No vault is configured, so there is nothing to read or write yet.".to_owned());
+    }
+    sections.push(BriefSection {
+        key: "machine",
+        title: "This machine",
+        lines: machine_lines,
+    });
+
+    // 3. The fleet, inferred from the remote and recent commits.
+    let mut fleet_lines = Vec::new();
+    let mut remote: Option<(String, String)> = None;
+    let mut upstream: Option<(String, String)> = None;
+    let mut authors: Vec<String> = Vec::new();
+    if let (Some(root), true) = (vault, has_git) {
+        if let Ok(output) = confidant_core::write::git(root, &["remote", "-v"], cli.no_input) {
+            let entries = parse_git_remote_urls(&output);
+            remote = entries
+                .iter()
+                .find(|(name, _)| name == "origin")
+                .or_else(|| entries.first())
+                .map(|(name, url)| (name.clone(), url.clone()));
+        }
+        upstream = git_upstream(root, cli.no_input);
+        if let Ok(output) =
+            confidant_core::write::git(root, &["log", "-n", "50", "--format=%an"], cli.no_input)
+        {
+            for name in output
+                .lines()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                if !authors.iter().any(|seen| seen == name) {
+                    authors.push(name.to_owned());
+                }
+            }
+        }
+        fleet_lines.push(format!("This clone: {}", root.display()));
+    }
+    match &remote {
+        Some((name, url)) => fleet_lines.push(format!(
+            "Remote: {name} {}",
+            display_remote_url(url)
+        )),
+        None if vault.is_some() && !has_git => fleet_lines.push(
+            "This vault is not a git repository, so there is no remote. Writes need git; run `confidant doctor`."
+                .to_owned(),
+        ),
+        None => fleet_lines.push(
+            "No git remote. This vault lives on one machine; a lost disk has no copy.".to_owned(),
+        ),
+    }
+    if !authors.is_empty() {
+        fleet_lines.push(format!(
+            "Recent commits (last 50) show {} author {}: {}. Confidant cannot see how many machines clone this repo.",
+            authors.len(),
+            if authors.len() == 1 { "identity" } else { "identities" },
+            authors.join(", ")
+        ));
+    } else if vault.is_some() {
+        fleet_lines.push(
+            "No commits yet, so there is no recent-author evidence about other machines."
+                .to_owned(),
+        );
+    }
+    sections.push(BriefSection {
+        key: "fleet",
+        title: "The fleet",
+        lines: fleet_lines,
+    });
+
+    // 4. The remote and the perimeter, stated plainly.
+    let mut perimeter_lines = vec!["Records are plaintext on disk and in git history.".to_owned()];
+    if remote.is_some() {
+        perimeter_lines.push(
+            "The remote must be private: anyone with access can read every record, history included. Confidant cannot verify the host's visibility setting."
+                .to_owned(),
+        );
+        perimeter_lines.push(
+            "There is no application-level encryption. The perimeter is the private remote plus full-disk encryption (LUKS, FileVault) on every machine."
+                .to_owned(),
+        );
+    } else {
+        perimeter_lines.push(
+            "There is no remote. The perimeter is this machine and any backup copy you keep."
+                .to_owned(),
+        );
+        perimeter_lines.push(
+            "There is no application-level encryption. Keep the disk and every backup under full-disk encryption (LUKS, FileVault)."
+                .to_owned(),
+        );
+    }
+    perimeter_lines.push(
+        "Full-disk encryption is an OS setting. Confidant does not verify it, and no check was run."
+            .to_owned(),
+    );
+    sections.push(BriefSection {
+        key: "perimeter",
+        title: "The remote and the perimeter",
+        lines: perimeter_lines,
+    });
+
+    // 5. Sync posture, with the reason.
+    let mut sync_lines = Vec::new();
+    match &upstream {
+        Some((branch, upstream)) => {
+            sync_lines.push(format!("This clone tracks {upstream} on branch {branch}."));
+            sync_lines.push(
+                "Commits stay local until you run `confidant sync --push`; that is an explicit, confirmed network write."
+                    .to_owned(),
+            );
+        }
+        None if remote.is_some() => {
+            sync_lines.push(format!(
+                "A remote is configured, but branch {} has no upstream yet.",
+                branch.as_deref().unwrap_or("main")
+            ));
+            sync_lines.push(format!(
+                "Set one with `git push -u {} {}` before using `confidant sync`.",
+                remote
+                    .as_ref()
+                    .map(|(name, _)| name.as_str())
+                    .unwrap_or("origin"),
+                branch.as_deref().unwrap_or("main")
+            ));
+        }
+        None => {
+            sync_lines.push(
+                "Local-only: no remote, so nothing syncs. Back up the disk another way.".to_owned(),
+            );
+        }
+    }
+    sync_lines.push(
+        "Nothing pushes or pulls as a side effect of a write. `confidant sync` reports ahead/behind from the last fetch."
+            .to_owned(),
+    );
+    sync_lines.push(
+        "If the branch has diverged, `confidant sync` reports it and refuses to fast-forward; reconcile explicitly."
+            .to_owned(),
+    );
+    if remote.is_some() {
+        sync_lines.push(
+            "Who can write: this machine can change its local clone; any machine with push access to the remote can change the shared copy. Confidant does not probe credentials."
+                .to_owned(),
+        );
+    } else {
+        sync_lines
+            .push("Who can write: this machine only; there is no remote to push to.".to_owned());
+    }
+    sections.push(BriefSection {
+        key: "sync",
+        title: "Sync posture",
+        lines: sync_lines,
+    });
+
+    // 6. Search state and its upkeep truth.
+    let qmd_available = find_on_path("qmd").is_some();
+    let corpus_path = vault.map(|root| root.join(QMD_CORPUS_REL));
+    let corpus = corpus_path
+        .as_deref()
+        .filter(|path| path.is_dir())
+        .map(std::path::Path::to_path_buf);
+    let mut search_lines = Vec::new();
+    if vault.is_none() {
+        search_lines.push(
+            "No vault, so there is no corpus. `confidant find` becomes available once a vault is configured."
+                .to_owned(),
+        );
+    } else if !qmd_available {
+        search_lines.push(
+            "QMD is not installed; semantic search is off. `confidant find` reads the live vault."
+                .to_owned(),
+        );
+    } else if let Some(path) = &corpus {
+        let modified = std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .map(format_system_time)
+            .unwrap_or_else(|_| "unknown".to_owned());
+        search_lines.push(format!(
+            "QMD corpus: {}; last modified {modified}.",
+            path.display()
+        ));
+        search_lines.push(
+            "Search results are a snapshot from that time. Refresh the corpus after changes; exact lookups (`resolve`, `context`, `find`) read the live vault."
+                .to_owned(),
+        );
+    } else {
+        search_lines.push(
+            "QMD is installed but this vault has no corpus. Keyword search falls back to `confidant find`; build the corpus with the qmd-search skill."
+                .to_owned(),
+        );
+    }
+    search_lines.push(
+        "QMD is optional: embeddings can download multi-GB models and use disk under `.confidant/` (gitignored)."
+            .to_owned(),
+    );
+    sections.push(BriefSection {
+        key: "search",
+        title: "Search",
+        lines: search_lines,
+    });
+
+    // 7. The standing orders, and where they live.
+    let mut standing_lines = Vec::new();
+    match setup::home_dir() {
+        Ok(home) => {
+            let health = setup::system_of_record_health(&home, vault);
+            if health.is_empty() {
+                standing_lines.push(
+                    "No agent detected; no standing orders were installed. Run `confidant setup --agent auto` after installing one."
+                        .to_owned(),
+                );
+            } else {
+                for entry in health {
+                    let state = if !entry.installed {
+                        "missing"
+                    } else if vault.is_some() && !entry.matches_vault {
+                        "installed, but points at another vault"
+                    } else {
+                        "installed"
+                    };
+                    standing_lines.push(format!(
+                        "{} -> {} ({state})",
+                        entry.agent,
+                        entry.path.display()
+                    ));
+                }
+            }
+        }
+        Err(err) => standing_lines.push(format!("Cannot determine home directory: {err:#}")),
+    }
+    standing_lines.push("Re-print the exact rule with `confidant routing`.".to_owned());
+    sections.push(BriefSection {
+        key: "standing-orders",
+        title: "Standing orders",
+        lines: standing_lines,
+    });
+
+    // 8. The work discipline in force.
+    sections.push(BriefSection {
+        key: "discipline",
+        title: "Work discipline",
+        lines: vec![
+            "Writes are propose (`--dry-run`) → operator confirms → apply.".to_owned(),
+            "Each write runs `check` and commits once; a failing check blocks the write."
+                .to_owned(),
+            "Nothing pushes, publishes, or spends as a side effect.".to_owned(),
+            "`sync --pull` and `sync --push` are explicit, confirmed network writes.".to_owned(),
+            "`no-ai: true` records, and the notes of `no-ai: notes` people, never enter agent output.".to_owned(),
+        ],
+    });
+
+    // 9. 3–5 jumping-off routines, grounded in this vault's contents.
+    let mut routines = Vec::new();
+    if let Some(root) = vault {
+        if loaded.is_none() {
+            routines.push(format!(
+                "Inspect the vault: `confidant check --vault {}` and fix the error it reports.",
+                root.display()
+            ));
+            routines.push(format!(
+                "Load it in the agent: `confidant resolve <name> --vault {}` once `check` is clean.",
+                root.display()
+            ));
+            routines.push(format!(
+                "Re-run setup after fixing it: `confidant setup --vault {}`.",
+                root.display()
+            ));
+            routines.push("Check readiness: `confidant status`.".to_owned());
+        } else if people > 0 {
+            routines.push(
+                "Before a conversation: `confidant resolve <name>` then `confidant context <id>`."
+                    .to_owned(),
+            );
+            routines.push(
+                "After a conversation: `confidant log touch <person> meet --note \"what happened\" --dry-run`, review it, then rerun without `--dry-run`."
+                    .to_owned(),
+            );
+            if cadence_warnings > 0 {
+                routines.push(format!(
+                    "Keep in touch: `confidant check` lists {cadence_warnings} cadence warning(s); log a touch with `confidant log touch <person> meal` after contact."
+                ));
+            }
+        } else {
+            routines.push(
+                "Add the first person: `confidant record add --file <person.md>` (see `confidant help record add`)."
+                    .to_owned(),
+            );
+        }
+        routines.push(
+            "Search: `confidant find <query>` reads the live vault; use the qmd-search skill for fuzzy questions when enabled."
+                .to_owned(),
+        );
+        if interactions + notes > 0 && routines.len() < 5 {
+            routines.push(format!(
+                "Review context: `confidant context <id>` includes {interactions} interaction(s) and {notes} note(s)."
+            ));
+        }
+        if routines.len() < 5 {
+            routines.push(
+                "Check the vault: `confidant check` (read-only; finding codes are stable)."
+                    .to_owned(),
+            );
+        }
+    } else {
+        routines.push("Create a vault: `confidant init --create --no-input`.".to_owned());
+        routines.push(
+            "Point this machine at an existing vault: set `CONFIDANT_VAULT` or pass `--vault <path>`."
+                .to_owned(),
+        );
+        routines.push(
+            "Re-run `confidant setup --vault <path>` so the pointer is in agent instructions."
+                .to_owned(),
+        );
+        routines.push("Check readiness: `confidant status`.".to_owned());
+    }
+
+    CompletionBrief { sections, routines }
 }
 
 fn bootstrap_target(cli: &Cli) -> PathBuf {
@@ -6658,7 +8444,8 @@ const FALLBACK_GIT_NAME: &str = "Confidant Operator";
 const FALLBACK_GIT_EMAIL: &str = "operator@confidant.local";
 
 /// Create the collection directories and write the repo-local fallback
-/// identity into `<vault>/.git/config`. Both steps are idempotent.
+/// identity into `<vault>/.git/config` for any key the vault has not set.
+/// Both steps are idempotent, and a per-vault override survives a re-run.
 fn initialize_vault_shape(root: &Path, no_input: bool) -> anyhow::Result<()> {
     for dir in VAULT_DIRS {
         std::fs::create_dir_all(root.join(dir)).map_err(|e| {
@@ -6671,6 +8458,12 @@ fn initialize_vault_shape(root: &Path, no_input: bool) -> anyhow::Result<()> {
         ("user.name", FALLBACK_GIT_NAME),
         ("user.email", FALLBACK_GIT_EMAIL),
     ] {
+        // `git config --get` exits non-zero when the key is unset; only then
+        // write the neutral value, so an operator's per-vault edit is kept.
+        if confidant_core::write::git(root, &["config", "--local", "--get", key], no_input).is_ok()
+        {
+            continue;
+        }
         confidant_core::write::git(root, &["config", "--local", key, value], no_input)?;
     }
     Ok(())
@@ -6989,9 +8782,9 @@ fn bootstrap_vault(cli: &Cli, create: bool) -> anyhow::Result<BootstrapPlan> {
         )?;
     }
 
-    // The vault's shape (`people/` … `ledger/`) and, on a machine with no
-    // git identity at all, the repo-local fallback identity the skeleton
-    // commit needs. An operator's real identity is never overridden.
+    // The vault's shape (`people/` … `ledger/`) and the neutral repo-local
+    // identity the skeleton commit uses, so the operator's global identity
+    // never lands in the vault's history.
     initialize_vault_shape(&root, no_input)?;
 
     // `.confidant/` holds the plaintext search corpus and must never be
@@ -7077,7 +8870,7 @@ fn bootstrap_vault(cli: &Cli, create: bool) -> anyhow::Result<BootstrapPlan> {
 /// Records are plaintext, so there is no key, keychain, anchor, or recovery
 /// step. With `--create` the skeleton is already written and committed by
 /// [`bootstrap_vault`], including the collection directories and a
-/// repo-local fallback git identity when the machine has none; this
+/// neutral repo-local git identity; this
 /// validates the result and reports the plan. Without `--create` the same
 /// idempotent shape step runs on the existing vault.
 fn cmd_init(cli: &Cli, root: &Path, scaffold: Option<Scaffold>) -> anyhow::Result<ExitCode> {
@@ -7086,7 +8879,7 @@ fn cmd_init(cli: &Cli, root: &Path, scaffold: Option<Scaffold>) -> anyhow::Resul
 
     require_git_repo(root, no_input)?;
     let vault = load_vault(root)?;
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         return Err(anyhow::Error::new(DomainError::spec_unsupported(
             &vault.config.spec,
         )));
@@ -7123,7 +8916,7 @@ fn cmd_init(cli: &Cli, root: &Path, scaffold: Option<Scaffold>) -> anyhow::Resul
         Some(mut scaffold) => scaffold.disarm(),
         // `--create` on an existing vault, or `init` on a hand-written one:
         // make the on-disk shape match what a fresh scaffold produces.
-        // Idempotent, and it never overwrites an existing identity.
+        // Idempotent, and it keeps a per-vault identity already set.
         None => initialize_vault_shape(root, no_input)?,
     }
     if json {
@@ -7147,7 +8940,13 @@ fn cmd_init(cli: &Cli, root: &Path, scaffold: Option<Scaffold>) -> anyhow::Resul
 }
 
 fn cmd_schema(cli: &Cli, vault: Option<&Path>) -> anyhow::Result<ExitCode> {
-    let schema = contract_schema();
+    let mut schema = contract_schema();
+    if let Some(root) = vault {
+        let loaded = load_vault(root).map_err(anyhow::Error::new)?;
+        let (scope, _) =
+            resolve_cli_scope(&loaded, cli.packs.as_deref()).map_err(anyhow::Error::new)?;
+        schema["record_types"] = record_types_json(Some(&loaded), Some(&scope));
+    }
     if cli.json {
         print_json(&ok_envelope(vault, serde_json::json!({"contract": schema})))?;
     } else {
@@ -7156,7 +8955,12 @@ fn cmd_schema(cli: &Cli, vault: Option<&Path>) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn setup_result_json(result: &setup::SetupResult) -> Value {
+fn setup_result_json(
+    result: &setup::SetupResult,
+    instructions: Option<&[setup::InstructionInstall]>,
+    instruction_text: &str,
+    instructions_skipped: bool,
+) -> Value {
     let agents: Vec<Value> = result
         .agents
         .iter()
@@ -7174,7 +8978,7 @@ fn setup_result_json(result: &setup::SetupResult) -> Value {
             })
         })
         .collect();
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "skills_dir": result.skills_dir.display().to_string(),
         "home": result.home.display().to_string(),
         "version": result.version,
@@ -7188,7 +8992,19 @@ fn setup_result_json(result: &setup::SetupResult) -> Value {
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>(),
         "dry_run": result.dry_run,
-    })
+    });
+    if let Some(instructions) = instructions {
+        value["instructions"] = serde_json::json!({
+            "skipped": instructions_skipped,
+            "text": instruction_text,
+            "targets": instructions.iter().map(|i| serde_json::json!({
+                "agent": i.agent,
+                "path": i.path.display().to_string(),
+                "outcome": i.outcome.as_str(),
+            })).collect::<Vec<_>>(),
+        });
+    }
+    value
 }
 
 fn cmd_setup(
@@ -7196,8 +9012,11 @@ fn cmd_setup(
     agent: &str,
     force: bool,
     copy: bool,
+    no_instructions: bool,
     verbose: bool,
+    vault: Option<&Path>,
 ) -> anyhow::Result<ExitCode> {
+    let vault = vault.or(cli.vault.as_deref());
     match setup::run_setup(agent, force, copy, cli.dry_run) {
         Ok(result) => {
             // #653c: `--agent auto` falls back to claude-code when nothing is
@@ -7205,10 +9024,29 @@ fn cmd_setup(
             if let Some(note) = &result.fallback_note {
                 eprintln!("warning: {note}");
             }
+            // #727: install the system-of-record rule in each agent's
+            // always-on instruction file, not only in the skill dirs.
+            let instruction_text = setup::system_of_record_text(vault);
+            let instructions = if no_instructions {
+                Vec::new()
+            } else {
+                setup::install_instructions(
+                    &result.resolved_agents,
+                    &result.home,
+                    vault,
+                    cli.dry_run,
+                )?
+            };
             if cli.json {
-                let mut value = setup_result_json(&result);
+                let mut value = setup_result_json(
+                    &result,
+                    Some(&instructions),
+                    &instruction_text,
+                    no_instructions,
+                );
                 if let Value::Object(ref mut obj) = value {
                     obj.insert("next_steps".to_owned(), setup_next_steps_json(cli));
+                    obj.insert("brief".to_owned(), completion_brief_json(cli, vault));
                 }
                 print_json(&ok_envelope(None, value))?;
             } else {
@@ -7252,11 +9090,51 @@ fn cmd_setup(
                         result.removed_stale.len()
                     );
                 }
+                if no_instructions {
+                    println!();
+                    println!("System-of-record rule skipped (--no-instructions).");
+                } else if instructions.is_empty() {
+                    println!();
+                    println!(
+                        "System-of-record rule not installed: no agent instruction file was selected."
+                    );
+                } else {
+                    println!();
+                    println!(
+                        "System-of-record rule {}:",
+                        if result.dry_run {
+                            "planned (nothing written)"
+                        } else {
+                            "installed"
+                        }
+                    );
+                    for install in &instructions {
+                        println!(
+                            "  {:<12} {}",
+                            install.outcome.as_str(),
+                            install.path.display()
+                        );
+                    }
+                    println!();
+                    println!(
+                        "Text {}:",
+                        if result.dry_run {
+                            "that would be written"
+                        } else {
+                            "written"
+                        }
+                    );
+                    for line in instruction_text.lines() {
+                        println!("  {line}");
+                    }
+                }
                 if result.dry_run {
                     println!("  re-run without --dry-run to apply");
                 } else {
                     println!();
                     setup_next_steps(cli, verbose)?;
+                    println!();
+                    print_completion_brief(cli, vault);
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -7395,7 +9273,7 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
             return Ok(ExitCode::SUCCESS);
         }
         let result = setup::run_setup(agent, force, false, cli.dry_run)?;
-        let mut value = setup_result_json(&result);
+        let mut value = setup_result_json(&result, None, "", false);
         if let Value::Object(ref mut obj) = value {
             obj.insert("update".to_owned(), update_info);
         }
@@ -7570,14 +9448,12 @@ fn cmd_which(cli: &Cli, skills_dir_only: bool) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_routing(cli: &Cli) -> anyhow::Result<ExitCode> {
+fn cmd_routing(cli: &Cli, vault: Option<&Path>) -> anyhow::Result<ExitCode> {
+    let text = setup::system_of_record_text(vault.or(cli.vault.as_deref()));
     if cli.json {
-        print_json(&ok_envelope(
-            None,
-            serde_json::json!({"snippet": setup::ROUTING_SNIPPET}),
-        ))?;
+        print_json(&ok_envelope(vault, serde_json::json!({"snippet": text})))?;
     } else {
-        print!("{}", setup::ROUTING_SNIPPET);
+        print!("{text}");
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -7661,6 +9537,103 @@ fn cmd_tui(cli: &Cli, args: &[String]) -> anyhow::Result<ExitCode> {
     })
 }
 
+/// Human `--help` groups (#721): where an operator meets each command, not
+/// the order clap stores them in. Every visible command appears exactly
+/// once; hidden commands (`bench-gen`) stay hidden, and `help --json` keeps
+/// its flat, complete command list.
+const JOURNEYS: &[(&str, &[&str])] = &[
+    ("Start here", &["setup", "init", "doctor", "status", "sync"]),
+    (
+        "Everyday",
+        &[
+            "check", "context", "find", "log", "note", "record", "retract", "correct", "alias",
+            "resolve",
+        ],
+    ),
+    ("Integrations", &["agents", "mcp", "routing"]),
+    (
+        "Advanced / rare",
+        &[
+            "pack",
+            "import",
+            "allowlist",
+            "schema",
+            "update",
+            "which",
+            "help",
+            "tui",
+        ],
+    ),
+];
+
+/// The top-level command with human help grouped by journey (#721).
+///
+/// Only the human top-level screen changes: subcommand help, parse rules,
+/// and `help --json` all still use `Cli::command()`.
+fn grouped_help_command() -> clap::Command {
+    // Use `{options}` rather than `{all-args}`: the latter appends clap's
+    // flat command list, and the journey block is the human command list.
+    // Keeping the subcommands visible also keeps `<COMMAND>` in the usage.
+    Cli::command()
+        .help_template(
+            "{about-with-newline}\n{usage-heading} {usage}\n\n{before-help}Options:\n{options}{after-help}",
+        )
+        .before_help(journey_commands())
+}
+
+/// Render the grouped command list. clap's `before_help` adds the blank
+/// lines after the block, so blocks are joined by one blank line here.
+fn journey_commands() -> String {
+    let cmd = Cli::command();
+    let visible: Vec<&clap::Command> = cmd
+        .get_subcommands()
+        .filter(|sc| !sc.is_hide_set())
+        .collect();
+    let grouped: BTreeSet<&str> = JOURNEYS
+        .iter()
+        .flat_map(|(_, names)| names.iter().copied())
+        .collect();
+    let width = visible
+        .iter()
+        .map(|sc| sc.get_name().len())
+        .max()
+        .unwrap_or(0);
+
+    let line = |sc: &clap::Command| {
+        let name = sc.get_name();
+        let about = sc.get_about().map(ToString::to_string).unwrap_or_default();
+        format!("    {name:<width$}  {about}")
+    };
+
+    let mut blocks: Vec<String> = Vec::new();
+    for (heading, names) in JOURNEYS {
+        let mut lines = vec![format!("  {heading}")];
+        for name in *names {
+            if let Some(sc) = visible.iter().find(|sc| sc.get_name() == *name) {
+                lines.push(line(sc));
+            }
+        }
+        blocks.push(lines.join("\n"));
+    }
+
+    // Never drop a visible command from human help if it was added without a
+    // journey: list it under Other. The unit test keeps JOURNEYS current.
+    let ungrouped: Vec<&clap::Command> = visible
+        .iter()
+        .copied()
+        .filter(|sc| !grouped.contains(sc.get_name()))
+        .collect();
+    if !ungrouped.is_empty() {
+        let mut lines = vec![String::from("  Other")];
+        for sc in ungrouped {
+            lines.push(line(sc));
+        }
+        blocks.push(lines.join("\n"));
+    }
+
+    format!("Commands:\n{}", blocks.join("\n\n"))
+}
+
 fn help_json_value() -> serde_json::Value {
     let commands: Vec<serde_json::Value> = Cli::command()
         .get_subcommands()
@@ -7697,7 +9670,7 @@ fn cmd_help(cli: &Cli, vault: Option<&Path>, topic: Option<String>) -> anyhow::R
         print_json(&ok_envelope(vault, help_json_value()))?;
         return Ok(ExitCode::SUCCESS);
     }
-    let mut cmd = Cli::command();
+    let mut cmd = grouped_help_command();
     match topic {
         None => {
             cmd.print_help()?;
@@ -7744,11 +9717,28 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
         Some(name) => {
             if name.is_empty() {
                 return Err(anyhow::Error::new(DomainError::usage(
-                    "empty pack name: use `help pack:<name>`, e.g. `help pack:personal@0.2`",
+                    "empty pack name: use `help pack:<name>`, e.g. `help pack:personal@0.3`",
                 )));
             }
-            if !names.iter().any(|n| n == name) {
-                let known = v.pack_registry().all().iter().any(|p| p.name() == name);
+            // A built-in listing names the active version at any version
+            // (#551, #745): `personal@0.2` in a 0.4 vault serves 0.3.
+            let canonical = name
+                .split_once('@')
+                .filter(|(_, version)| !version.is_empty())
+                .and_then(|(base, _)| {
+                    v.pack_registry()
+                        .implicit()
+                        .iter()
+                        .find(|p| p.name().split_once('@').map(|(n, _)| n) == Some(base))
+                        .map(|p| p.name())
+                })
+                .unwrap_or(name);
+            if !names.iter().any(|n| n == canonical) {
+                let known = v
+                    .pack_registry()
+                    .all()
+                    .iter()
+                    .any(|p| p.name() == canonical);
                 return Err(anyhow::Error::new(
                     DomainError::not_found(if known {
                         format!(
@@ -7760,20 +9750,20 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
                     .with_fix("Enable it in confidant.toml `packs = [...]` or widen --packs"),
                 ));
             }
-            let mut text = embedded::pack_skill_text_from_registry(v.pack_registry(), name)
+            let mut text = embedded::pack_skill_text_from_registry(v.pack_registry(), canonical)
                 .ok_or_else(|| {
                     anyhow::Error::new(DomainError::internal(format!(
-                        "pack `{name}` is enabled but ships no SKILL.md"
+                        "pack `{canonical}` is enabled but ships no SKILL.md"
                     )))
                 })?
                 .to_owned();
             // PD10 (#445): external pack text shown to agents is labelled
             // with where it came from. Compiled packs are shipped with the
             // binary and print exactly as before.
-            if let Some(label) = external_pack_label(v.pack_registry(), root, name) {
+            if let Some(label) = external_pack_label(v.pack_registry(), root, canonical) {
                 text = format!("{label}\n{text}");
             }
-            (vec![name.to_owned()], text)
+            (vec![canonical.to_owned()], text)
         }
         None => {
             debug_assert_eq!(topic, "pack");
@@ -7975,13 +9965,22 @@ pub(crate) struct LoadedSides {
 ///
 /// The file path is derived from the id (never trusting a caller-supplied
 /// path). Both sides must parse as records naming `id` with equal `type`.
-fn load_sides(root: &Path, id: &RecordId) -> anyhow::Result<LoadedSides> {
+fn load_sides(
+    root: &Path,
+    vault: &confidant_core::Vault,
+    id: &RecordId,
+) -> anyhow::Result<LoadedSides> {
     reject_unsupported_prefix(id)?;
-    let rel = main_path_for(id).ok_or_else(|| {
-        anyhow::Error::new(DomainError::usage(format!(
-            "record resolve does not handle ids like {id}"
-        )))
-    })?;
+    let rel = vault
+        .records
+        .get(id)
+        .map(|record| PathBuf::from(&record.path))
+        .or_else(|| main_path_for(id))
+        .ok_or_else(|| {
+            anyhow::Error::new(DomainError::usage(format!(
+                "record resolve does not handle ids like {id}"
+            )))
+        })?;
     let bytes = std::fs::read(root.join(&rel)).map_err(|_| {
         anyhow::Error::new(DomainError::not_found(format!("no record with id {id}")))
             .context("use `confidant find <name>` to look up the id")
@@ -8004,8 +10003,9 @@ fn load_sides(root: &Path, id: &RecordId) -> anyhow::Result<LoadedSides> {
             rel.display()
         )))
     })?;
-    let ours = parse_side("ours", &sides.ours, &rel, id)?;
-    let theirs = parse_side("theirs", &sides.theirs, &rel, id)?;
+    let schema = record_schema(vault, false);
+    let ours = parse_side("ours", &sides.ours, &rel, id, &schema)?;
+    let theirs = parse_side("theirs", &sides.theirs, &rel, id, &schema)?;
     if ours.kind != theirs.kind {
         return Err(anyhow::Error::new(DomainError::invalid(format!(
             "the two sides of {} have different record types",
@@ -8023,14 +10023,22 @@ fn load_sides(root: &Path, id: &RecordId) -> anyhow::Result<LoadedSides> {
 }
 
 /// Parse one reconstructed side as a record naming `id`.
-fn parse_side(side: &str, text: &str, rel: &Path, id: &RecordId) -> anyhow::Result<Record> {
-    let rec = confidant_core::parse_record(text, &rel.display().to_string()).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "the {side} side of {} is not a readable record: {}",
-            rel.display(),
-            e.message
-        )))
-    })?;
+fn parse_side(
+    side: &str,
+    text: &str,
+    rel: &Path,
+    id: &RecordId,
+    schema: &RecordSchema<'_>,
+) -> anyhow::Result<Record> {
+    let rec =
+        confidant_core::record::parse_record_with_schema(text, &rel.display().to_string(), schema)
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "the {side} side of {} is not a readable record: {}",
+                    rel.display(),
+                    e.message
+                )))
+            })?;
     if rec.id != *id {
         return Err(anyhow::Error::new(DomainError::invalid(format!(
             "the {side} side of {} holds a different record ({})",
@@ -8549,9 +10557,31 @@ mod tests {
     use super::{
         confirm_yn, detect_install_method, git_version_check_from, offerable_update,
         parse_ahead_behind, parse_git_remotes, parse_git_version, parse_tui_version,
-        reject_unsupported_prefix, sync_push_refspec, AheadBehind, InstallMethod, MIN_GIT_VERSION,
+        reject_unsupported_prefix, sync_push_refspec, AheadBehind, Cli, InstallMethod, JOURNEYS,
+        MIN_GIT_VERSION,
     };
+    use clap::CommandFactory;
     use std::path::Path;
+
+    /// #721: every visible command sits in exactly one journey, so the
+    /// grouped human help can never silently drop a command (hidden
+    /// `bench-gen` stays out, as it does from clap's own help).
+    #[test]
+    fn journey_groups_cover_every_visible_command() {
+        let command = Cli::command();
+        let mut visible: Vec<&str> = command
+            .get_subcommands()
+            .filter(|sc| !sc.is_hide_set())
+            .map(|sc| sc.get_name())
+            .collect();
+        let mut grouped: Vec<&str> = JOURNEYS
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
+        visible.sort_unstable();
+        grouped.sort_unstable();
+        assert_eq!(grouped, visible);
+    }
 
     /// #659: the TUI `--version` probe accepts a prefixed, `v`-prefixed,
     /// bare, and suffix-bearing version, and refuses garbage.

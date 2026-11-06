@@ -582,18 +582,389 @@ fn which_skills_dir_flag_prints_bare_path() {
     assert!(stdout.trim().contains(env!("CARGO_PKG_VERSION")));
 }
 
-#[test]
-fn routing_prints_snippet() {
-    let env = fresh_env();
+fn demo() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault")
+}
+
+/// Run against a HOME with no `CONFIDANT_SKILLS_DIR` override, so setup
+/// targets real agent dirs and installs instruction files.
+fn run_home(
+    args: &[&str],
+    home: &str,
+    share: &str,
+    extra: &[(&str, &str)],
+) -> (bool, Value, String) {
     let mut cmd = Command::new(bin());
-    cmd.args(["routing", "--no-input"])
-        .env("HOME", &env.home)
-        .env("CONFIDANT_HOME", &env.share);
+    cmd.args(args)
+        .arg("--no-input")
+        .env("HOME", home)
+        .env("CONFIDANT_HOME", share)
+        .env_remove("CONFIDANT_SKILLS_DIR")
+        .env_remove("CONFIDANT_VAULT");
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
     let out = cmd.output().unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("pack-author"), "{stdout:?}");
-    assert!(stdout.contains("qmd-search"), "{stdout:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let value: Value = serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!(
+            "stdout is not JSON for {args:?}: status={} stdout={stdout:?} stderr={:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        )
+    });
+    (out.status.success(), value, stdout)
+}
+
+#[test]
+fn routing_prints_system_of_record_rule() {
+    let env = fresh_env();
+    let demo = demo();
+    let (ok, v, _) = run(
+        &["routing", "--vault", demo.to_str().unwrap(), "--json"],
+        &env,
+        &[],
+    );
+    assert!(ok, "{v}");
+    let snippet = v["snippet"].as_str().expect("snippet missing");
+    assert!(
+        snippet.contains("system of record for relationship memory"),
+        "{snippet}"
+    );
+    let demo = demo.canonicalize().unwrap();
+    assert!(snippet.contains(&demo.display().to_string()), "{snippet}");
+    assert!(snippet.contains("confidant resolve"), "{snippet}");
+    assert!(snippet.contains("confidant context"), "{snippet}");
+    assert!(snippet.contains("confidant find"), "{snippet}");
+    assert!(snippet.contains("no-ai"), "{snippet}");
+    assert!(snippet.contains("--dry-run"), "{snippet}");
+    assert!(snippet.contains("unreachable"), "{snippet}");
+    // The old two-skill routing table claimed agents self-route; that
+    // assumption is exactly what #727 rejects.
+    assert!(!snippet.contains("self-describing"), "{snippet}");
+}
+
+#[test]
+fn setup_installs_system_of_record_rule_in_agent_memory() {
+    let env = fresh_env();
+    let demo = demo();
+    let (ok, v, _) = run_home(
+        &[
+            "setup",
+            "--agent",
+            "claude-code",
+            "--json",
+            "--vault",
+            demo.to_str().unwrap(),
+        ],
+        &env.home,
+        &env.share,
+        &[],
+    );
+    assert!(ok, "{v}");
+    let instructions = &v["instructions"];
+    assert_eq!(instructions["skipped"], false, "{v}");
+    let targets = instructions["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 1, "{v}");
+    let path = PathBuf::from(targets[0]["path"].as_str().unwrap());
+    assert_eq!(
+        path,
+        PathBuf::from(&env.home).join(".claude/CLAUDE.md"),
+        "{v}"
+    );
+    assert_eq!(targets[0]["outcome"], "written", "{v}");
+    let text = instructions["text"].as_str().unwrap();
+    let demo = demo.canonicalize().unwrap();
+    assert!(text.contains(&demo.display().to_string()), "{text}");
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("<!-- confidant:system-of-record:begin -->"));
+    assert!(written.contains("<!-- confidant:system-of-record:end -->"));
+    assert!(written.contains(&text.trim_end().to_owned()), "{written}");
+    assert!(written.contains("no-ai"), "{written}");
+}
+
+#[test]
+fn setup_instructions_are_idempotent_and_preserve_user_text() {
+    let env = fresh_env();
+    let demo = demo();
+    let path = PathBuf::from(&env.home).join(".claude/CLAUDE.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "# My own notes\n\nKeep this line.\n").unwrap();
+
+    for expected in ["written", "unchanged"] {
+        let (ok, v, _) = run_home(
+            &[
+                "setup",
+                "--agent",
+                "claude-code",
+                "--json",
+                "--vault",
+                demo.to_str().unwrap(),
+            ],
+            &env.home,
+            &env.share,
+            &[],
+        );
+        assert!(ok, "{v}");
+        assert_eq!(v["instructions"]["targets"][0]["outcome"], expected, "{v}");
+    }
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("# My own notes"), "{written}");
+    assert!(written.contains("Keep this line."), "{written}");
+    assert_eq!(
+        written
+            .matches("<!-- confidant:system-of-record:begin -->")
+            .count(),
+        1,
+        "the marked block must not duplicate: {written}"
+    );
+}
+
+#[test]
+fn setup_dry_run_writes_no_instruction_file() {
+    let env = fresh_env();
+    let (ok, v, _) = run_home(
+        &[
+            "setup",
+            "--agent",
+            "claude-code",
+            "--dry-run",
+            "--json",
+            "--vault",
+            demo().to_str().unwrap(),
+        ],
+        &env.home,
+        &env.share,
+        &[],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(
+        v["instructions"]["targets"][0]["outcome"], "would_write",
+        "{v}"
+    );
+    assert!(
+        !PathBuf::from(&env.home).join(".claude/CLAUDE.md").exists(),
+        "dry run wrote an instruction file: {v}"
+    );
+}
+
+#[test]
+fn setup_no_instructions_skips_agent_memory() {
+    let env = fresh_env();
+    let (ok, v, _) = run_home(
+        &[
+            "setup",
+            "--agent",
+            "claude-code",
+            "--no-instructions",
+            "--json",
+            "--vault",
+            demo().to_str().unwrap(),
+        ],
+        &env.home,
+        &env.share,
+        &[],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["instructions"]["skipped"], true, "{v}");
+    assert!(v["instructions"]["targets"].as_array().unwrap().is_empty());
+    assert!(
+        !PathBuf::from(&env.home).join(".claude/CLAUDE.md").exists(),
+        "--no-instructions still wrote a file: {v}"
+    );
+}
+
+#[test]
+fn status_reports_readiness_and_completion_brief() {
+    let env = fresh_env();
+    let vault = PathBuf::from(&env.home).join("vault");
+    let (ok, v, _) = run_home(
+        &[
+            "init",
+            "--create",
+            "--json",
+            "--vault",
+            vault.to_str().unwrap(),
+        ],
+        &env.home,
+        &env.share,
+        &[],
+    );
+    assert!(ok, "{v}");
+    let (ok, v, _) = run_home(
+        &[
+            "setup",
+            "--agent",
+            "claude-code",
+            "--json",
+            "--vault",
+            vault.to_str().unwrap(),
+        ],
+        &env.home,
+        &env.share,
+        &[],
+    );
+    assert!(ok, "{v}");
+    let (ok, v, _) = run_home(
+        &["status", "--json", "--vault", vault.to_str().unwrap()],
+        &env.home,
+        &env.share,
+        &[("CONFIDANT_OFFLINE", "1")],
+    );
+    assert!(ok, "{v}");
+    let summary = &v["readiness"]["summary"];
+    assert_eq!(summary["ready"], true, "{v}");
+    let ids: Vec<&str> = v["readiness"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    for expected in [
+        "cli-staleness",
+        "tui-version",
+        "vault-discovery",
+        "vault-access",
+        "git-repo",
+        "git-remote",
+        "local-commits",
+        "skills-links",
+        "system-of-record",
+        "qmd-search",
+    ] {
+        assert!(ids.contains(&expected), "missing {expected}: {v}");
+    }
+    let sections: Vec<&str> = v["brief"]["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["key"].as_str().unwrap())
+        .collect();
+    for expected in [
+        "vault",
+        "machine",
+        "fleet",
+        "perimeter",
+        "sync",
+        "search",
+        "standing-orders",
+        "discipline",
+    ] {
+        assert!(sections.contains(&expected), "missing {expected}: {v}");
+    }
+    let routines = v["brief"]["routines"].as_array().unwrap();
+    assert!(
+        (3..=5).contains(&routines.len()),
+        "expected 3-5 routines, got {}: {v}",
+        routines.len()
+    );
+    let perimeter = serde_json::to_string(&v["brief"]["sections"]).unwrap();
+    assert!(perimeter.contains("no application-level encryption"), "{v}");
+    assert!(perimeter.contains("does not verify"), "{v}");
+    let standing = serde_json::to_string(&v["brief"]["sections"]).unwrap();
+    assert!(standing.contains(".claude/CLAUDE.md"), "{v}");
+}
+
+#[test]
+fn status_flags_standing_orders_pointing_at_another_vault() {
+    let env = fresh_env();
+    let first = PathBuf::from(&env.home).join("first-vault");
+    let second = PathBuf::from(&env.home).join("second-vault");
+    for vault in [&first, &second] {
+        let (ok, v, _) = run_home(
+            &[
+                "init",
+                "--create",
+                "--json",
+                "--vault",
+                vault.to_str().unwrap(),
+            ],
+            &env.home,
+            &env.share,
+            &[],
+        );
+        assert!(ok, "{v}");
+    }
+    let (ok, v, _) = run_home(
+        &[
+            "setup",
+            "--agent",
+            "claude-code",
+            "--json",
+            "--vault",
+            first.to_str().unwrap(),
+        ],
+        &env.home,
+        &env.share,
+        &[],
+    );
+    assert!(ok, "{v}");
+    let (ok, v, _) = run_home(
+        &["status", "--json", "--vault", second.to_str().unwrap()],
+        &env.home,
+        &env.share,
+        &[("CONFIDANT_OFFLINE", "1")],
+    );
+    assert!(!ok, "a stale pointer must not report ready: {v}");
+    let check = v["readiness"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "system-of-record")
+        .expect("system-of-record missing");
+    assert_eq!(check["status"], "warning", "{v}");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("points at another vault"),
+        "{v}"
+    );
+    assert_eq!(v["readiness"]["summary"]["ready"], false, "{v}");
+}
+
+#[test]
+fn status_does_not_call_a_detected_but_unconfigured_agent_ready() {
+    let env = fresh_env();
+    std::fs::create_dir_all(PathBuf::from(&env.home).join(".claude/skills")).unwrap();
+    let (ok, v, _) = run_home(
+        &["status", "--json", "--vault", demo().to_str().unwrap()],
+        &env.home,
+        &env.share,
+        &[("CONFIDANT_OFFLINE", "1")],
+    );
+    assert!(!ok, "an unlinked agent must not report ready: {v}");
+    for id in ["skills-links", "system-of-record"] {
+        let check = v["readiness"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap();
+        assert_eq!(check["status"], "absent", "{id}: {v}");
+        assert_eq!(check["required"], true, "{id}: {v}");
+    }
+    assert_eq!(v["readiness"]["summary"]["ready"], false, "{v}");
+}
+
+#[test]
+fn status_without_a_vault_reports_absent() {
+    let env = fresh_env();
+    let (ok, v, _) = run_home(
+        &["status", "--json"],
+        &env.home,
+        &env.share,
+        &[("CONFIDANT_OFFLINE", "1")],
+    );
+    assert!(!ok, "status without a vault must exit non-zero: {v}");
+    assert_eq!(v["ok"], false, "{v}");
+    let checks = v["readiness"]["checks"].as_array().unwrap();
+    let vault = checks
+        .iter()
+        .find(|c| c["id"] == "vault-discovery")
+        .expect("vault-discovery missing");
+    assert_eq!(vault["status"], "absent", "{v}");
+    assert_eq!(v["readiness"]["summary"]["ready"], false, "{v}");
 }
 
 #[test]

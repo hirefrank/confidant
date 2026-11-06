@@ -8,20 +8,24 @@ your life — the friend you meant to call, a sibling's birthday, the mentor
 you last saw in March — in one private place your AI agents can read and
 update. Each person is a Markdown file with notes, dates, and a log of every
 touch; `confidant check` turns that into who is overdue and which dates are
-coming up.
+coming up. Spec 0.4 keeps people first, adds built-in **places** and
+**things** to the personal schema, and adds corrections and record
+retirement.
 
 Records are plain-text files in a git repo (the **vault**); the Rust CLI
 `confidant` reads, checks, and writes them. There is no server, and a ledger
 of dated facts (`ledger/2026/10.cfd`) keeps the record append-only and
-auditable.
+auditable. Mistakes are corrected by appending a visible compensating line,
+never by rewriting history.
 
 Start with [Install](#install) or the [demo
 quickstart](#first-five-minutes-the-people-in-your-life).
 
 Starting over, or adopting Confidant in stages? See
 [Starting fresh, and adopting in stages](docs/starting-fresh.md) — personal
-relationships first (`personal@0.2` is built in), extra packs later, in the
-same vault.
+relationships first (the active personal pack is built in: `personal@0.3`
+on spec 0.4, `personal@0.2` on older vaults), extra packs later, in the same
+vault.
 
 ## Install
 
@@ -54,9 +58,9 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    `confidant setup --agent auto`. This materializes the skills to a
    versioned share dir and links each skill into the detected agent's
    skills directory. (No vault configured yet? `confidant doctor` exits
-   with `E_VAULT_NOT_FOUND` before reporting skills-link health, so
-   confirm the links with `confidant agents` or
-   `confidant which --skills-dir` instead.) (`confidant doctor` checks GitHub for the latest
+   with `E_VAULT_NOT_FOUND`, but `confidant status` works without a vault
+   and reports skill links honestly; `confidant agents` or
+   `confidant which --skills-dir` also confirm the install.) (`confidant doctor` checks GitHub for the latest
    release unless `CONFIDANT_OFFLINE=1` is exported — add that to my
    shell rc too, this session and permanently, only if I want that
    request disabled.)
@@ -79,13 +83,16 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
      install: `confidant doctor` reports it as a warning, since older git
      is still usable for the commands Confidant runs. Upgrade when you
      can.
-   - Make sure git has an identity, because `init` commits: check first
-     with `git config --global user.name` and
-     `git config --global user.email`, and set only values that are
-     unset — do not overwrite an existing identity. If a value is
-     missing, ask me for it (do not invent it) and set
-     `git config --global user.name "Your Name"` and
-     `git config --global user.email "you@example.com"`.
+   - `init` commits, but it does not need a global git identity: it
+     sets a neutral repo-local identity (`Confidant Operator
+     <operator@confidant.local>`) in `<vault>/.git/config`, so the
+     operator's global identity never lands in the vault's history.
+     Do not set a global identity for this. If I want my own name in
+     the vault's history, ask me for it (do not invent it) and set it
+     per vault, inside the vault, with
+     `git config --local user.name "Your Name"` and
+     `git config --local user.email "you@example.com"` — that override
+     survives re-runs of `init`.
    - Do not probe remote credentials here: at this point you do not
      yet know whether there is a remote at all, let alone its URL (step
      6 asks that). Version and identity above are the whole of step 3;
@@ -161,12 +168,17 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    `confidant doctor --vault "<path>"`; report the error/warning counts,
    the branch `init` created, and any `git-remote` or `local-commits`
    warning.
-8. Read the routing snippet (`confidant routing`) for the propose →
-   confirm → apply workflow every skill follows, and the Privacy rules
-   (trusted devices with full-disk encryption; a private remote;
-   `.confidant/` is never committed; `no-ai` records stay out of agent
-   output — see the README's Privacy section and `docs/privacy.md` in the
-   GitHub repo).
+8. Confirm the system-of-record step: `confidant setup` writes the
+   Confidant rule into each detected agent's always-on instruction file
+   (for example `~/.claude/CLAUDE.md`) and prints the exact text and paths.
+   Re-print it with `confidant routing`. The rule covers read routing
+   (`resolve`/`context`, `find`, QMD), writes through the CLI (dry-run →
+   confirm → apply), the `no-ai` boundary, and failure honesty. Setup ends
+   with a completion brief; `confidant status` reprints the readiness
+   rollup and that brief. Also read the Privacy rules (trusted devices with
+   full-disk encryption; a private remote; `.confidant/` is never
+   committed; `no-ai` records stay out of agent output — see the README's
+   Privacy section and `docs/privacy.md` in the GitHub repo).
 
 Report back: CLI version (`confidant --version`), which skills you linked,
 the vault branch, the `check` result, and any `confidant doctor` warnings.
@@ -220,8 +232,9 @@ Details:
 
 ## First five minutes: the people in your life
 
-The demo vault is fake data: a friend, a sibling, a partner, and a mentor.
-Copy it out so writes commit to a scratch repo:
+The demo vault is fake data: a friend, a sibling, a partner, a mentor, and
+one organization (Example Studio) that Dana Example works at. Copy it out so
+writes commit to a scratch repo:
 
 ```sh
 git clone --depth 1 https://github.com/hirefrank/confidant
@@ -235,8 +248,13 @@ explicitly instead of relying on an exported variable — and never
 `source ~/.bashrc` to set it: an interactive guard skips the export, and a
 stale `CONFIDANT_VAULT` can make `check` inspect the wrong vault.
 
-`confidant record list` prints the visible people; the one marked
-`no-ai: true` is absent. `confidant check` lists what needs attention:
+`confidant record list` prints the cleared roster and defaults to every
+identity kind — people, orgs, deals, plus any pack-declared type with
+`roster = true`. On this 0.2 demo that means people, orgs, and deals, so
+Example Studio appears without knowing to pass `--kind org`. Use `--kind
+person` for the people-only view, or `--kind <type>` for a declared pack
+type. Records marked `no-ai: true` are absent. `confidant check` lists what
+needs attention:
 
 ```text
 warning  W_CADENCE_OVERDUE  people/p-01M3TC5H00MPJG000000000101/profile.md  p-01M3TC5H00MPJG000000000101
@@ -288,15 +306,104 @@ The demo is fake data. For your own vault, `confidant init --create
 plaintext in the repo, so keep it private and on a full-disk-encrypted
 machine ([Privacy](#privacy)).
 
+### Link a person to an org
+
+Edges are records under `edges/e-…/edge.md` with `a`, `b`, `kind`, and
+optional `since` / `until`. Core ships person↔person kinds (`married`,
+`introduced`, `colleague`) and directed person→org kinds (`works_at`,
+`founder_of`, `investor_in`, `advisor_to`). The demo's Dana Example already
+has a `works_at` edge to Example Studio:
+
+```sh
+confidant context o-01M3TC5H00MPJG000000000901
+```
+
+`context` accepts a person or org ID, or the ID of a pack-declared entity
+type. The bundle's `entity` is the target; `person` remains a deprecated
+alias for person targets. `edges` lists the relationships visible from that
+entity, with `direction` (`out` when the target is `a`, `in` when it is `b`,
+`none` for a symmetric kind) and the `other` endpoint. An org bundle also
+includes notes and interactions linked by `org:`; a pack-declared entity
+bundle includes notes and interactions linked by `entity:`.
+
+An edge is agent-visible only when both endpoints are cleared; a
+`no-ai: true` endpoint removes the whole edge, with no count or hint. In
+spec 0.3 an edge can itself carry `no-ai: true` / `false`; a hidden edge is
+omitted from every agent read while both endpoints stay visible, and the
+operator path badges it. Orgs still do not take `no-ai`. Pack kinds can
+declare their own endpoint types with `from` / `to` in the pack manifest.
+
+### Places, things, and pack-declared types
+
+Spec 0.4 is current. In a 0.4 vault the default `personal@0.3` pack declares
+`place` and `thing`; a 0.3 vault can get the same shape from an external v3
+pack. A v3 pack manifest declares a record type with `[[record_types]]`: its
+name, two-letter ID prefix, collection directory, main file,
+entity/person-like flags, `no_ai` policy, roster visibility, and
+required/optional fields. See
+[`spec/pack-manifest.md`](spec/pack-manifest.md) for the full table and the
+two-letter prefix rules.
+
+The repo's checked-in
+[`testdata/vaults/personal-0.4`](testdata/vaults/personal-0.4) is the
+built-in default example, and
+[`testdata/vaults/place-0.3`](testdata/vaults/place-0.3) is the external-pack
+version. In a 0.4 vault, add a place from a file and attach a note:
+
+```sh
+cat > /tmp/place.md <<'PLACE'
+---
+id: pl-01M3TC5H00MPJG000000000201
+type: place
+name: Example Studio
+kind: work
+address: 1 Example Way
+---
+Fake place.
+PLACE
+
+confidant record add --file /tmp/place.md
+confidant record list --kind place
+confidant context pl-01M3TC5H00MPJG000000000201
+
+cat > /tmp/place-note.md <<'NOTE'
+The back room was quiet; we stayed for two hours.
+NOTE
+confidant note add --entity pl-01M3TC5H00MPJG000000000201 --body-file /tmp/place-note.md
+confidant context pl-01M3TC5H00MPJG000000000201   # bundle notes now include it
+```
+
+`--kind <type>` takes the declared type name (for example `place`), not a
+collection name. `--kind all` includes declared types with `roster = true`;
+`--kind person` stays core-person-only. `context` by name
+still resolves core people only; use the opaque ID for a pack type.
+`record add`, `record edit`, and `note add --entity` write the same
+check-gated commit as every other record.
+
+The demo vault stays on **spec 0.2** on purpose: it demonstrates the
+person/org model without requiring a pack. The 0.4 fixture demonstrates the
+built-in places/things model, and the 0.3 fixture demonstrates the
+external-pack model; neither vault is migrated by this release. Run their
+checked-in golden cases with:
+
+```sh
+confidant check --json --no-input --vault testdata/vaults/personal-0.4
+confidant check --json --no-input --vault testdata/vaults/place-0.3
+```
+
 ## How your agents use it
 
 `confidant setup --agent auto` links the embedded skills. Agents use the
 CLI — or `confidant mcp`, a thin stdio wrapper over the same commands — and
-follow one workflow: propose, confirm, apply. Every command takes `--json`
-and `--no-input`; usage errors exit 2; branch on `code`, never message text.
+follow one workflow: propose, confirm, apply. Setup also writes the
+system-of-record declaration into each detected agent's always-on
+instructions, so a session that never loads a skill still knows where
+relationship facts live and that they go through the CLI. Every command
+takes `--json` and `--no-input`; usage errors exit 2; branch on `code`,
+never message text.
 
-`confidant mcp` exposes ten fixed tools (`check`, `doctor`, `find`,
-`context`, `log_session`, `log_touch`, `import_ledger`, `note_add`, `schema`,
+`confidant mcp` exposes nine fixed tools (`check`, `doctor`, `find`,
+`context`, `log_touch`, `import_ledger`, `note_add`, `schema`,
 `pack_skill`); no tool can widen that list. A write runs `check` and commits once. `--packs` scopes
 reads (on `mcp` it is the instance ceiling) as a read-time policy filter,
 not access control ([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178),
@@ -304,20 +411,31 @@ not access control ([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178),
 
 `no-ai` keeps a record out of agent output; `--for-operator` on `find`,
 `context`, and `record list` is the operator-only escape hatch, and MCP
-never passes it. `--person` (on `log session`, `log touch`, `note add`,
-`context`) takes a `p-<ULID>` or an **exact display name**; `find` stays
-fuzzy and `no-ai: true` people are ID-only.
+never passes it. `--person` (on `log touch`, `note add`) takes a
+`p-<ULID>` or an **exact display name**. `context` takes a person
+or org ID, or an exact person display name; org names are not resolved, so
+use `find` for the `o-` ID. `find` stays fuzzy and `no-ai: true` people are
+ID-only.
 
 | Area | Commands |
 |---|---|
-| Write | `record add`, `record edit`, `record resolve`, `note add`, `note edit`, `log session`, `log touch`, `alias add`, `import` |
+| Write | `record add`, `record edit`, `record resolve`, `record retire`, `record unretire`, `note add`, `note edit`, `log touch`, `retract`, `correct`, `import` |
 | Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `record show`, `note show`, `allowlist`, `schema`, `help` |
 | Check | `check` (read-only; stable codes in [`spec/findings.md`](spec/findings.md)) |
 | Packs | `pack init`, `pack add`, `pack list`, `pack verify`, `pack update`, `pack remove` |
-| Setup | `init`, `setup`, `update`, `doctor` |
+| Setup | `init`, `setup`, `update`, `doctor`, `status` |
 | Search | `find`, plus the optional `qmd-search` skill |
 | Sync | `sync` (read-only report; `--pull` / `--push` explicit) |
 | Agents | `mcp`, `agents`, `which`, `routing`, `tui` |
+
+**Corrections.** `confidant retract <id> --line <ref> --reason <token>`
+appends a dated `retract` line that supersedes a prior ledger line; the
+original stays in the ledger and git history. `confidant correct` appends a
+replacement plus the retraction in one commit. Both are operator commands
+(never MCP tools) and require spec 0.4. `confidant record retire <id>` marks
+a record `retired: true`: it stays on disk but leaves agent reads, while
+`record list --for-operator` still shows it. Use `find --json` to copy a
+ledger hit's `ref`.
 
 **Contact values** (emails, phones, handles, former names) are front-matter
 fields on the person, declared by the personal pack. `alias resolve <kind>
@@ -337,8 +455,8 @@ confidant-tui` — then run `confidant tui --vault examples/demo-vault`.
 differ; upgrade both together.
 
 Operator mode (`!`) is off by default; `e` edits through the operator-only
-path, `s` / `t` / `n` capture a session, touch, or note, and `2` opens the
-review queue. Tabs and phase history: [`docs/tui.md`](docs/tui.md).
+path, `t` / `n` capture a touch or note, and `2` opens the review queue.
+Tabs and phase history: [`docs/tui.md`](docs/tui.md).
 
 ## Packs
 
@@ -347,13 +465,22 @@ metrics, and check rules; its manifest
 ([`spec/pack-manifest.md`](spec/pack-manifest.md)) is the machine-readable
 contract.
 
-**`personal@0.2` is built in and always on.** It supplies the relationships
-schema this README describes: birthdays (full dates or year-less `--MM-DD`),
-recurring dates, `relationship`, `cadence` with `snooze_until`, contact
-fields, relationship edges, the `touch` verb, and two warning-level rules
-(`W_CADENCE_OVERDUE`, `W_DATE_UPCOMING`) that never block a write. Contract:
-[`packs/personal/0.2.md`](packs/personal/0.2.md). A vault needs no other pack
-to be useful, and a `personal@…` entry in `packs` is a no-op.
+**The personal pack is built in and always on.** Spec 0.4 selects
+`personal@0.3`; it supplies the relationships schema this README describes —
+birthdays (full dates or year-less `--MM-DD`), recurring dates,
+`relationship`, `cadence` with `snooze_until`, contact fields, relationship
+edges (person↔person; core adds the person→org kinds), the `touch` verb, and
+two warning-level rules (`W_CADENCE_OVERDUE`, `W_DATE_UPCOMING`) that never
+block a write — plus built-in `place` and `thing` types with `kind`,
+`address`, `tags`, `links`, and the `visited` / `lives_at` / `owns` /
+`located_at` edges. Contract:
+[`packs/personal/0.3.md`](packs/personal/0.3.md). Vaults on spec 0.1–0.3
+keep the frozen `personal@0.2`, which is person-only
+([`packs/personal/0.2.md`](packs/personal/0.2.md)). A vault needs no other
+pack to be useful, and a `personal@…` entry in `packs` is a no-op; the vault
+`spec` selects the version. `context` exposes a place/thing's declared fields
+in `entity.fields`; `--exclude-private` strips `address`, `tags`, and
+`links`, and an uncleared place/thing returns no agent bundle at all.
 
 **Extra domains are optional packs in the same vault.** `init --create`
 seeds `packs = []`, and `check` is clean without one.
@@ -437,7 +564,7 @@ query-path bug degrades to missing results; without QMD it falls back to
 ## Privacy
 
 **Records are plaintext on disk.** A vault is Markdown and `.cfd` files in a
-git repo; `record add`, `note add`, and `log session --note` write those
+git repo; `record add`, `note add`, and `log touch --note` write those
 bytes directly. There is no second secrecy layer and no key material, so a
 clone is the whole vault.
 
@@ -451,9 +578,9 @@ That makes the perimeter easy to state, and it is the whole privacy model:
   pushed there stays in history (deleting a file is not erasing it).
 - **`no-ai`.** A record or a person can be marked `no-ai`, which keeps its
   content out of `find`, `context`, the allowlist, MCP, and the search
-  corpus that agents read. Content stays out while `context` still serves
-  derived ledger metadata; the flag itself is visible in the record's front
-  matter.
+  corpus that agents read. A person's `context` bundle still serves derived
+  ledger metadata; a `no-ai` place or thing returns no agent bundle at all.
+  The flag itself is visible in the record's front matter.
 
 `no-ai` is an exposure control, not access control: the operator owns the
 files, and an agent with a shell on the same machine can read them. A stolen
@@ -469,12 +596,13 @@ and accepted, and Confidant makes no claim about what the provider stores.
 link health. The release check is one unauthenticated `GET` to
 `api.github.com/repos/hirefrank/confidant/releases/latest`; no vault data is
 included, and only the `tag_name` is read — the response body is discarded.
-Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
+`confidant status` makes the same release check as part of its readiness
+rollup. Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 `staleness check disabled`.
 
 ## Where to go deeper
 
-- [`spec/0.1.md`](spec/0.1.md) — vault format; [`spec/findings.md`](spec/findings.md) — finding codes; [`spec/pack-manifest.md`](spec/pack-manifest.md) — pack manifests.
+- [`spec/0.4.md`](spec/0.4.md) — current vault format; [`spec/0.3.md`](spec/0.3.md), [`spec/0.2.md`](spec/0.2.md), and [`spec/0.1.md`](spec/0.1.md) — frozen; [`spec/findings.md`](spec/findings.md) — finding codes; [`spec/pack-manifest.md`](spec/pack-manifest.md) — pack manifests.
 - [`docs/architecture.md`](docs/architecture.md) — privacy, threat model, ADRs, milestones.
 - [`docs/privacy.md`](docs/privacy.md) — allowlist, `no-ai`, pack scoping, edges; [`docs/threat-model-agents.md`](docs/threat-model-agents.md) — agent limits and gaps.
 - [`docs/sync.md`](docs/sync.md) — the explicit git boundary and timer; [`docs/tui.md`](docs/tui.md) — TUI detail; [`docs/agent-setup.md`](docs/agent-setup.md) — headless hosts and updates.
@@ -484,7 +612,7 @@ Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 
 The roadmap is the open issues on GitHub. The current themes:
 
-- **Domain model** — record types and edges defined by packs, so a domain beyond people is first-class ([#796](https://github.com/hirefrank/confidant/issues/796)).
+- **Domain model** — spec 0.4 adds the built-in `personal@0.3` places/things schema; richer cross-pack domains remain ([#796](https://github.com/hirefrank/confidant/issues/796)).
 - **Agent ergonomics** — cheaper reads across MCP calls ([#543](https://github.com/hirefrank/confidant/issues/543)).
 - **TUI** — a new-person modal ([#621](https://github.com/hirefrank/confidant/issues/621)).
 - **First-run setup** — pack selection on `init --create` ([#639](https://github.com/hirefrank/confidant/issues/639)), a safer `init` on a non-empty directory ([#640](https://github.com/hirefrank/confidant/issues/640)).

@@ -82,6 +82,19 @@ fn commits(root: &Path) -> usize {
     String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
 }
 
+/// Porcelain status, so a dry-run regression test can prove the tree is
+/// untouched (not just uncommitted).
+fn git_status(root: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git status failed: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 fn run_json(args: &[&str]) -> (bool, Value) {
     // Hermetic HOME: Windows CI runners don't set HOME, and `doctor` needs
     // a config dir. A fresh tempdir per call is fine — no test here
@@ -137,262 +150,52 @@ fn add_person(root: &Path, id: &str, name: &str, extra: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// log session
+// log
 // ---------------------------------------------------------------------------
 
+/// #799 step 2: the top-level `log session` command is gone. `session` is a
+/// pack-declared verb now, logged through `import --file`; `log touch`
+/// remains the core personal write.
 #[test]
-fn log_session_creates_one_commit() {
+fn log_session_is_no_longer_a_subcommand() {
     let dir = make_vault();
-    let root = dir.path();
-    let vroot = vault_arg(root);
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "paid",
-        "--date",
-        "2026-10-13",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-        "--request-id",
-        "01J9Z3K4QF0000000000000001",
-    ]);
-    assert!(ok, "{v}");
-    assert_eq!(v["command"], "log-session");
-    assert!(v["commit"].as_str().unwrap().len() >= 8);
-    assert_eq!(v["files"], serde_json::json!(["ledger/2026/10.cfd"]));
-    assert_eq!(commits(root), 2, "exactly one new commit");
-
-    let ledger = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-    assert!(
-        ledger.contains(&format!("session {PERSON} 60m paid")),
-        "{ledger}"
-    );
-
-    // Commit message carries IDs and verbs only — no free text.
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["log", "-1", "--format=%B"])
-        .output()
-        .unwrap();
-    let msg = String::from_utf8_lossy(&out.stdout);
-    assert!(msg.contains(&format!("session {PERSON} 60m paid")));
-    assert!(msg.contains("Request-Id-Hash:"));
-    assert!(msg.contains("Request-Hash:"));
-}
-
-#[test]
-fn log_session_dry_run_touches_nothing() {
-    let dir = make_vault();
-    let root = dir.path();
-    let vroot = vault_arg(root);
-    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "paid",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-        "--dry-run",
-    ]);
-    assert!(ok, "{v}");
-    assert_eq!(v["dry_run"], true);
-    assert_eq!(v["commit"], Value::Null);
-    assert_eq!(commits(root), 1, "no commit on dry run");
-    let after = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-    assert_eq!(before, after, "no file change on dry run");
-    // The logical change is shown as plaintext record text.
-    let content = v["changes"][0]["content"].as_str().unwrap();
-    assert!(content.contains(&format!("session {PERSON} 60m paid")));
-}
-
-/// #732: a `packs = []` vault owns no `session` verb, so both the
-/// dry run and the apply must refuse up front instead of the dry run
-/// reporting `ok:true` for a write apply's post-check blocks with
-/// `E_UNKNOWN_VERB`. The fixture ledger holds only a core `touch`
-/// line, so the vault is otherwise check-clean, and a `touch` apply
-/// still succeeds afterwards (the gate is verb-specific, not a blanket
-/// write refusal).
-#[test]
-fn log_session_dry_run_fails_when_verb_not_enabled() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    std::fs::write(
-        root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
-    )
-    .unwrap();
-    let person_dir = root.join(format!("people/{PERSON}"));
-    std::fs::create_dir_all(&person_dir).unwrap();
-    std::fs::write(
-        person_dir.join("profile.md"),
-        format!("---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n---\n\nTest bio.\n"),
-    )
-    .unwrap();
-    let ledger_dir = root.join("ledger/2026");
-    std::fs::create_dir_all(&ledger_dir).unwrap();
-    std::fs::write(
-        ledger_dir.join("10.cfd"),
-        format!("2026-10-01 touch {PERSON} call\n"),
-    )
-    .unwrap();
-    git(root, &["init", "-q"]);
-    git(root, &["config", "user.email", "test@example.com"]);
-    git(root, &["config", "user.name", "Test"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "init"]);
-    let vroot = vault_arg(root);
-    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-
-    // Dry run refuses with the same up-front error apply gets.
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "--date",
-        "2026-10-23",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-        "--dry-run",
-    ]);
-    assert!(!ok, "{v}");
-    assert_eq!(v["ok"], false);
-    assert_eq!(v["error"]["code"], "E_INVALID");
-    assert!(
-        v["error"]["message"].as_str().unwrap().contains("session"),
-        "{v}"
-    );
-    assert_eq!(commits(root), 1, "no commit on refused dry run");
-    assert_eq!(
-        std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
-        before,
-        "no file change on refused dry run"
-    );
-
-    // Apply refuses identically (no CheckBlocked report, no commit).
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "--date",
-        "2026-10-23",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ]);
-    assert!(!ok, "{v}");
-    assert_eq!(v["ok"], false);
-    assert_eq!(v["error"]["code"], "E_INVALID");
-    assert_eq!(commits(root), 1, "no commit on refused apply");
-    assert_eq!(
-        std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
-        before,
-        "no file change on refused apply"
-    );
-
-    // The core `touch` verb is unaffected in the same vault.
-    let (ok, v) = run_json(&[
-        "log",
-        "touch",
-        PERSON,
-        "meal",
-        "--date",
-        "2026-10-23",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ]);
-    assert!(ok, "{v}");
-    assert_eq!(commits(root), 2, "touch apply still commits");
-}
-
-/// #732 fix wave: a vendored-but-unlisted pack is NOT a disabled pack
-/// — the loader only registers listed packs, so its verbs are unknown
-/// and the gate refuses them. (A registered-but-disabled pack can only
-/// arise inside the registry itself; that branch is covered by the
-/// `accepted_verbs_orphan_branch` unit test in `check.rs`, since no
-/// vault config can produce one through `load_vault` today — the last
-/// CLI-reachable orphan case went away when the personal pack became
-/// implicit in #551.)
-#[test]
-fn log_session_refuses_unlisted_pack_verb() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    install_example_pack(root);
-    std::fs::write(
-        root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
-    )
-    .unwrap();
-    let person_dir = root.join(format!("people/{PERSON}"));
-    std::fs::create_dir_all(&person_dir).unwrap();
-    std::fs::write(
-        person_dir.join("profile.md"),
-        format!("---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n---\n\nTest bio.\n"),
-    )
-    .unwrap();
-    let ledger_dir = root.join("ledger/2026");
-    std::fs::create_dir_all(&ledger_dir).unwrap();
-    std::fs::write(
-        ledger_dir.join("10.cfd"),
-        format!("2026-10-01 touch {PERSON} call\n"),
-    )
-    .unwrap();
-    git(root, &["init", "-q"]);
-    git(root, &["config", "user.email", "test@example.com"]);
-    git(root, &["config", "user.name", "Test"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "init"]);
-    let vroot = vault_arg(root);
-    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-
-    for extra in [&["--dry-run"][..], &[][..]] {
-        let mut args: Vec<&str> = vec![
+    let vroot = vault_arg(dir.path());
+    let out = Command::new(bin())
+        .args([
             "log",
             "session",
             PERSON,
             "60m",
-            "--date",
-            "2026-10-23",
+            "paid",
             "--json",
             "--no-input",
             "--vault",
             &vroot,
-        ];
-        args.extend_from_slice(extra);
-        let (ok, v) = run_json(&args);
-        assert!(!ok, "{v}");
-        assert_eq!(v["error"]["code"], "E_INVALID");
-        assert_eq!(commits(root), 1, "no commit on refused log");
-        assert_eq!(
-            std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
-            before,
-            "no file change on refused log"
-        );
-    }
+        ])
+        .env("HOME", tempfile::tempdir().unwrap().path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "usage_error");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("unrecognized subcommand") || message.contains("unexpected argument"),
+        "expected a clap usage error, got: {message}"
+    );
+    assert_eq!(commits(dir.path()), 1, "a refused command writes nothing");
 }
 
 /// #732 fix wave: a problem pack's claimed verbs stay known (spec
 /// pack-lock §5), so the gate must pass them. Tampering a vendored file
 /// makes the listed example pack a hash problem while its manifest
 /// still sells `session`; the dry run must therefore not refuse the
-/// verb (apply still blocks, but on the pack hash, not the verb).
+/// verb. #770: both dry-run and apply then block on the shared pre-check
+/// (the pack hash), so the dry run must report the same findings.
+/// #799 step 2: the pack verb is written through `import --file`.
 #[test]
-fn log_session_dry_run_passes_for_problem_pack_verb() {
+fn import_problem_pack_verb_dry_run_matches_apply() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     install_example_pack(root);
@@ -426,31 +229,39 @@ fn log_session_dry_run_passes_for_problem_pack_verb() {
     git(root, &["add", "-A"]);
     git(root, &["commit", "-qm", "init"]);
     let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("session.cfd");
+    std::fs::write(&file, format!("2026-10-23 session {PERSON} 60m paid\n")).unwrap();
 
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "--date",
-        "2026-10-23",
+    let (dry_ok, dry) = run_json(&[
+        "import",
+        "--file",
+        &file.display().to_string(),
         "--json",
         "--no-input",
         "--vault",
         &vroot,
         "--dry-run",
     ]);
-    assert!(ok, "{v}");
-    assert_eq!(v["dry_run"], true);
+    // Not a verb refusal: the gate passes the problem pack's verb, and the
+    // shared pre-check then blocks on the pack problem exactly as apply does.
+    assert!(!dry_ok, "{dry}");
+    assert_eq!(dry["ok"], false, "{dry}");
+    assert!(
+        dry.get("error").is_none(),
+        "blocked by the pre-check, not the verb gate: {dry}"
+    );
+    assert!(
+        !dry["findings"].as_array().unwrap().is_empty(),
+        "the pre-check findings must be reported: {dry}"
+    );
+    assert_eq!(git_status(root), "", "dry run must write nothing");
 
-    // Apply is blocked by the pack problem, but not by the verb gate.
+    // Apply is blocked by the same pack problem, not by the verb gate.
     let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "--date",
-        "2026-10-23",
+        "import",
+        "--file",
+        &file.display().to_string(),
         "--json",
         "--no-input",
         "--vault",
@@ -458,6 +269,10 @@ fn log_session_dry_run_passes_for_problem_pack_verb() {
     ]);
     assert!(!ok, "{v}");
     assert_ne!(v["error"]["code"], "E_INVALID", "{v}");
+    assert_eq!(
+        dry["findings"], v["findings"],
+        "dry run and apply must agree on the pre-check"
+    );
     assert_eq!(commits(root), 1, "no commit on blocked apply");
 }
 
@@ -529,20 +344,19 @@ fn import_refuses_unknown_verb_before_writing() {
 }
 
 #[test]
-fn log_session_with_note_creates_note_record() {
+fn log_touch_with_note_creates_note_record() {
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--date",
         "2026-10-13",
         "--note",
-        "Great session",
+        "Great meal",
         "--json",
         "--no-input",
         "--vault",
@@ -564,7 +378,7 @@ fn log_session_with_note_creates_note_record() {
         .unwrap();
     let note_path = root.join(format!("people/{PERSON}/notes/{note_id}.md"));
     let body = std::fs::read_to_string(&note_path).unwrap();
-    assert!(body.contains("Great session"), "{body}");
+    assert!(body.contains("Great meal"), "{body}");
 }
 
 #[test]
@@ -574,10 +388,11 @@ fn request_id_is_idempotent_then_conflicts() {
     let vroot = vault_arg(root);
     let base = [
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
+        "--date",
+        "2026-10-13",
         "--json",
         "--no-input",
         "--vault",
@@ -596,10 +411,11 @@ fn request_id_is_idempotent_then_conflicts() {
     // Same id, different content -> E_IDEMPOTENCY_CONFLICT.
     let (ok3, v3) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "90m",
-        "paid",
+        "call",
+        "--date",
+        "2026-10-13",
         "--json",
         "--no-input",
         "--vault",
@@ -624,10 +440,9 @@ fn request_id_rejects_low_entropy_ids() {
     // 17 chars: under the unguessability floor.
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--json",
         "--no-input",
         "--vault",
@@ -644,10 +459,9 @@ fn request_id_rejects_low_entropy_ids() {
     // Exactly 22 chars clears the floor.
     let (ok, _) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--dry-run",
         "--json",
         "--no-input",
@@ -664,20 +478,50 @@ fn failing_check_blocks_write_and_rolls_back() {
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);
-    // Break the vault directly: a session line with a bad id.
+    // Break the vault directly: a session line with a bad id. Commit the
+    // breakage so the fixture tree starts clean and a dry run's write-free
+    // guarantee is observable.
     std::fs::write(
         root.join("ledger/2026/10.cfd"),
         "2026-10-01 open x package y 4 sessions\n",
     )
     .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "break vault"]);
     let ledger_before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+
+    // #770: a dry run runs the same read-only pre-check as apply. It must
+    // not report ok for a write apply blocks, and it must not touch the
+    // vault (no file change, no commit, no queue).
+    let (dry_ok, dry) = run_json(&[
+        "log",
+        "touch",
+        PERSON,
+        "meal",
+        "--dry-run",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!dry_ok, "{dry}");
+    assert_eq!(
+        dry["ok"], false,
+        "dry run returns the same check report as apply"
+    );
+    assert_eq!(commits(root), 2, "dry run must not commit");
+    assert_eq!(
+        std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
+        ledger_before,
+        "dry run must not append"
+    );
+    assert_eq!(git_status(root), "", "dry run must leave the tree clean");
 
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--json",
         "--no-input",
         "--vault",
@@ -686,11 +530,65 @@ fn failing_check_blocks_write_and_rolls_back() {
     assert!(!ok);
     assert_eq!(v["ok"], false, "check report, not an error envelope");
     assert!(v["summary"]["errors"].as_u64().unwrap() > 0);
-    assert_eq!(commits(root), 1, "nothing committed");
+    assert_eq!(
+        dry["findings"], v["findings"],
+        "dry run and apply must agree on the pre-check"
+    );
+    assert_eq!(commits(root), 2, "nothing committed");
 
     // The pre-check fails fast, so the file is untouched.
     let ledger_after = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
     assert_eq!(ledger_before, ledger_after);
+
+    // A record write on the same broken vault agrees too (#770): the
+    // pre-check is shared, not per-command.
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("person.md");
+    let new_person = "p-01J9Z3K4QF0000000000000003";
+    std::fs::write(
+        &file,
+        format!("---\nid: {new_person}\ntype: person\nname: \"Ada Example\"\n---\n\nFake bio.\n"),
+    )
+    .unwrap();
+    let file_arg = file.display().to_string();
+    let record_path = root.join(format!("people/{new_person}/profile.md"));
+    let mut args = vec![
+        "record",
+        "add",
+        "--file",
+        file_arg.as_str(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ];
+    args.push("--dry-run");
+    let (dry_ok, dry_record) = run_json(&args);
+    assert!(!dry_ok, "{dry_record}");
+    assert_eq!(
+        dry_record["findings"], v["findings"],
+        "record dry run uses the same pre-check"
+    );
+    assert!(!record_path.exists(), "record dry run wrote a file");
+    assert_eq!(
+        git_status(root),
+        "",
+        "record dry run must leave the tree clean"
+    );
+
+    args.pop();
+    let (ok, applied) = run_json(&args);
+    assert!(!ok, "{applied}");
+    assert_eq!(
+        applied["findings"], dry_record["findings"],
+        "record dry run and apply must agree on the pre-check"
+    );
+    assert!(!record_path.exists(), "blocked record apply wrote a file");
+    assert_eq!(
+        commits(root),
+        2,
+        "record apply was blocked by the pre-check"
+    );
 }
 
 #[test]
@@ -701,10 +599,9 @@ fn write_to_non_git_vault_fails() {
     let vroot = vault_arg(dir.path());
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--json",
         "--no-input",
         "--vault",
@@ -729,10 +626,9 @@ fn conflict_markers_block_write() {
     git(root, &["commit", "-qm", "conflicted"]);
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--json",
         "--no-input",
         "--vault",
@@ -1289,6 +1185,485 @@ fn note_edit_refuses_a_person_that_does_not_match_the_path() {
 // record add
 // ---------------------------------------------------------------------------
 
+const PLACE_PERSON: &str = "p-01M3TC5H00MPJG000000000000";
+const PLACE_ORG: &str = "o-01M3TC5H00MPJG000000000001";
+const PLACE: &str = "pl-01M3TC5H00MPJG000000000002";
+const PLACE_NOTE: &str = "n-01M3TC5H00MPJG000000000003";
+
+/// Vendor the checked-in place pack and pin it, as `pack add` would. The
+/// place pack declares one entity type (`place`) for spec 0.3.
+fn install_place_pack(vault: &Path) {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/packs/place-pack");
+    let dst = vault.join("packs/place-pack@0.1");
+    std::fs::create_dir_all(&dst).unwrap();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+    }
+    let hash = confidant_core::packs::dir::read_pack_dir(&dst)
+        .unwrap()
+        .hash;
+    std::fs::write(
+        vault.join("confidant.lock"),
+        format!(
+            "lock_version = 1\n\n[[pack]]\nname = \"place-pack\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn make_place_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    install_place_pack(root);
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.3\"\npacks = [\"place-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    add_person(root, PLACE_PERSON, "Dana Example", "");
+    dir
+}
+
+/// Vendor the place pack with one extra pack-declared verb, `session`, and
+/// pin the modified copy. #799 step 2 removed the core `log session`
+/// command; this fixture proves a coaching/CRM-style pack can still log its
+/// own verb through the shared `import --file` path.
+fn install_place_pack_with_session_verb(vault: &Path) {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/packs/place-pack");
+    let dst = vault.join("packs/place-pack@0.1");
+    std::fs::create_dir_all(&dst).unwrap();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+    }
+    let manifest = dst.join("manifest.toml");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str("\n[[verbs]]\nname = \"session\"\nid_type = \"person\"\n");
+    std::fs::write(&manifest, text).unwrap();
+    let hash = confidant_core::packs::dir::read_pack_dir(&dst)
+        .unwrap()
+        .hash;
+    std::fs::write(
+        vault.join("confidant.lock"),
+        format!(
+            "lock_version = 1\n\n[[pack]]\nname = \"place-pack\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn make_session_verb_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    install_place_pack_with_session_verb(root);
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.3\"\npacks = [\"place-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    add_person(root, PLACE_PERSON, "Dana Example", "");
+    dir
+}
+
+#[test]
+fn place_pack_end_to_end_record_add_list_context_note_allowlist_check() {
+    let dir = make_place_vault();
+    let scratch = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let place_file = scratch.path().join("place.md");
+    std::fs::write(
+        &place_file,
+        format!(
+            "---\nid: {PLACE}\ntype: place\nname: Example Studio\naddress: 1 Example Way\n---\n\nFake place.\n"
+        ),
+    )
+    .unwrap();
+
+    let (ok, v) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &place_file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["command"], "record-add");
+    assert_eq!(v["path"], format!("places/{PLACE}/place.md"));
+    assert!(root.join(format!("places/{PLACE}/place.md")).is_file());
+
+    let list = run_json(&[
+        "record",
+        "list",
+        "--kind",
+        "place",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(list.0, "{list:?}");
+    assert_eq!(list.1["kind"], "place");
+    assert_eq!(list.1["kinds"], serde_json::json!(["place"]));
+    assert_eq!(list.1["records"][0]["kind"], "place");
+    assert_eq!(list.1["records"][0]["name"], "Example Studio");
+    assert!(list.1["records"][0].get("orphan").is_none());
+
+    let all = run_json(&["record", "list", "--json", "--no-input", "--vault", &vroot]);
+    assert!(all.0, "{all:?}");
+    assert!(
+        all.1["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind == "place"),
+        "{}",
+        all.1
+    );
+    assert!(all.1["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["id"] == PLACE));
+
+    // People stays core-person-only, as the TUI's People list expects.
+    let people = run_json(&[
+        "record",
+        "list",
+        "--kind",
+        "person",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(people.0, "{people:?}");
+    assert_eq!(people.1["kinds"], serde_json::json!(["person"]));
+    assert!(
+        !people.1["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["id"] == PLACE),
+        "{}",
+        people.1
+    );
+
+    // The edit path also parses with the vault's spec and declared types.
+    std::fs::write(
+        &place_file,
+        format!(
+            "---\nid: {PLACE}\ntype: place\nname: Example Studio Annex\naddress: 1 Example Way\n---\n\nFake place, edited.\n"
+        ),
+    )
+    .unwrap();
+    let (ok, edited) = run_json(&[
+        "record",
+        "edit",
+        PLACE,
+        "--file",
+        &place_file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{edited}");
+    assert_eq!(edited["command"], "record-edit");
+    assert_eq!(edited["path"], format!("places/{PLACE}/place.md"));
+
+    let context = run_json(&["context", PLACE, "--json", "--no-input", "--vault", &vroot]);
+    assert!(context.0, "{context:?}");
+    assert_eq!(context.1["entity"]["kind"], "place");
+    assert_eq!(context.1["entity"]["name"], "Example Studio Annex");
+
+    let body = scratch.path().join("body.md");
+    std::fs::write(&body, "Liked the back room.\n").unwrap();
+    let (ok, note) = run_json(&[
+        "note",
+        "add",
+        "--entity",
+        PLACE,
+        "--id",
+        PLACE_NOTE,
+        "--date",
+        "2026-10-13",
+        "--body-file",
+        &body.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{note}");
+    assert_eq!(note["command"], "note-add");
+    assert_eq!(note["path"], format!("notes/{PLACE_NOTE}/note.md"));
+    let note_text =
+        std::fs::read_to_string(root.join(format!("notes/{PLACE_NOTE}/note.md"))).unwrap();
+    assert!(
+        note_text.contains(&format!("entity: {PLACE}")),
+        "{note_text}"
+    );
+
+    let context = run_json(&["context", PLACE, "--json", "--no-input", "--vault", &vroot]);
+    assert!(context.0, "{context:?}");
+    assert_eq!(context.1["notes"][0]["id"], PLACE_NOTE);
+
+    let allow = run_json(&["allowlist", "--json", "--no-input", "--vault", &vroot]);
+    assert!(allow.0, "{allow:?}");
+    let files: Vec<&str> = allow.1["cleared_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file.as_str().unwrap())
+        .collect();
+    assert!(
+        files
+            .iter()
+            .any(|file| file.contains(&format!("places/{PLACE}/place.md"))),
+        "{files:?}"
+    );
+    assert!(
+        files
+            .iter()
+            .any(|file| file.contains(&format!("notes/{PLACE_NOTE}/note.md"))),
+        "{files:?}"
+    );
+
+    // Out of scope, the pack-owned place and its note disappear from every
+    // agent read even though the core person remains.
+    let scoped_allow = run_json(&[
+        "allowlist",
+        "--packs",
+        "personal@0.2",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(scoped_allow.0, "{scoped_allow:?}");
+    assert!(
+        !scoped_allow.1["cleared_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| {
+                let file = file.as_str().unwrap();
+                file.contains(&format!("places/{PLACE}/place.md"))
+                    || file.contains(&format!("notes/{PLACE_NOTE}/note.md"))
+            }),
+        "out-of-scope pack files leaked into allowlist: {}",
+        scoped_allow.1
+    );
+    let scoped_list = run_json(&[
+        "record",
+        "list",
+        "--kind",
+        "place",
+        "--packs",
+        "personal@0.2",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(scoped_list.0, "{scoped_list:?}");
+    assert!(scoped_list.1["records"].as_array().unwrap().is_empty());
+    let scoped_find = run_json(&[
+        "find",
+        "Example Studio",
+        "--packs",
+        "personal@0.2",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(scoped_find.0, "{scoped_find:?}");
+    assert!(scoped_find.1["matches"].as_array().unwrap().is_empty());
+
+    let schema = run_json(&["schema", "--json", "--no-input", "--vault", &vroot]);
+    assert!(schema.0, "{schema:?}");
+    assert!(
+        schema.1["contract"]["record_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|decl| decl["name"] == "place" && decl["owner"] == "place-pack@0.1"),
+        "{}",
+        schema.1
+    );
+    let scoped_schema = run_json(&[
+        "schema",
+        "--packs",
+        "personal@0.2",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(scoped_schema.0, "{scoped_schema:?}");
+    assert!(
+        !scoped_schema.1["contract"]["record_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|decl| decl["name"] == "place"),
+        "out-of-scope pack type leaked into schema: {}",
+        scoped_schema.1
+    );
+
+    let (ok, check) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{check}");
+    assert_eq!(check["ok"], true, "{check}");
+}
+
+/// #799 step 2: `session` is a pack-declared verb, not a core command, but a
+/// 0.3 pack can still append it through the shared `import --file` path.
+/// The fixture is the checked-in place pack plus one `session` verb, so this
+/// pins the capability without restoring a core session write command.
+#[test]
+fn pack_declared_session_verb_is_appended_through_import() {
+    let dir = make_session_verb_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("session.cfd");
+    std::fs::write(
+        &file,
+        format!("2026-10-13 session {PLACE_PERSON} 60m paid\n"),
+    )
+    .unwrap();
+
+    let (ok, v) = run_json(&[
+        "import",
+        "--file",
+        &file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["command"], "import");
+    assert_eq!(v["files"], serde_json::json!(["ledger/2026/10.cfd"]));
+    let ledger = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+    assert!(
+        ledger.contains(&format!("session {PLACE_PERSON} 60m paid")),
+        "{ledger}"
+    );
+
+    let (ok, check) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{check}");
+    assert_eq!(check["ok"], true, "{check}");
+}
+
+/// The 0.3 write path gets the spec-aware parser: an edge can be authored
+/// with `no-ai: true`, it is hidden from agent reads, and the operator sees
+/// it with the tri-state badge.
+#[test]
+fn cli_authors_a_0_3_edge_no_ai_that_agent_reads_hide() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.3\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    add_person(root, PLACE_PERSON, "Dana Example", "");
+    std::fs::create_dir_all(root.join("orgs").join(PLACE_ORG)).unwrap();
+    std::fs::write(
+        root.join("orgs").join(PLACE_ORG).join("org.md"),
+        format!("---\nid: {PLACE_ORG}\ntype: org\nname: Example Studio\n---\n"),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let edge = "e-01M3TC5H00MPJG000000000004";
+    let edge_file = scratch.path().join("edge.md");
+    std::fs::write(
+        &edge_file,
+        format!(
+            "---\nid: {edge}\ntype: edge\na: {PLACE_PERSON}\nb: {PLACE_ORG}\nkind: works_at\nsince: 2024-01-01\nno-ai: true\n---\n"
+        ),
+    )
+    .unwrap();
+
+    let (ok, added) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &edge_file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{added}");
+    assert_eq!(added["path"], format!("edges/{edge}/edge.md"));
+
+    let allow = run_json(&["allowlist", "--json", "--no-input", "--vault", &vroot]);
+    assert!(allow.0, "{allow:?}");
+    assert!(
+        !allow.1["cleared_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file.as_str().unwrap().contains(edge)),
+        "hidden edge leaked into the agent allowlist: {}",
+        allow.1
+    );
+
+    let agent = run_json(&[
+        "context",
+        PLACE_PERSON,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(agent.0, "{agent:?}");
+    assert!(
+        agent.1["edges"].as_array().unwrap().is_empty(),
+        "{}",
+        agent.1
+    );
+
+    let operator = run_json(&[
+        "context",
+        PLACE_PERSON,
+        "--for-operator",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(operator.0, "{operator:?}");
+    assert_eq!(operator.1["for_operator"], true);
+    assert_eq!(operator.1["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(operator.1["edges"][0]["id"], edge);
+    assert_eq!(operator.1["edges"][0]["no_ai"], "true");
+
+    let (ok, check) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{check}");
+    assert_eq!(check["ok"], true, "{check}");
+}
+
 #[test]
 fn record_add_creates_person_profile() {
     let dir = make_vault();
@@ -1347,10 +1722,32 @@ fn record_add_deal_and_dry_run() {
     assert!(ok, "{v}");
     assert_eq!(v["command"], "record-add");
     assert_eq!(v["dry_run"], true);
+    // #770: the dry run ran apply's read-only pre-check and says plainly
+    // that it could not run the post-write check.
+    assert_eq!(v["checks"]["pre"], "passed", "{v}");
+    assert_eq!(v["checks"]["post"], "skipped", "{v}");
     assert!(!root
         .join("deals/d-01J9Z3K4QF0000000000000002/deal.md")
         .exists());
     assert_eq!(commits(root), 1);
+    assert_eq!(git_status(root), "", "dry run must write nothing");
+
+    // The human output states the skipped post-check too, not just JSON.
+    let (ok, text, _) = run_raw(&[
+        "record",
+        "add",
+        "--file",
+        &file.display().to_string(),
+        "--dry-run",
+        "--request-id",
+        rid,
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{text}");
+    assert!(text.contains("pre-check passed"), "{text}");
+    assert!(text.contains("post-check skipped"), "{text}");
 }
 
 /// #604: a `record add` whose post-check refuses must not leave the record
@@ -2098,8 +2495,8 @@ fn resolve_no_ai_true_is_not_name_resolvable_and_leaks_nothing() {
 fn resolve_cleared_name_merged_into_no_ai_person_leaks_nothing() {
     // A cleared person ("Ada Old") merged into a `no-ai: true` person: the
     // cleared name canonicalizes to the hidden id. It must not resolve, or
-    // `log session` / `log touch` / `note add` would print and serialize
-    // the hidden person's name. The by-name query gets the same generic
+    // `log touch` / `note add` would print and serialize the hidden
+    // person's name. The by-name query gets the same generic
     // not-found as a miss, in human and `--json` output, and writes nothing.
     let dir = make_vault();
     let root = dir.path();
@@ -2147,10 +2544,9 @@ fn resolve_cleared_name_merged_into_no_ai_person_leaks_nothing() {
     // The by-name write fails the same way and writes nothing.
     let (ok_w, v_w) = run_json(&[
         "log",
-        "session",
+        "touch",
         "Ada Old",
-        "60m",
-        "paid",
+        "meal",
         "--json",
         "--no-input",
         "--vault",
@@ -2164,10 +2560,9 @@ fn resolve_cleared_name_merged_into_no_ai_person_leaks_nothing() {
     // Human output carries no resolved-person line and no hidden name.
     let (ok_h, stdout, stderr) = run_raw(&[
         "log",
-        "session",
+        "touch",
         "Ada Old",
-        "60m",
-        "paid",
+        "meal",
         "--no-input",
         "--vault",
         &vroot,
@@ -2232,16 +2627,15 @@ fn resolve_merged_away_name_resolves_to_canonical() {
 }
 
 #[test]
-fn log_session_by_name_echoes_resolved_person() {
+fn log_touch_by_name_echoes_resolved_person() {
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         "Test Person",
-        "60m",
-        "paid",
+        "meal",
         "--date",
         "2026-10-13",
         "--json",
@@ -2255,22 +2649,18 @@ fn log_session_by_name_echoes_resolved_person() {
     assert_eq!(v["person"]["name"], "Test Person");
     // The ledger line carries the id, never the display name.
     let ledger = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-    assert!(
-        ledger.contains(&format!("session {PERSON} 60m paid")),
-        "{ledger}"
-    );
+    assert!(ledger.contains(&format!("touch {PERSON} meal")), "{ledger}");
 
     // Human output echoes the pick too. It says "resolving to" because the
     // line prints before the remaining validation (#537 review).
-    // #747: the second call re-logs the same session, so it passes
-    // --force; the refusal for the identical session is covered by the
-    // #747 tests, and this test is about the echo.
+    // #747: the second call re-logs the same touch, so it passes --force;
+    // the refusal for the identical touch is covered by the #747 tests,
+    // and this test is about the echo.
     let (ok, stdout, stderr) = run_raw(&[
         "log",
-        "session",
+        "touch",
         "Test Person",
-        "60m",
-        "paid",
+        "meal",
         "--date",
         "2026-10-13",
         "--force",
@@ -2286,7 +2676,7 @@ fn log_session_by_name_echoes_resolved_person() {
 }
 
 #[test]
-fn log_session_by_id_does_not_echo_a_person_object() {
+fn log_touch_by_id_does_not_echo_a_person_object() {
     // Id writes keep their previous output shape (no `person` echo).
     let dir = make_vault();
     let root = dir.path();
@@ -2294,10 +2684,9 @@ fn log_session_by_id_does_not_echo_a_person_object() {
     let vroot = vault_arg(root);
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
         "--date",
         "2026-10-13",
         "--json",
@@ -2309,7 +2698,7 @@ fn log_session_by_id_does_not_echo_a_person_object() {
     assert!(v.get("person").is_none(), "{v}");
     let after = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
     assert!(after.starts_with(&before));
-    assert!(after.contains(&format!("session {PERSON} 60m paid")));
+    assert!(after.contains(&format!("touch {PERSON} meal")));
 }
 
 #[test]
@@ -2506,18 +2895,22 @@ fn help_json_lists_every_subcommand() {
     ] {
         assert!(names.contains(&expected), "missing subcommand {expected}");
     }
-    // Nested subcommands are visible too (ADR-7 `log session` form).
+    // Nested subcommands are visible too (ADR-7 `log touch` form), and the
+    // removed `log session` command is gone.
     let log = v["commands"]
         .as_array()
         .unwrap()
         .iter()
         .find(|c| c["name"] == "log")
         .unwrap();
-    assert!(log["subcommands"]
+    let log_subs: Vec<&str> = log["subcommands"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|s| s == "session"));
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert!(log_subs.contains(&"touch"), "{log_subs:?}");
+    assert!(!log_subs.contains(&"session"), "{log_subs:?}");
     let alias = v["commands"]
         .as_array()
         .unwrap()
@@ -2583,7 +2976,8 @@ fn mcp_initialize_and_list() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"log_session"));
+    assert!(names.contains(&"log_touch"));
+    assert!(!names.contains(&"log_session"));
     assert!(names.contains(&"context"));
 }
 
@@ -2645,6 +3039,61 @@ fn mcp_context_honors_no_ai_by_default() {
     );
     let body: Value = serde_json::from_str(text).unwrap();
     assert_eq!(body["ok"], true);
+}
+
+#[test]
+fn mcp_note_add_entity_and_context_target_a_pack_type() {
+    let dir = make_place_vault();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(format!("places/{PLACE}"))).unwrap();
+    std::fs::write(
+        root.join(format!("places/{PLACE}/place.md")),
+        format!(
+            "---\nid: {PLACE}\ntype: place\nname: Example Studio\naddress: 1 Example Way\n---\n"
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "place fixture"]);
+    let scratch = tempfile::tempdir().unwrap();
+    let body = scratch.path().join("body.md");
+    std::fs::write(&body, "Liked the back room.\n").unwrap();
+    let msg = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"note_add","arguments":{{"entity":"{PLACE}","body_file":{}}}}}}}"#,
+        serde_json::to_string(&body.display().to_string()).unwrap()
+    );
+    let resps = mcp_exchange(root, &[msg.as_str()]);
+    let text = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let note: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(note["ok"], true, "{note}");
+    assert_eq!(note["command"], "note-add");
+    let note_path = root.join(note["path"].as_str().unwrap());
+    let contents = std::fs::read_to_string(&note_path).unwrap();
+    assert!(contents.contains(&format!("entity: {PLACE}")), "{contents}");
+
+    let context_msg = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"context","arguments":{{"person":"{PLACE}"}}}}}}"#
+    );
+    let resps = mcp_exchange(root, &[context_msg.as_str()]);
+    let text = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let context: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(context["ok"], true, "{context}");
+    assert_eq!(context["entity"]["kind"], "place");
+    assert_eq!(context["notes"][0]["id"], note["id"]);
+
+    let schema_msg = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"schema","arguments":{}}}"#;
+    let resps = mcp_exchange(root, &[schema_msg]);
+    let text = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let schema: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(schema["ok"], true, "{schema}");
+    assert!(
+        schema["contract"]["record_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|decl| decl["name"] == "place"),
+        "{schema}"
+    );
 }
 
 #[test]
@@ -2719,10 +3168,11 @@ fn warnings_never_block_writes() {
     // The write succeeds despite the warnings: exactly one new commit.
     let (ok, v) = run_json(&[
         "log",
-        "session",
+        "touch",
         PERSON,
-        "60m",
-        "paid",
+        "meal",
+        "--date",
+        "2026-10-13",
         "--json",
         "--no-input",
         "--vault",
@@ -2734,7 +3184,7 @@ fn warnings_never_block_writes() {
     assert_eq!(
         commits(root),
         3,
-        "init + untagged session + the new session"
+        "init + untagged session line + the new touch"
     );
 }
 
@@ -3252,7 +3702,7 @@ fn log_touch_rejects_coffee_and_lists_v1_kinds() {
 }
 
 // ---------------------------------------------------------------------------
-// #747: semantic idempotency for `log touch` / `log session`
+// #747: semantic idempotency for `log touch`
 // ---------------------------------------------------------------------------
 
 fn log_touch_args<'a>(kind: &'a str, vroot: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
@@ -3344,98 +3794,6 @@ fn log_touch_refusal_writes_no_note_record() {
     assert_eq!(after, before, "a refused touch must not stage a note");
 }
 
-#[test]
-fn log_session_refuses_identical_session_and_force_logs_it() {
-    let dir = make_vault();
-    let root = dir.path();
-    let vroot = vault_arg(root);
-    enable_personal(root);
-
-    let base = [
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "paid",
-        "--date",
-        "2026-10-05",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ];
-    let (ok, v) = run_json(&base);
-    assert!(ok, "{v}");
-    let before = commits(root);
-
-    // `1h` is the same 60 minutes: refused, not a distinct session.
-    let hour = [
-        "log",
-        "session",
-        PERSON,
-        "1h",
-        "paid",
-        "--date",
-        "2026-10-05",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ];
-    let (ok, v) = run_json(&hour);
-    assert!(!ok, "{v}");
-    assert_eq!(v["error"]["code"], "E_ALREADY_EXISTS");
-    assert_eq!(commits(root), before, "a refused session writes nothing");
-
-    // A different tag the same day is a different session.
-    let other_tag = [
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "pps",
-        "--date",
-        "2026-10-05",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ];
-    let (ok, v) = run_json(&other_tag);
-    assert!(ok, "{v}");
-
-    // --force logs the genuine repeat.
-    let forced = [
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "paid",
-        "--date",
-        "2026-10-05",
-        "--force",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ];
-    let (ok, v) = run_json(&forced);
-    assert!(ok, "{v}");
-
-    // #747 review: `check` flags the forced session repeat as a
-    // warning on the later line, mirroring `W_DUPLICATE_TOUCH`.
-    let (ok, report) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
-    assert!(ok, "{report}");
-    let dups: Vec<&Value> = report["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|f| f["code"] == "W_DUPLICATE_SESSION")
-        .collect();
-    assert_eq!(dups.len(), 1, "{report}");
-    assert_eq!(dups[0]["severity"], "warning");
-}
-
 /// #747 review: when the two identities disagree — same `--request-id`,
 /// same person/date/kind, different `--note` — the input is both a
 /// semantic duplicate (refusal would say `E_ALREADY_EXISTS`) and a
@@ -3463,93 +3821,6 @@ fn log_touch_request_id_conflict_beats_semantic_refusal() {
     assert!(!ok, "{v}");
     assert_eq!(v["error"]["code"], "E_IDEMPOTENCY_CONFLICT");
     assert_eq!(commits(root), before, "a conflict writes nothing");
-}
-
-/// #747 review: the billing tag is a closed vocabulary, so `log session`
-/// rejects anything outside paid/pps/comp — including a correctly
-/// spelled tag in the wrong case.
-#[test]
-fn log_session_rejects_unknown_and_cased_tags() {
-    let dir = make_vault();
-    let root = dir.path();
-    let vroot = vault_arg(root);
-    enable_personal(root);
-    let before = commits(root);
-
-    for tag in ["full", "Paid", "PAID"] {
-        let (ok, v) = run_json(&[
-            "log",
-            "session",
-            PERSON,
-            "60m",
-            tag,
-            "--date",
-            "2026-10-05",
-            "--json",
-            "--no-input",
-            "--vault",
-            &vroot,
-        ]);
-        assert!(!ok, "tag {tag} must be rejected: {v}");
-        assert_eq!(v["error"]["code"], "usage_error");
-        let message = v["error"]["message"].as_str().unwrap();
-        assert!(
-            message.contains("paid, pps, comp"),
-            "the error must list the vocabulary: {message}"
-        );
-    }
-    assert_eq!(commits(root), before, "rejected tags write nothing");
-}
-
-/// #747 review: the session refusal names the normalized duration, not
-/// the raw typed one — re-logging `1h` against a stored `60m` line
-/// reports a `60m` session, so the message points at the line matched.
-#[test]
-fn log_session_refusal_names_normalized_minutes() {
-    let dir = make_vault();
-    let root = dir.path();
-    let vroot = vault_arg(root);
-    enable_personal(root);
-
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "60m",
-        "paid",
-        "--date",
-        "2026-10-05",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ]);
-    assert!(ok, "{v}");
-
-    let (ok, v) = run_json(&[
-        "log",
-        "session",
-        PERSON,
-        "1h",
-        "paid",
-        "--date",
-        "2026-10-05",
-        "--json",
-        "--no-input",
-        "--vault",
-        &vroot,
-    ]);
-    assert!(!ok, "{v}");
-    assert_eq!(v["error"]["code"], "E_ALREADY_EXISTS");
-    let message = v["error"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("a 60m paid session"),
-        "refusal must name normalized minutes: {message}"
-    );
-    assert!(
-        !message.contains("a 1h "),
-        "refusal must not echo the raw typed duration: {message}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3757,4 +4028,491 @@ fn record_self_edge_edit_is_blocked_by_check_and_commits_nothing() {
         on_disk.contains(BEA),
         "the file was not rolled back: {on_disk}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #746 corrections and retirement (spec 0.4)
+// ---------------------------------------------------------------------------
+
+const CP_PERSON: &str = "p-01J9Z3K4QF0000000000000010";
+const CP_NOTE: &str = "n-01J9Z3K4QF0000000000000011";
+const CP_DATE: &str = "2026-11-02";
+const CP_REQUEST: &str = "01J9Z3K4QF7F3A000000000099";
+
+fn make_corrections_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.4\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-11-02\"\n",
+    )
+    .unwrap();
+    let person_dir = root.join(format!("people/{CP_PERSON}"));
+    std::fs::create_dir_all(person_dir.join("notes")).unwrap();
+    std::fs::write(
+        person_dir.join("profile.md"),
+        format!(
+            "---\nid: {CP_PERSON}\ntype: person\nname: \"Correction Person\"\n---\n\nFake bio.\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        person_dir.join(format!("notes/{CP_NOTE}.md")),
+        format!("---\nid: {CP_NOTE}\ntype: note\nperson: {CP_PERSON}\ndate: 2026-10-01\n---\n\nFake note body.\n"),
+    )
+    .unwrap();
+    let ledger = root.join("ledger/2026");
+    std::fs::create_dir_all(&ledger).unwrap();
+    std::fs::write(
+        ledger.join("10.cfd"),
+        format!("2026-10-01 touch {CP_PERSON} call\n2026-10-01 touch {CP_PERSON} call\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    dir
+}
+
+fn find_refs(root: &Path, query: &str) -> Vec<String> {
+    let v = run_json(&["find", query, "--json", "--vault", &vault_arg(root)]).1;
+    v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|hit| hit["ref"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn retract_dry_run_apply_request_id_and_find_output() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let before = commits(root);
+    let refs = find_refs(root, "call");
+    assert_eq!(refs.len(), 2, "{refs:?}");
+    let target = refs[1].clone();
+    let (ok, text, _) = run_raw(&["find", "call", "--no-input", "--vault", &vault_arg(root)]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("line:"),
+        "ledger hit lost its ref in text: {text}"
+    );
+
+    let (ok, dry) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--dry-run",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{dry}");
+    assert_eq!(dry["dry_run"], true, "{dry}");
+    // #770: `retract` is a repairing write, so apply skips the pre-check;
+    // the dry run skips it too. The post-write check still cannot run.
+    assert_eq!(dry["checks"]["pre"], "skipped", "{dry}");
+    assert_eq!(dry["checks"]["post"], "skipped", "{dry}");
+    assert_eq!(commits(root), before, "dry run must not commit");
+    assert!(!root.join("ledger/2026/11.cfd").exists());
+
+    let (ok, applied) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--request-id",
+        CP_REQUEST,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{applied}");
+    assert!(applied["commit"].as_str().is_some(), "{applied}");
+    assert_eq!(commits(root), before + 1);
+    let ledger = std::fs::read_to_string(root.join("ledger/2026/11.cfd")).unwrap();
+    assert!(ledger.contains("retract"), "{ledger}");
+    assert!(ledger.contains("reason:duplicate"), "{ledger}");
+
+    let (ok, check) = run_json(&["check", "--json", "--vault", &vault_arg(root)]);
+    assert!(ok, "{check}");
+    assert_eq!(check["summary"]["warnings"], 0, "{check}");
+    assert_eq!(find_refs(root, "call").len(), 1);
+
+    // The retry replays the recorded request instead of refusing the
+    // now-voided target.
+    let (ok, replay) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--request-id",
+        CP_REQUEST,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{replay}");
+    assert_eq!(replay["idempotent"], true, "{replay}");
+    assert_eq!(commits(root), before + 1);
+}
+
+#[test]
+fn bulk_retract_clears_a_duplicate_batch_in_one_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.4\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-11-02\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(format!("people/{CP_PERSON}"))).unwrap();
+    std::fs::write(
+        root.join(format!("people/{CP_PERSON}/profile.md")),
+        format!("---\nid: {CP_PERSON}\ntype: person\nname: \"Correction Person\"\n---\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("ledger/2026")).unwrap();
+    let mut lines = String::new();
+    for _ in 0..41 {
+        lines.push_str(&format!("2026-10-01 touch {CP_PERSON} call\n"));
+    }
+    std::fs::write(root.join("ledger/2026/10.cfd"), lines).unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let before = commits(root);
+    let (ok, out) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--verb",
+        "touch",
+        "--match-date",
+        "2026-10-01",
+        "--keep",
+        "1",
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{out}");
+    assert!(out["commit"].as_str().is_some(), "{out}");
+    assert_eq!(out["targets"].as_array().unwrap().len(), 40, "{out}");
+    assert_eq!(commits(root), before + 1);
+    let ledger = std::fs::read_to_string(root.join("ledger/2026/11.cfd")).unwrap();
+    assert_eq!(ledger.matches("retract ").count(), 40, "{ledger}");
+    let (ok, check) = run_json(&["check", "--json", "--vault", &vault_arg(root)]);
+    assert!(ok, "{check}");
+    assert_eq!(check["summary"]["warnings"], 0, "{check}");
+    assert_eq!(find_refs(root, "call").len(), 1);
+}
+
+#[test]
+fn correct_appends_replacement_and_context_shows_it() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let before = commits(root);
+    let target = find_refs(root, "call")[0].clone();
+    let replacement = format!("2026-10-01 touch {CP_PERSON} meet");
+
+    let (ok, out) = run_json(&[
+        "correct",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--replacement",
+        &replacement,
+        "--reason",
+        "wrong-kind",
+        "--date",
+        CP_DATE,
+        "--request-id",
+        CP_REQUEST,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{out}");
+    assert!(out["commit"].as_str().is_some(), "{out}");
+    assert_eq!(commits(root), before + 1);
+    let october = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+    let november = std::fs::read_to_string(root.join("ledger/2026/11.cfd")).unwrap();
+    assert!(october.contains("meet"), "{october}");
+    assert!(november.contains("replace:"), "{november}");
+    assert!(november.contains("reason:wrong-kind"), "{november}");
+    let (ok, context) = run_json(&[
+        "context",
+        CP_PERSON,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{context}");
+    let touchpoints = context["touchpoints"].as_array().unwrap();
+    // One of the two identical call lines was corrected; the other remains.
+    assert_eq!(touchpoints.len(), 2, "{context}");
+    assert_eq!(
+        touchpoints.iter().filter(|t| t["kind"] == "call").count(),
+        1,
+        "{context}"
+    );
+    assert_eq!(
+        touchpoints.iter().filter(|t| t["kind"] == "meet").count(),
+        1,
+        "{context}"
+    );
+    let (_ok, check) = run_json(&["check", "--json", "--vault", &vault_arg(root)]);
+    assert_eq!(check["summary"]["warnings"], 0, "{check}");
+
+    let (ok, replay) = run_json(&[
+        "correct",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--replacement",
+        &replacement,
+        "--reason",
+        "wrong-kind",
+        "--date",
+        CP_DATE,
+        "--request-id",
+        CP_REQUEST,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{replay}");
+    assert_eq!(replay["idempotent"], true, "{replay}");
+    assert_eq!(commits(root), before + 1);
+}
+
+#[test]
+fn record_retire_hides_agent_reads_and_operator_sees_the_badge() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let (ok, out) = run_json(&[
+        "record",
+        "retire",
+        CP_PERSON,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["retired"], true, "{out}");
+    let profile =
+        std::fs::read_to_string(root.join(format!("people/{CP_PERSON}/profile.md"))).unwrap();
+    assert!(profile.contains("retired: true"), "{profile}");
+
+    assert!(find_refs(root, "Correction Person").is_empty());
+    let (ok, op) = run_json(&[
+        "find",
+        "Correction Person",
+        "--for-operator",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{op}");
+    assert_eq!(op["matches"].as_array().unwrap().len(), 1, "{op}");
+
+    let (ok, list) = run_json(&["record", "list", "--json", "--vault", &vault_arg(root)]);
+    assert!(ok, "{list}");
+    assert!(list["records"].as_array().unwrap().is_empty(), "{list}");
+    let (ok, op_list) = run_json(&[
+        "record",
+        "list",
+        "--for-operator",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{op_list}");
+    let entry = &op_list["records"][0];
+    assert_eq!(entry["id"], CP_PERSON, "{op_list}");
+    assert_eq!(entry["retired"], true, "{op_list}");
+
+    let (ok, show) = run_json(&[
+        "record",
+        "show",
+        CP_PERSON,
+        "--for-edit",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{show}");
+    assert_eq!(show["retired"], true, "{show}");
+    let (ok, _out, err) = run_raw(&[
+        "record",
+        "show",
+        CP_PERSON,
+        "--for-edit",
+        "--no-input",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{err}");
+    assert!(err.contains("retired"), "missing retired hint: {err}");
+
+    let (ok, err) = run_json(&[
+        "context",
+        CP_PERSON,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(!ok, "{err}");
+    assert_eq!(err["error"]["code"], "E_NOT_FOUND", "{err}");
+
+    let (ok, err) = run_json(&[
+        "log",
+        "touch",
+        CP_PERSON,
+        "meet",
+        "--date",
+        "2026-10-13",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(!ok, "{err}");
+    assert_eq!(err["error"]["code"], "E_INVALID", "{err}");
+
+    let (ok, out) = run_json(&[
+        "record",
+        "unretire",
+        CP_PERSON,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["retired"], false, "{out}");
+    let (ok, found) = run_json(&[
+        "find",
+        "Correction Person",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{found}");
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1, "{found}");
+
+    // Notes are records too; `record retire` keeps the note file and hides
+    // it from agent reads.
+    let (ok, out) = run_json(&[
+        "record",
+        "retire",
+        CP_NOTE,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["retired"], true, "{out}");
+    let (ok, hidden) = run_json(&[
+        "find",
+        "Fake note body",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(ok, "{hidden}");
+    assert!(hidden["matches"].as_array().unwrap().is_empty(), "{hidden}");
+}
+
+#[test]
+fn retract_is_refused_on_spec_03() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.3\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(format!("people/{CP_PERSON}"))).unwrap();
+    std::fs::write(
+        root.join(format!("people/{CP_PERSON}/profile.md")),
+        format!("---\nid: {CP_PERSON}\ntype: person\nname: \"Correction Person\"\n---\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("ledger/2026")).unwrap();
+    std::fs::write(
+        root.join("ledger/2026/10.cfd"),
+        format!("2026-10-01 touch {CP_PERSON} call\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let refs = find_refs(root, "call");
+    let (ok, err) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--line",
+        &refs[0],
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(!ok, "{err}");
+    assert_eq!(err["error"]["code"], "E_INVALID", "{err}");
+}
+
+#[test]
+fn retract_refuses_a_dirty_month_file() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let target = find_refs(root, "call")[1].clone();
+    let draft_path = root.join("ledger/2026/11.cfd");
+    let mut draft =
+        std::fs::read_to_string(&draft_path).unwrap_or_else(|_| "; local draft\n".to_owned());
+    draft.push_str("; uncommitted\n");
+    std::fs::write(draft_path, draft).unwrap();
+    let (ok, err) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(!ok, "{err}");
+    assert_eq!(err["error"]["code"], "E_CONFLICT", "{err}");
 }

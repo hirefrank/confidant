@@ -59,7 +59,7 @@ PERSON = "p-01J9Z3K4QF0000000000000001"  # "Ada Example", paid
 NO_AI_PERSON = "p-01J9Z3K4QG0000000000000002"  # "Cam Sample", no-ai
 PACKAGE = "pkg-01J9Z3K4QF0000000000000000"
 VAULT_ID = "01J9Z3K4QF0000000000000000"
-SESSION_DATE = "2026-10-13"
+WRITE_DATE = "2026-10-13"
 ALIAS_DATE = "2026-10-13"
 TOUCH_DATE = "2026-10-15"
 # The neutral external-pack fixture. Installed the way a user installs a
@@ -393,26 +393,25 @@ def plaintext_vault_steps(smoke: Smoke) -> None:
     smoke.ok(step, str(report.get("id", "")).startswith("n-"), f"bad note id: {report}")
     smoke.mark(step)
 
-    step = "log session (plaintext)"
+    step = "log touch (plaintext)"
     report = smoke.cli_ok(
         step,
         [
             "log",
-            "session",
+            "touch",
             PERSON,
-            "60m",
-            "paid",
+            "meet",
             "--date",
-            SESSION_DATE,
+            WRITE_DATE,
             "--note",
-            "Fake session note.",
+            "Fake touchpoint note.",
             "--json",
             "--no-input",
             "--vault",
             str(vault),
         ],
     )
-    smoke.ok(step, report.get("command") == "log-session", f"bad command: {report}")
+    smoke.ok(step, report.get("command") == "log-touch", f"bad command: {report}")
     smoke.mark(step)
 
     smoke.check_clean("check --json (plaintext)", vault)
@@ -494,6 +493,212 @@ def plaintext_vault_steps(smoke: Smoke) -> None:
     smoke.mark(step)
 
     refused_write_step(smoke, vault)
+
+
+def corrections_steps(smoke: Smoke) -> None:
+    """Spec 0.4: retract, correct, retire, and their agent/operator reads."""
+    vault = smoke.make_plaintext_vault("corrections", [])
+    (vault / "confidant.toml").write_text(
+        'spec = "0.4"\npacks = []\nvault_id = "01J9Z3K4QF0000000000000000"\n'
+        '\n[checks]\nas_of = "2026-10-13"\n'
+    )
+    smoke.git(vault, ["add", "-A"])
+    smoke.git(vault, ["commit", "-qm", "spec 0.4"])
+
+    person = "p-01J9Z3K4QJ0000000000000004"
+    retired = "p-01J9Z3K4QJ0000000000000005"
+    for record_id, name in ((person, "Correction Sample"), (retired, "Retired Sample")):
+        smoke.write_person(record_id, name)
+        smoke.cli_ok(
+            "record add (corrections)",
+            [
+                "record",
+                "add",
+                "--file",
+                str(smoke.scratch / f"{record_id}.md"),
+                "--json",
+                "--no-input",
+                "--vault",
+                str(vault),
+            ],
+        )
+
+    step = "retract hides a line from agent find"
+    smoke.cli_ok(
+        step,
+        [
+            "log",
+            "touch",
+            person,
+            "text",
+            "--date",
+            WRITE_DATE,
+            "--json",
+            "--no-input",
+            "--vault",
+            str(vault),
+        ],
+    )
+    found = smoke.cli_ok(
+        step,
+        ["find", "text", "--json", "--no-input", "--vault", str(vault)],
+    )
+    refs = [m["ref"] for m in found.get("matches", []) if m.get("ref")]
+    smoke.ok(step, len(refs) == 1, f"find did not return one ref: {found}")
+    smoke.cli_ok(
+        step,
+        [
+            "retract",
+            person,
+            "--line",
+            refs[0],
+            "--reason",
+            "typo",
+            "--date",
+            WRITE_DATE,
+            "--json",
+            "--no-input",
+            "--vault",
+            str(vault),
+        ],
+    )
+    agent = smoke.cli_ok(
+        step,
+        ["find", "text", "--json", "--no-input", "--vault", str(vault)],
+    )
+    smoke.ok(step, agent.get("matches") == [], f"retracted line still visible: {agent}")
+    smoke.mark(step)
+
+    step = "correct replaces a line in context"
+    smoke.cli_ok(
+        step,
+        [
+            "log",
+            "touch",
+            person,
+            "call",
+            "--date",
+            WRITE_DATE,
+            "--json",
+            "--no-input",
+            "--vault",
+            str(vault),
+        ],
+    )
+    found = smoke.cli_ok(
+        step,
+        ["find", "call", "--json", "--no-input", "--vault", str(vault)],
+    )
+    refs = [m["ref"] for m in found.get("matches", []) if m.get("ref")]
+    smoke.ok(step, len(refs) == 1, f"find did not return one call ref: {found}")
+    smoke.cli_ok(
+        step,
+        [
+            "correct",
+            person,
+            "--line",
+            refs[0],
+            "--replacement",
+            f"{WRITE_DATE} touch {person} email",
+            "--reason",
+            "wrong-kind",
+            "--date",
+            WRITE_DATE,
+            "--json",
+            "--no-input",
+            "--vault",
+            str(vault),
+        ],
+    )
+    old = smoke.cli_ok(
+        step,
+        ["find", "call", "--json", "--no-input", "--vault", str(vault)],
+    )
+    new = smoke.cli_ok(
+        step,
+        ["find", "email", "--json", "--no-input", "--vault", str(vault)],
+    )
+    smoke.ok(step, old.get("matches") == [], f"corrected line still visible: {old}")
+    smoke.ok(step, bool(new.get("matches")), f"replacement not visible: {new}")
+    context = smoke.cli_ok(
+        step,
+        ["context", person, "--json", "--no-input", "--vault", str(vault)],
+    )
+    kinds = [tp.get("kind") for tp in context.get("touchpoints", [])]
+    smoke.ok(step, kinds.count("call") == 0 and kinds.count("email") == 1, f"context: {context}")
+    smoke.mark(step)
+
+    step = "record retire hides agent reads, operator sees it"
+    smoke.cli_ok(
+        step,
+        [
+            "record",
+            "retire",
+            retired,
+            "--json",
+            "--no-input",
+            "--vault",
+            str(vault),
+        ],
+    )
+    agent = smoke.cli_ok(
+        step,
+        ["find", "Retired Sample", "--json", "--no-input", "--vault", str(vault)],
+    )
+    smoke.ok(step, agent.get("matches") == [], f"agent find leaked retired: {agent}")
+    operator = smoke.cli_ok(
+        step,
+        [
+            "find",
+            "Retired Sample",
+            "--for-operator",
+            "--json",
+            "--no-input",
+            "--vault",
+            str(vault),
+        ],
+    )
+    smoke.ok(step, bool(operator.get("matches")), f"operator find missed retired: {operator}")
+    listing = smoke.cli_ok(
+        step,
+        [
+            "record",
+            "list",
+            "--for-operator",
+            "--json",
+            "--no-input",
+            "--vault",
+            str(vault),
+        ],
+    )
+    entry = next((r for r in listing.get("records", []) if r.get("id") == retired), None)
+    smoke.ok(step, entry is not None and entry.get("retired") is True, f"bad roster: {listing}")
+    smoke.cli_fail(
+        step,
+        ["context", retired, "--json", "--no-input", "--vault", str(vault)],
+        code="E_NOT_FOUND",
+    )
+    smoke.cli_ok(
+        step,
+        [
+            "record",
+            "unretire",
+            retired,
+            "--json",
+            "--no-input",
+            "--vault",
+            str(vault),
+        ],
+    )
+    restored = smoke.cli_ok(
+        step,
+        ["find", "Retired Sample", "--json", "--no-input", "--vault", str(vault)],
+    )
+    smoke.ok(step, bool(restored.get("matches")), f"unretire did not restore: {restored}")
+    smoke.mark(step)
+
+    smoke.check_clean("check (corrections)", vault)
+    smoke.mark("check (corrections)")
 
 
 def refused_write_step(smoke: Smoke, vault: Path) -> None:
@@ -870,6 +1075,7 @@ def main() -> int:
 
     try:
         plaintext_vault_steps(smoke)
+        corrections_steps(smoke)
         pack_lifecycle_steps(smoke)
     except SmokeFailure as err:
         print(f"\nqa smoke FAILED at step: {err.step}", file=sys.stderr)

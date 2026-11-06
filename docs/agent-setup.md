@@ -54,15 +54,17 @@ URL is known instead. This is the long form of step 3 of the install prompt in
    not a hard block on a fresh install: `confidant doctor` reports it as a
    warning, since older git is still usable for the commands Confidant
    runs. Upgrade when you can.
-2. **Git identity.** `init` commits, so it needs one. Check first with
-   `git config --global user.name` and `git config --global user.email`,
-   and set only values that are unset — do not overwrite an existing
-   identity. If a value is missing, ask the operator for it (do not
-   invent it) and set it before `init`:
+2. **Git identity.** `init` commits, but it does not need a global git
+   identity: it sets a neutral repo-local identity (`Confidant Operator
+   <operator@confidant.local>`) in `<vault>/.git/config`, so the
+   operator's global identity never lands in the vault's history. Do
+   not set a global identity for this. If the operator wants their own
+   name in the vault's history, ask them for it (do not invent it) and
+   set it per vault, inside the vault:
 
    ```sh
-   git config --global user.name "Your Name"
-   git config --global user.email "you@example.com"
+   git config --local user.name "Your Name"
+   git config --local user.email "you@example.com"
    ```
 
 3. **Git credentials — checked where the URL is known, not here.** At
@@ -87,9 +89,10 @@ URL is known instead. This is the long form of step 3 of the install prompt in
 ## What a vault is on disk
 
 A vault is a directory of plain text: `confidant.toml`, `ledger/`, and one
-Markdown record per person, org, deal, interaction, and note. There is one
-kind of vault, and no mode to choose. `examples/demo-vault` is the same kind
-of vault filled with fake people.
+Markdown record per person, org, deal, interaction, note, and edge. There is
+one kind of vault, and no mode to choose. `examples/demo-vault` is the same
+kind of vault, filled with fake people, an org, and the relationships
+between them.
 
 The privacy perimeter is the operator's own machines and a **private** git
 remote, with full-disk encryption on (LUKS, FileVault): see
@@ -136,9 +139,10 @@ The command creates the directory and runs `git init` with branch `main`
 the skeleton. There is no secret to store and no enrollment step. Without
 `--remote` it adds no git remote. It never pushes.
 
-Packs are optional. `packs = []` is clean: `personal@0.2` is built in and
-implicit, so `check` starts with birthdays, cadence, and the `touch` verb.
-To add another pack after init:
+Packs are optional. `packs = []` is clean: the active personal pack is built
+in and implicit — `personal@0.3` on a 0.4 vault, `personal@0.2` on 0.1–0.3 —
+so `check` starts with birthdays, cadence, the `touch` verb, and (on 0.4)
+places and things. To add another pack after init:
 
 ```sh
 confidant pack add <https-url> --yes
@@ -243,13 +247,14 @@ last-fetched copy.
 
 | Command | What |
 |---|---|
-| `confidant setup [--agent auto\|all\|a,b] [--force] [--copy] [-v]` | Materialize embedded skills, link into agent skill dirs |
+| `confidant setup [--agent auto\|all\|a,b] [--force] [--copy] [--no-instructions] [-v]` | Materialize embedded skills, link into agent skill dirs, install the system-of-record rule, print the completion brief |
 | `confidant update [--agent …] [--force] [-v]` | Report latest release, re-link skills from this binary |
-| `confidant doctor` | Vault health + CLI staleness + skills link health + `git-remote` + `local-commits` |
+| `confidant doctor` | Vault health + CLI staleness + skills link health + system-of-record rule + `git-remote` + `local-commits`, with a summary |
+| `confidant status` | One-screen readiness rollup and the completion brief; exits 1 when a required check is not `ok` |
 | `confidant sync [--dry-run] [--pull\|--push] [--yes]` | Fetch and report ahead/behind; `--pull`/`--push` are confirmed network writes |
 | `confidant agents` | List supported agents and detection status |
 | `confidant which [--skills-dir]` | Print installed skills location |
-| `confidant routing` | Print the optional routing snippet |
+| `confidant routing` | Print the system-of-record rule (the text setup installs) |
 
 `--agent auto` (default) links into every detected agent, falling back to
 `claude-code` when none is detected. `--agent all` targets all nine supported
@@ -260,15 +265,69 @@ warning. `--force` replaces existing non-symlink skill dirs (older installs);
 adds the optional qmd note ([below](#optional-search-backend-qmd)).
 Every command takes `--json` and `--no-input` per the agent contract.
 
+## System of record and the completion brief
+
+Linking skills is not enough. A session that never loads a skill still
+answers from whatever memory the host gave it, so `confidant setup` also
+writes a system-of-record declaration into each selected agent's always-on
+instructions. The declaration says the vault is where relationship memory
+lives, gives the vault path and CLI access path, routes reads through
+`resolve`/`context`, `find`, or QMD, routes writes through the CLI
+(dry-run → confirm → apply), states the `no-ai` boundary, and says to admit
+when the vault is unreachable instead of answering from agent memory.
+
+| Agent | Instruction file (relative to `$HOME`) |
+|---|---|
+| `claude-code` | `.claude/CLAUDE.md` |
+| `cursor` | `.cursor/rules/confidant.mdc` |
+| `codex` | `.codex/AGENTS.md` |
+| `opencode` | `.config/opencode/AGENTS.md` |
+| `pi` | `.pi/agent/AGENTS.md` |
+| `gemini-cli` | `.gemini/GEMINI.md` |
+| `hermes-agent` | `.hermes/AGENTS.md` |
+| `muse`, `agents` | `.agents/AGENTS.md` |
+
+Setup owns only the block between `<!-- confidant:system-of-record:begin -->`
+and `<!-- confidant:system-of-record:end -->`; text outside it is preserved,
+and a re-run updates the block in place. An existing block is left alone
+when setup has no vault to point at, so running `confidant setup` from
+`$HOME` cannot erase a pointer installed earlier. `--dry-run` reports the
+planned outcome and writes nothing. `--no-instructions` skips the files
+entirely for operators who manage their own memory. Setup prints every path
+and the exact text it wrote; `confidant routing` reprints the text.
+
+Setup ends with a completion brief for this install: the vault name, path,
+branch, and record counts; the machine and whether it can read and write
+the vault; the remote and recent commit authors (Confidant cannot count
+other machines); the perimeter in plain language (plaintext on disk and in
+git history, a private remote, full-disk encryption as an OS setting that
+Confidant does not verify, and no application-level encryption); the sync
+posture; search state and the corpus snapshot time; where the standing
+orders live; the work discipline; and 3–5 routines grounded in the vault's
+actual contents. `confidant status` reprints that brief with the readiness
+rollup.
+
+The rollup covers CLI/TUI versions, vault discovery and writability, skill
+links, the system-of-record rule, git repository/identity/remote/ahead-
+behind state, the QMD corpus, and binary staleness. Every line is `ok`,
+`warning`, `absent`, `unknown`, or `error`; an optional layer that is not
+installed is `absent`, never a false `ok`. Required checks are the CLI
+version, vault discovery and access, the git repository and identity, the
+vault spec, skill links, and the system-of-record rule. Absent optional
+layers (TUI, QMD) and optional warnings (remote advice, ahead/behind) do
+not block readiness. `confidant status --json` returns the same data under
+`readiness` and `brief`.
+
 ## Local packs
 
 The `pack-author` skill walks an agent through the decision: a pack for new
 declarative claims or checks, a skill-only workflow when existing records
 and notes suffice, and a core change when new Rust logic is needed.
 
-A pack is data plus agent text. It can declare fields, verbs, edge kinds,
-finding codes, check keys, and parameters for existing rule kinds; it cannot
-run code or define a new kind. Keep the source outside the vault:
+A pack is data plus agent text. It can declare fields, verbs, edge kinds
+(with optional `from` / `to` endpoint types), finding codes, check keys, and
+parameters for existing rule kinds; it cannot run code or define a new kind.
+Keep the source outside the vault:
 
 ```sh
 confidant pack init ~/confidant-packs/<name>
@@ -374,8 +433,9 @@ this loop:
   (https://github.com/hirefrank/confidant/releases), or run
   `confidant update` to be told. If behind, re-run the installer or
   `cargo install confidant-cli confidant-tui`, then `confidant setup` to
-  re-point the skill links at the new version dir. Upgrading only one of
-  the two is what trips the version warning.
+  re-point the skill links at the new version dir and refresh the
+  system-of-record rule. Upgrading only one of the two is what trips the
+  version warning.
 - **Skills:** they re-link from the new binary — no separate step, no tag
   to pin. `doctor` warns (`skills-links`) when a detected agent is missing
   links; fix with `confidant setup --agent auto`.

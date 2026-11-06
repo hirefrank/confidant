@@ -1,4 +1,4 @@
-# Stable finding codes (spec 0.1)
+# Stable finding codes (spec 0.1–0.4)
 
 Callers of `confidant check --json` must branch on `code`, never on message
 text. Codes are stable once published. A new meaning needs a new code.
@@ -20,23 +20,25 @@ present, for CI users who want the stricter gate.
 | `E_PARSE` | error | | A ledger line or record file does not match the grammar. |
 | `E_UNREADABLE` | error | | A file is not valid UTF-8 or a directory cannot be read. |
 | `E_CONFIG` | error | | `confidant.toml` is missing a required field, is not valid TOML, or a `[checks]` key/value is unknown, mistyped, or out of range. |
-| `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1`. |
+| `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1`, `0.2`, `0.3`, or `0.4`. |
+| `E_VAULT_LEGACY_ENCRYPTED` | error | | The vault matches the ≤0.7 encrypted-vault shell: a `keys/` tree beyond `.gitkeep`, an `enc:` front-matter header, or an `enc:` ledger line. `check` emits this one finding and stops; `find`, `context`, `allowlist`, `resolve`, and `alias resolve` return it as a command error instead of scanning. The message is the whole diagnosis and remedy; the finding carries no file path, id, or record content. |
 | `E_PACK_UNKNOWN` | error | | A listed pack is neither compiled into this CLI nor resolved through `confidant.lock`. The fix hint points at `confidant pack add`. The message may name the failing `name@version` exactly as listed in `confidant.toml`; `file` is `confidant.toml`. Not reported when `spec` is unsupported: external packs are not resolved and `check` stops after `E_SPEC_UNSUPPORTED`. |
 | `E_PACK_VERSION` | error | | A listed pack's pinned version is newer than this binary supports, or (for external packs) the pack's `requires_spec` does not include the vault's `spec`. The message names the failing `name@version` exactly as listed in `confidant.toml`; `file` is `confidant.toml`. |
 | `E_PACK_HASH` | error | | An external pack's vendored files do not match the lockfile hash, or the vendored directory is missing. The message names the failing `name@version` exactly as listed in `confidant.toml`; `file` is the vendored path `packs/<name>@<version>`. |
 | `E_PACK_INVALID` | error | | An external pack's manifest or contents fail validation: bad `manifest_version`, unknown keys, name or finding-code regex violations, reserved names, capability-limit (PD8) violations, or disallowed files (PD7). A vendored-pack failure names the `name@version` exactly as listed in `confidant.toml` and sets `file` to the vendored path `packs/<name>@<version>`; a broken `confidant.lock` is a separate name-free finding. |
-| `E_PACK_CONFLICT` | error | | Two enabled packs claim the same verb, record type, field, balance metric, or edge kind. The pack set is incoherent: `check` reports the conflict and skips all pack folding (core checks still run). |
-| `W_PACK_ORPHAN` | warning | | A ledger verb, record field, record type, balance metric, or edge kind belongs to a registered pack that is not enabled. Warnings never block writes; the operator enables the pack or removes the data. |
-| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, merge `TO`, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, and an alphanumeric run 20–32 characters that fails ULID validation or a longer run whose first 26 characters canonicalize to a ULID). A `person` / `org` / `deal` value (including ASCII case variants: `Person:`, `ORG:`, …) accepts `[[id|Alias]]` only inside `[[…]]` (bare `p-A|Name` is this code), a trailing comment after a space or tab then `#`, and treats empty / `~` / YAML `null` as no reference. Check reports the line number and, when the key is a known spec key (including a case-variant ref key, named as written), the key name; it never echoes the token. |
+| `E_PACK_CONFLICT` | error | | Two pack declarations claim the same verb, record type, record-type prefix, record-type collection, field, balance metric, or edge kind. The pack set is incoherent: `check` reports the conflict and skips all pack folding for enabled packs (core checks still run). |
+| `W_PACK_ORPHAN` | warning | | A ledger verb, record field, record type, balance metric, or edge kind belongs to a pack that is not enabled. Since 0.3 this includes a record whose type belongs to a removed pack (a `[[retired_types]]` tombstone or an undeclared two-letter pack prefix). Warnings never block writes; the operator enables/re-adds the pack or removes the data. Agent reads fail closed on an orphaned record type. |
+| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, merge `TO`, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, and an alphanumeric run 20–32 characters that fails ULID validation or a longer run whose first 26 characters canonicalize to a ULID). A `person` / `org` / `deal` / `entity` value (including ASCII case variants: `Person:`, `ORG:`, `Entity:`, …) accepts `[[id|Alias]]` only inside `[[…]]` (bare `p-A|Name` is this code), a trailing comment after a space or tab then `#`, and treats empty / `~` / YAML `null` as no reference. Check reports the line number and, when the key is a known spec key (including a case-variant ref key, named as written), the key name; it never echoes the token. |
 | `E_INVALID_FILENAME` | error | | A collection or record directory contains a name that is not a record ID, a non-UTF-8 name, or a leftover `.confidant-tmp-*` file. |
 | `E_ID_PATH_MISMATCH` | error | | Front matter `id` does not equal the path ID, or a note's `person` does not match `people/<id>/`. On `find`, a mismatch on a note, interaction, or deal uncleares only that record; a mismatch or `E_DUPLICATE_ID` on a person's profile uncleares that whole person. |
-| `E_TYPE_PATH_MISMATCH` | error | | Front matter `type` / ID prefix does not match the collection directory. |
-| `E_WRONG_ID_TYPE` | error | | `stage`, `open`, or `session` names the wrong record type, or a `merge` folds one record type into another. |
+| `E_TYPE_PATH_MISMATCH` | error | | Front matter `type` / ID prefix does not match the collection directory. A pack-declared type must sit in its declaration's collection and use its declared two-letter prefix. |
+| `E_WRONG_ID_TYPE` | error | | `stage`, `open`, or `session` names the wrong record type, a `merge` folds one record type into another, an `entity:` value names a non-entity type, or an edge end is not a declared entity type (0.2: person or org; 0.3 also a pack type with `entity = true`) or does not match its kind's `from` / `to` endpoint declaration. |
 | `E_DUPLICATE_ID` | error | | The same ID appears in two files. |
 | `E_DUPLICATE_ULID` | error | | The same ULID is used under two prefixes. |
-| `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not `true`/`false` — or `notes` on a person record — or is set on a record type that does not allow it; a key the record type does not allow at all, such as `name` on an `edge`; a key that, after stripping surrounding quotes, case-folding, and removing every non-alphanumeric character, equals `noai` other than exact `no-ai`; and note `date` / `session` that is not YYYY-MM-DD). Messages never echo a raw front-matter value. They name the key only when it is a known spec key; otherwise they give the line number only. |
+| `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not `true`/`false` — or `notes` on a record type that does not allow it, including an `edge` — or is set on a record type that does not allow it; a key the record type does not allow at all, such as `name` on an `edge`; a key that, after stripping surrounding quotes, case-folding, and removing every non-alphanumeric character, equals `noai` other than exact `no-ai`; note `date` / `session` that is not YYYY-MM-DD; and a missing field a pack type declares as required). Messages never echo a raw front-matter value. They name the key when it is a known spec key or a field the record type declares; otherwise they give the line number only. |
 | `E_UNKNOWN_VERB` | error | | A ledger verb is not core, not in an enabled pack, and not owned by a disabled pack (those are `W_PACK_ORPHAN`). The message does not echo the verb. |
 | `E_UNKNOWN_RECORD` | error | | A ledger ID has no record file. A pack's `note:` miss is that pack's own finding. |
+| `E_UNKNOWN_RECORD_TYPE` | error | | A record's `type` is neither a core type nor a type declared by an enabled/registered pack. An undeclared two-letter pack prefix is `W_PACK_ORPHAN` instead (removed pack); a type declared by a disabled or retired pack is also `W_PACK_ORPHAN`. The message names the `type` key, never its value. |
 | `E_UNKNOWN_METRIC` | error | | A `balance` line names a metric no enabled pack defines and no disabled pack owns (those are `W_PACK_ORPHAN`). |
 | `E_LEDGER_PATH` | error | | A file under `ledger/` is not `YYYY/MM.cfd`. |
 | `E_LEDGER_DATE` | error | | An entry's date is not in its file's year/month. |
@@ -46,9 +48,9 @@ present, for CI users who want the stricter gate.
 | `E_MERGE_FORK` | error | | The same `FROM` is merged into two different `TO`s. |
 | `E_SYMLINK` | error | | A symbolic link exists in the vault. |
 | `E_MERGE_CONFLICT` | error | | Git conflict markers (`<<<<<<<` / `>>>>>>>`) are present in a vault file. |
-| `E_DANGLING_REF` | error | | A front-matter `person` / `org` / `deal` ID (including ASCII case variants) has no record. Also: an edge end (`a` / `b`) or a `with:` entry with no record. |
-| `E_SELF_EDGE` | error | | An edge links a person to themself (`a` and `b` are the same id). |
-| `E_DUPLICATE_EDGE` | error | | Two edges state the same relation: an exact duplicate, or a reversed duplicate (`b, a`) of a symmetric kind. |
+| `E_DANGLING_REF` | error | | A front-matter `person` / `org` / `deal` / `entity` ID (including ASCII case variants) has no record. Also: an edge end (`a` / `b`) or a `with:` entry with no record. |
+| `E_SELF_EDGE` | error | | An edge links an entity to itself (`a` and `b` are the same id; in a 0.2 vault, the same canonical id after merge mappings). |
+| `E_DUPLICATE_EDGE` | error | | Two edges state the same relation: an exact duplicate, or a reversed duplicate (`b, a`) of a symmetric kind. In a 0.2 vault the pair is compared after merge canonicalization. |
 | `E_UNKNOWN_EDGE_KIND` | error | | An edge `kind` is not in the closed kind list (core kinds plus enabled packs' kinds). A kind owned by a disabled pack is `W_PACK_ORPHAN` instead. |
 | `E_TOUCH_MALFORMED` | error | | A `touch` ledger line is malformed. The built-in personal pack is implicit, so a `touch` line carries either `[kind:call\|text\|email\|meet\|meal\|event\|gift\|video\|other]` or `<call\|text\|email\|meet\|meal\|event\|gift\|video\|other> [note:NOTE-ID] [src:PROVENANCE]`; any other shape is malformed. |
 | `W_DUPLICATE_TOUCH` | warning | | A `touch` ledger line repeats an earlier line for the same person, date, and kind (`note:` and `src:` do not distinguish lines). Only the second and later occurrences are flagged; kind-less mirrored lines carry no identity and are never flagged. |
@@ -56,6 +58,11 @@ present, for CI users who want the stricter gate.
 | `W_CADENCE_OVERDUE` | warning | `personal.cadence_overdue` | A person with `cadence: <N>d` has no touchpoint (`touch`, `session`, or dated `interaction`) on or after `as_of - N days` (built-in personal pack). |
 | `W_DATE_UPCOMING` | warning | `personal.date_upcoming` | A person's `birthday` or an entry in `dates` occurs within `0..=personal.date_upcoming_days` days of `as_of` (built-in personal pack). |
 | `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. The message does not echo the `src:` value. |
+| `E_RETRACT_MALFORMED` | error | | A `retract` line does not match `DATE retract SUBJECT-ID line:<64 lowercase hex> [occurrence:<n>] reason:<closed token> [replace:<64 lowercase hex>]`, including an unknown reason, `occurrence:0`, duplicate/extra pairs, or non-lowercase hex. |
+| `E_RETRACT_TARGET` | error | | A `retract` line names no parsed line for its `line:` ref + `occurrence:`, or its `replace:` ref names no line. |
+| `E_RETRACT_CHAIN` | error | | A retraction chain is invalid: the same target is retracted twice, two retractions name different replacements, a replacement cycle exists, or the replacement is already superseded at the retraction date. |
+| `E_RETRACT_ORDER` | error | | A retraction is dated before its target or replacement line. |
+| `E_RETRACT_NOT_ALLOWED` | error | | The target is a `retract` or `merge` line, or the retraction/replacement subject ID differs from the target line's subject. |
 
 **Retired, not emitted, never reused.** These old built-in names stay
 reserved and must never be reused for a new meaning; nothing emits them in
@@ -80,7 +87,9 @@ verbatim only when it has no file and no ID, or when it resolves to a
 cleared record or a cleared ledger line. Everything else is reduced to
 its code and the count of affected items — never a path, file name, ID,
 key, or line text. Front-matter `E_INVALID_ID` on an uncleared record
-is code and count only. Name-only mentions with no ID are not detected
+is code and count only. A finding on a `no-ai: true` edge is code and count
+only in `find`; `check` may carry the opaque `e-…` id and file but never the
+edge kind or either endpoint id. Name-only mentions with no ID are not detected
 in body prose and comments; a `person` / `org` / `deal` value (including
 case variants) that is
 not a record ID (including a bare `p-A|Name` pipe alias) is `E_INVALID_ID`
@@ -89,7 +98,7 @@ give the line number and code without echoing tokens. If any ledger file
 cannot be read, `find` does not scan: command error `E_LEDGER_UNREADABLE`
 (code and count only). `check` still reports `E_UNREADABLE`.
 
-Command-level error codes (not check findings):
+Command-level error codes (not check findings unless the row says otherwise):
 
 | Code | Exit | Meaning |
 |---|---|---|
@@ -102,7 +111,8 @@ Command-level error codes (not check findings):
 | `E_INVALID` | 1 | The request is well formed but not valid for this vault. |
 | `E_CONFLICT` | 1 | The request conflicts with stored vault state (including a refused symlink on a write path). |
 | `E_CONFIG` | 1 | `confidant.toml` cannot be parsed as TOML or is missing `spec` / `vault_id`. Semantic `[checks]` problems are the finding of the same code. |
-| `E_SPEC_UNSUPPORTED` | 1 | Vault `spec` is not `0.1`. `check` reports it as a finding; `find` returns this command error and does not scan. |
+| `E_SPEC_UNSUPPORTED` | 1 | Vault `spec` is not `0.1`, `0.2`, or `0.3`. `check` reports it as a finding; `find` returns this command error and does not scan. |
+| `E_VAULT_LEGACY_ENCRYPTED` | 1 | The vault matches the ≤0.7 encrypted-vault shell. `check` reports it as one finding; `find`, `context`, `allowlist`, `resolve`, and `alias resolve` return this command error and do not scan. The message is the whole diagnosis and remedy; no file path, id, or record content. |
 | `E_LEDGER_UNREADABLE` | 1 | A ledger file could not be read. `find` returns this command error (code and count only, no path) and no hits. `check` still reports finding `E_UNREADABLE`. |
 | `E_NO_REMOTE` | 1 | `confidant sync` found no git remote, no upstream branch, or no commits to compare. Local-only is a valid setup; nothing is fetched or pushed. |
 | `E_NOT_FAST_FORWARD` | 1 | `confidant sync` refused a diverged branch: local and upstream each have commits the other lacks. `--pull`/`--push` are never forced and never auto-merge; reconcile explicitly. |

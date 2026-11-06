@@ -3,8 +3,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::config::SpecVersion;
 use crate::id::{strip_ignorable, Prefix, RecordId};
 use crate::ledger::parse_strict_date;
+use crate::record_type::{NoAiPolicy, RecordSchema, TypeRegistry};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecordKind {
@@ -14,6 +16,13 @@ pub enum RecordKind {
     Interaction,
     Note,
     Edge,
+    /// A pack-declared type. The name and prefix are resolved at parse time;
+    /// an undeclared type keeps the ID's own prefix so path/format checks can
+    /// still run while `check` reports the unknown/orphan type.
+    Pack {
+        name: &'static str,
+        prefix: Prefix,
+    },
 }
 
 impl RecordKind {
@@ -25,6 +34,7 @@ impl RecordKind {
             Self::Interaction => "interaction",
             Self::Note => "note",
             Self::Edge => "edge",
+            Self::Pack { name, .. } => name,
         }
     }
 
@@ -36,6 +46,7 @@ impl RecordKind {
             Self::Interaction => Prefix::Interaction,
             Self::Note => Prefix::Note,
             Self::Edge => Prefix::Edge,
+            Self::Pack { prefix, .. } => prefix,
         }
     }
 
@@ -51,13 +62,18 @@ impl RecordKind {
         }
     }
 
+    pub fn pack(name: &'static str, prefix: Prefix) -> Self {
+        Self::Pack { name, prefix }
+    }
+
     pub fn allows_no_ai(self) -> bool {
         match self {
             Self::Person | Self::Note | Self::Deal | Self::Interaction => true,
-            // Org has no no-ai; an edge is ids + kind + dates only, and
-            // its content is never agent-facing prose, so no-ai is
-            // meaningless on it too.
+            // Org has no no-ai. Edge-level no-ai is spec-dependent (0.3+);
+            // `parse_record` applies `RecordSchema.spec`.
             Self::Org | Self::Edge => false,
+            // A pack declaration decides; `parse_record` checks the schema.
+            Self::Pack { .. } => false,
         }
     }
 }
@@ -84,6 +100,31 @@ impl Record {
         self.fields.get(key).map(String::as_str)
     }
 
+    /// The front-matter `type` value (core or pack-declared).
+    pub fn type_name(&self) -> &'static str {
+        self.kind.as_str()
+    }
+
+    pub fn is_person(&self) -> bool {
+        matches!(self.kind, RecordKind::Person)
+    }
+
+    pub fn is_note(&self) -> bool {
+        matches!(self.kind, RecordKind::Note)
+    }
+
+    pub fn is_interaction(&self) -> bool {
+        matches!(self.kind, RecordKind::Interaction)
+    }
+
+    pub fn is_edge(&self) -> bool {
+        matches!(self.kind, RecordKind::Edge)
+    }
+
+    pub fn is_pack_type(&self) -> bool {
+        matches!(self.kind, RecordKind::Pack { .. })
+    }
+
     /// Raw value of a `person` / `org` / `deal` reference, accepting ASCII
     /// case variants of the key (`Person:`, `DEAL:`). First match in key
     /// sort order wins; every variant is still validated where refs are
@@ -102,7 +143,26 @@ impl Record {
         }
     }
 
-    /// One end of an edge (`a` / `b`): a person ID parsed with the same
+    /// The `entity:` reference, parsed with the same tolerance as `person:`.
+    /// Used by `context` to attach notes/interactions to any entity (#814).
+    pub fn entity(&self) -> Option<RecordId> {
+        match parse_ref_id(self.ref_field("entity")?) {
+            FrontmatterRef::Id(id) => Some(id),
+            FrontmatterRef::Absent | FrontmatterRef::Invalid => None,
+        }
+    }
+
+    /// The `org:` reference, parsed with the same tolerance as `person:`.
+    /// Used by the org context bundle (#813) to find notes and interactions
+    /// attached to an org.
+    pub fn org(&self) -> Option<RecordId> {
+        match parse_ref_id(self.ref_field("org")?) {
+            FrontmatterRef::Id(id) => Some(id),
+            FrontmatterRef::Absent | FrontmatterRef::Invalid => None,
+        }
+    }
+
+    /// One end of an edge (`a` / `b`): an entity ID parsed with the same
     /// wikilink / quote / comment tolerance as `person` / `org` / `deal`.
     /// `None` when the key is absent, empty, or malformed — `check`
     /// distinguishes those cases.
@@ -117,6 +177,12 @@ impl Record {
         self.field("no-ai") == Some("true")
     }
 
+    /// Spec 0.4: a record retired by `record retire` (front-matter
+    /// `retired: true`). Before 0.4 the field is ignored by readers.
+    pub fn is_retired(&self) -> bool {
+        self.field("retired") == Some("true")
+    }
+
     /// Tri-state `no-ai` mode (`None` when the field is absent). A `notes`
     /// value here is only valid on person records — `parse_record`
     /// validates that — so callers can rely on the parse. Anything
@@ -127,7 +193,8 @@ impl Record {
     }
 }
 
-/// Tri-state `no-ai` value (`spec/0.1.md` §4).
+/// Tri-state `no-ai` value (spec §4; 0.1 and 0.2 core types; 0.3 adds pack
+/// types via their declaration).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NoAi {
     False,
@@ -230,7 +297,7 @@ impl FrontmatterError {
 }
 
 const SPEC_KEYS: &[&str] = &[
-    "id", "type", "name", "date", "person", "org", "deal", "session", "no-ai",
+    "id", "type", "name", "date", "person", "org", "deal", "entity", "session", "no-ai", "retired",
     // Edge (#179): `a` / `b` are person IDs, `kind` is a closed-list kind
     // name, `since` / `until` are dates. `with` is the participant list on
     // an interaction (`[p-…, p-…]`).
@@ -251,6 +318,8 @@ pub(crate) fn canonical_ref_key(key: &str) -> Option<&'static str> {
         Some("org")
     } else if key.eq_ignore_ascii_case("deal") {
         Some("deal")
+    } else if key.eq_ignore_ascii_case("entity") {
+        Some("entity")
     } else {
         None
     }
@@ -378,10 +447,19 @@ fn is_noai_typo(key: &str) -> bool {
     if key == "no-ai" {
         return false;
     }
-    normalize_noai(key) == "noai"
+    normalize_key(key) == "noai"
 }
 
-fn normalize_noai(key: &str) -> String {
+/// Spec 0.4: a key that normalizes to `retired` but is not exact would
+/// silently leave a record live (fail open), so it is an error.
+fn is_retired_typo(key: &str) -> bool {
+    if key == "retired" {
+        return false;
+    }
+    normalize_key(key) == "retired"
+}
+
+fn normalize_key(key: &str) -> String {
     let mut folded = String::new();
     for c in key.chars() {
         match c {
@@ -568,6 +646,48 @@ fn unescape(s: &str) -> String {
 }
 
 pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> {
+    parse_record_with_schema(text, path, &RecordSchema::core(SpecVersion::V02))
+}
+
+/// Intern a record-type name. The set of distinct type names is tiny (the
+/// vault's declared types plus any typo on disk), and `RecordKind` stays
+/// `Copy` for the rest of the crate.
+fn intern_type_name(name: &str) -> &'static str {
+    use std::sync::{LazyLock, Mutex};
+    static INTERNED: LazyLock<Mutex<std::collections::HashMap<String, &'static str>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    let mut map = INTERNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(&leaked) = map.get(name) {
+        return leaked;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    map.insert(name.to_owned(), leaked);
+    leaked
+}
+
+fn valid_type_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 32 || !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+/// Parse a record with the vault's spec and type table.
+///
+/// `require_declared` is `true` for writes (`record add`/`edit`): an unknown
+/// non-core type is a hard error. It is `false` for vault loading, where an
+/// unknown or orphaned type still parses so `check` can report it and the
+/// operator can edit/remove the file.
+pub fn parse_record_with_schema(
+    text: &str,
+    path: &str,
+    schema: &RecordSchema<'_>,
+) -> Result<Record, FrontmatterError> {
     let (fields, body, key_lines, body_start_line) = split_frontmatter(text)?;
     let line_of = |key: &str| key_lines.get(key).copied();
     let id_raw = fields.get("id").ok_or_else(|| {
@@ -579,16 +699,7 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
     let type_raw = fields.get("type").ok_or_else(|| {
         FrontmatterError::new(
             "front matter is missing key 'type'",
-            "Add type: person | org | deal | interaction | note | edge",
-        )
-    })?;
-    let kind = RecordKind::parse(type_raw).ok_or_else(|| {
-        let line = line_of("type").unwrap_or(1);
-        FrontmatterError::key_at(
-            line,
-            "type",
-            "has an unknown value",
-            "Use type: person, org, deal, interaction, note, or edge",
+            "Add type: person | org | deal | interaction | note | edge | <declared type>",
         )
     })?;
     let id = RecordId::parse(id_raw).map_err(|_| {
@@ -600,34 +711,109 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
             "Use a prefixed 26-character Crockford ULID",
         )
     })?;
-    // #390: an edge carries only ids, kind, and dates, so a front-matter key
-    // outside that set is rejected rather than ignored like unknown keys
-    // elsewhere (spec §4).
+    let declared = schema.types.and_then(|types| types.get(type_raw));
+    let core_kind = RecordKind::parse(type_raw);
+    let kind = if let Some(kind) = core_kind {
+        kind
+    } else if let Some(decl) = declared {
+        RecordKind::pack(decl.name, decl.prefix)
+    } else if !valid_type_name(type_raw) {
+        let line = line_of("type").unwrap_or(1);
+        return Err(FrontmatterError::key_at(
+            line,
+            "type",
+            "has an unknown value",
+            "Use a core type or a type declared by an enabled pack",
+        ));
+    } else if schema.require_declared {
+        let line = line_of("type").unwrap_or(1);
+        return Err(FrontmatterError::key_at(
+            line,
+            "type",
+            "is not a declared record type",
+            "Use a core type or install/enable the pack that declares it",
+        ));
+    } else {
+        // Unknown at load time: keep the ID prefix so path/format checks can
+        // run; `check` reports the unknown/orphan type and the allowlist
+        // fails closed.
+        RecordKind::pack(intern_type_name(type_raw), id.prefix())
+    };
+    // #390: an edge carries only ids, kind, dates, and (in 0.3) `no-ai`, so
+    // a front-matter key outside that set is rejected rather than ignored
+    // like unknown keys elsewhere (spec §4).
     if fields.contains_key("no-ai") {
         let line = line_of("no-ai").unwrap_or(1);
-        if !kind.allows_no_ai() {
+        let policy = match kind {
+            RecordKind::Person => Some(NoAiPolicy::Notes),
+            RecordKind::Note | RecordKind::Deal | RecordKind::Interaction => Some(NoAiPolicy::Full),
+            RecordKind::Org => None,
+            // Edge-level `no-ai` ships with spec 0.3 (#820): it hides the
+            // relation, not either endpoint, and has no `notes` mode.
+            RecordKind::Edge => (schema.spec >= SpecVersion::V03).then_some(NoAiPolicy::Full),
+            // An orphaned pack type has no declaration to consult; accept
+            // the full tri-state so the file still loads for `check` and
+            // the operator. The type gate fails it closed for agents.
+            RecordKind::Pack { .. } => declared.map(|decl| decl.no_ai).or(Some(NoAiPolicy::Notes)),
+        };
+        let Some(policy) = policy else {
             return Err(FrontmatterError::key_at(
                 line,
                 "no-ai",
                 "is not allowed on this record type",
-                "Use no-ai only on person, note, interaction, or deal records",
+                "Use no-ai only on person, note, interaction, deal, or a pack type that declares it",
+            ));
+        };
+        if policy == NoAiPolicy::None {
+            return Err(FrontmatterError::key_at(
+                line,
+                "no-ai",
+                "is not allowed on this record type",
+                "This type does not declare a no-ai mode",
             ));
         }
         let v = fields.get("no-ai").map(String::as_str).unwrap_or("");
-        // Issue #181: `notes` is a third value, valid only on person
-        // records (their notes/interactions default hidden). Anything else
-        // is E_FRONTMATTER, as before.
-        let valid = match kind {
-            RecordKind::Person => v == "true" || v == "false" || v == "notes",
-            _ => v == "true" || v == "false",
+        let allow_notes = policy == NoAiPolicy::Notes;
+        let valid = match v {
+            "true" | "false" => true,
+            "notes" => allow_notes,
+            _ => false,
         };
         if !valid {
             return Err(FrontmatterError::key_at(
                 line,
                 "no-ai",
                 "is not a valid no-ai value",
-                "Use no-ai: true or no-ai: false (no-ai: notes is only valid on person records)",
+                if allow_notes {
+                    "Use no-ai: true, no-ai: false, or no-ai: notes"
+                } else {
+                    "Use no-ai: true or no-ai: false"
+                },
             ));
+        }
+    }
+    // Spec 0.4 record retirement. Before 0.4 `retired` is an unknown key
+    // and is ignored like any other forward-compatible key.
+    if schema.spec >= SpecVersion::V04 {
+        if let Some(key) = fields.keys().find(|key| is_retired_typo(key)) {
+            let line = line_of(key).unwrap_or(1);
+            return Err(FrontmatterError::key_at(
+                line,
+                key,
+                "has a retired key typo",
+                "Use the exact key retired: true or retired: false",
+            ));
+        }
+        if let Some(value) = fields.get("retired") {
+            if value != "true" && value != "false" {
+                let line = line_of("retired").unwrap_or(1);
+                return Err(FrontmatterError::key_at(
+                    line,
+                    "retired",
+                    "is not a valid retired value",
+                    "Use retired: true or retired: false",
+                ));
+            }
         }
     }
     for key in ["date", "session", "since", "until"] {
@@ -643,19 +829,37 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
             }
         }
     }
-    // #390: an edge carries only ids, kind, and dates, so a front-matter key
-    // outside that set is rejected rather than ignored like unknown keys
-    // elsewhere (spec §4). An extra key on an edge has no home, so it is
-    // rejected rather than silently stored.
+    // #390: an edge carries only ids, kind, dates, and (in 0.3) `no-ai`.
+    // An extra key has no home, so it is rejected rather than silently
+    // stored.
     if kind == RecordKind::Edge {
-        const ALLOWED: [&str; 7] = ["id", "type", "a", "b", "kind", "since", "until"];
-        let disallowed = fields.keys().find(|k| !ALLOWED.contains(&k.as_str()));
+        const ALLOWED_03: [&str; 8] = ["id", "type", "a", "b", "kind", "since", "until", "no-ai"];
+        const ALLOWED_04: [&str; 9] = [
+            "id", "type", "a", "b", "kind", "since", "until", "no-ai", "retired",
+        ];
+        let allowed: &[&str] = if schema.spec >= SpecVersion::V04 {
+            &ALLOWED_04
+        } else if schema.spec >= SpecVersion::V03 {
+            &ALLOWED_03
+        } else {
+            &ALLOWED_03[..7]
+        };
+        let disallowed = fields.keys().find(|k| !allowed.contains(&k.as_str()));
         if let Some(key) = disallowed {
             let line = line_of(key).unwrap_or(1);
+            let fix = if schema.spec >= SpecVersion::V04 {
+                "Edge records allow only id, type, a, b, kind, since, until, no-ai, and retired; \
+                 move the context into a note on one of the edge's entities"
+            } else if schema.spec >= SpecVersion::V03 {
+                "Edge records allow only id, type, a, b, kind, since, until, and no-ai; \
+                 move the context into a note on one of the edge's entities"
+            } else {
+                "Edge records allow only id, type, a, b, kind, since, and until; \
+                 move the context into a note on one of the edge's entities"
+            };
             return Err(FrontmatterError::new(
                 "edge record has a front matter key that is not allowed",
-                "Edge records allow only id, type, a, b, kind, since, and until; \
-                 move the context into a note on one of the edge's people",
+                fix,
             )
             .at_line(line));
         }
@@ -667,6 +871,21 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
             "edge records carry no body",
             "Move the context into a note on one of the edge's people",
         ));
+    }
+    if let Some(decl) = declared {
+        if let Some(key) = decl
+            .required_fields
+            .iter()
+            .find(|key| !fields.contains_key(**key))
+        {
+            return Err(FrontmatterError::new(
+                format!("front matter is missing required key '{key}'"),
+                format!(
+                    "Add {key}: to the record; it is required by type '{}'",
+                    decl.name
+                ),
+            ));
+        }
     }
     let name = fields.get("name").cloned().filter(|s| !s.is_empty());
     Ok(Record {
@@ -684,21 +903,41 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
 
 /// Vault-relative path for a main collection record (`people/p-…/profile.md`, …).
 pub fn main_record_path(rec: &Record) -> Result<PathBuf, FrontmatterError> {
-    if rec.id.prefix() != rec.kind.prefix() {
+    main_record_path_with(rec, None)
+}
+
+/// Registry-aware main path. A pack type needs its declaration's collection
+/// and main file; core types fall back to the prefix constants.
+pub fn main_record_path_with(
+    rec: &Record,
+    types: Option<&TypeRegistry>,
+) -> Result<PathBuf, FrontmatterError> {
+    let declared = types.and_then(|types| types.get(rec.kind.as_str()));
+    let (prefix, collection, main) = match declared {
+        Some(decl) => (decl.prefix, decl.collection, decl.main_file),
+        None => {
+            let prefix = rec.kind.prefix();
+            let Some(collection) = prefix.collection() else {
+                return Err(FrontmatterError::new(
+                    "type has no collection path",
+                    "Declare the type in a pack manifest before adding records",
+                ));
+            };
+            let Some(main) = prefix.main_filename() else {
+                return Err(FrontmatterError::new(
+                    "type has no main file",
+                    "Use a record type",
+                ));
+            };
+            (prefix, collection, main)
+        }
+    };
+    if rec.id.prefix() != prefix {
         return Err(FrontmatterError::new(
             "id prefix does not match type",
-            "Use an id whose prefix matches type (p- for person, o- for org, …)",
+            "Use an id whose prefix matches type (p- for person, pl- for a two-letter pack type, …)",
         ));
     }
-    let collection =
-        rec.kind.prefix().collection().ok_or_else(|| {
-            FrontmatterError::new("type has no collection path", "Use a record type")
-        })?;
-    let main = rec
-        .kind
-        .prefix()
-        .main_filename()
-        .ok_or_else(|| FrontmatterError::new("type has no main file", "Use a record type"))?;
     Ok(PathBuf::from(format!("{}/{}/{}", collection, rec.id, main)))
 }
 
@@ -1118,5 +1357,60 @@ mod tests {
             super::frontmatter_line_spec_key("client: p-01M3TC5H00MPJG00"),
             None
         );
+    }
+    #[test]
+    fn edge_no_ai_is_spec_gated_and_has_no_notes_mode() {
+        use crate::config::SpecVersion;
+        use crate::record_type::RecordSchema;
+
+        let edge = |mode: &str| {
+            format!(
+                "---\nid: e-01M3TC5H00MPJG000000000000\ntype: edge\na: p-01M3TC5H00MPJG000000000000\nb: p-01M3TC5H00MPJG000H24000001\nkind: married\nno-ai: {mode}\n---\n"
+            )
+        };
+        let v03 = RecordSchema {
+            spec: SpecVersion::V03,
+            types: None,
+            require_declared: false,
+        };
+        for mode in ["true", "false"] {
+            let rec = super::parse_record_with_schema(&edge(mode), "x.md", &v03).unwrap();
+            assert_eq!(rec.no_ai(), mode == "true");
+        }
+        assert!(super::parse_record_with_schema(&edge("notes"), "x.md", &v03).is_err());
+        let v02 = RecordSchema::core(SpecVersion::V02);
+        assert!(super::parse_record_with_schema(&edge("true"), "x.md", &v02).is_err());
+    }
+
+    #[test]
+    fn retired_key_is_spec_gated_and_typed() {
+        use crate::config::SpecVersion;
+        use crate::record_type::RecordSchema;
+
+        let person = |value: &str| {
+            format!(
+                "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nname: Ada Example\nretired: {value}\n---\n"
+            )
+        };
+        let v04 = RecordSchema::core(SpecVersion::V04);
+        let v03 = RecordSchema::core(SpecVersion::V03);
+        let retired = super::parse_record_with_schema(&person("true"), "x.md", &v04).unwrap();
+        assert!(retired.is_retired());
+        let live = super::parse_record_with_schema(&person("false"), "x.md", &v04).unwrap();
+        assert!(!live.is_retired());
+        assert!(super::parse_record_with_schema(&person("maybe"), "x.md", &v04).is_err());
+        assert!(super::parse_record_with_schema(
+            "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nRetired: true\n---\n",
+            "x.md",
+            &v04
+        )
+        .is_err());
+        // 0.3 ignores the key like any other forward-compatible key.
+        assert!(super::parse_record_with_schema(&person("maybe"), "x.md", &v03).is_ok());
+
+        // The closed edge key set gains `retired` only in 0.4.
+        let edge = "---\nid: e-01M3TC5H00MPJG000000000000\ntype: edge\na: p-01M3TC5H00MPJG000000000000\nb: p-01M3TC5H00MPJG000H24000001\nkind: married\nretired: true\n---\n";
+        assert!(super::parse_record_with_schema(edge, "x.md", &v04).is_ok());
+        assert!(super::parse_record_with_schema(edge, "x.md", &v03).is_err());
     }
 }

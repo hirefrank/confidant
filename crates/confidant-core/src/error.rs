@@ -16,6 +16,12 @@
 
 use std::fmt::{self, Display, Formatter};
 
+/// One clear diagnosis for a vault written by the encrypted Confidant
+/// (≤0.7). Shared by the `doctor` check, the `check` finding, and the
+/// command-level error every agent-facing read returns (#821).
+pub const LEGACY_ENCRYPTED_VAULT_MESSAGE: &str =
+    "this vault was written by an encrypted Confidant ≤0.7; re-create it with `confidant init`.";
+
 /// Stable classification for failures that are not check findings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorKind {
@@ -33,6 +39,10 @@ pub enum ErrorKind {
     Config,
     /// Vault `spec` is not implemented by this CLI.
     SpecUnsupported,
+    /// The vault is the ≤0.7 encrypted shape, which this plaintext-only CLI
+    /// cannot read (#821). Agent-facing reads fail closed instead of
+    /// returning an empty or partial result.
+    VaultLegacyEncrypted,
     /// `find` refuses because a ledger file could not be read.
     LedgerUnreadable,
     /// Flags or arguments cannot be interpreted. Exit 2.
@@ -72,6 +82,7 @@ impl ErrorKind {
             Self::Invalid => "E_INVALID",
             Self::Config => "E_CONFIG",
             Self::SpecUnsupported => "E_SPEC_UNSUPPORTED",
+            Self::VaultLegacyEncrypted => "E_VAULT_LEGACY_ENCRYPTED",
             Self::LedgerUnreadable => "E_LEDGER_UNREADABLE",
             Self::Usage => "usage_error",
             Self::IdempotencyConflict => "E_IDEMPOTENCY_CONFLICT",
@@ -158,10 +169,22 @@ impl DomainError {
     pub fn spec_unsupported(spec: impl Display) -> Self {
         Self::new(
             ErrorKind::SpecUnsupported,
-            format!("vault spec '{spec}' is not supported (this CLI implements 0.1)"),
+            format!(
+                "vault spec '{spec}' is not supported (this CLI implements 0.1, 0.2, 0.3, and 0.4)"
+            ),
         )
-        .with_fix("Use spec = \"0.1\" or upgrade the CLI")
+        .with_fix("Use spec = \"0.1\", \"0.2\", or \"0.3\", or upgrade the CLI")
         .with_file("confidant.toml")
+    }
+
+    /// The vault matches the ≤0.7 encrypted-vault shell. No file, line, or
+    /// id: the sniff returns only a boolean, and the message is the whole
+    /// diagnosis plus remedy (#821).
+    pub fn vault_legacy_encrypted() -> Self {
+        Self::new(
+            ErrorKind::VaultLegacyEncrypted,
+            LEGACY_ENCRYPTED_VAULT_MESSAGE,
+        )
     }
 
     pub fn already_exists(message: impl Into<String>) -> Self {
@@ -402,6 +425,18 @@ mod tests {
             DomainError::spec_unsupported("9.9").code(),
             "E_SPEC_UNSUPPORTED"
         );
+        assert_eq!(
+            DomainError::vault_legacy_encrypted().code(),
+            "E_VAULT_LEGACY_ENCRYPTED"
+        );
+        assert_eq!(DomainError::vault_legacy_encrypted().exit_code(), 1);
+        assert!(DomainError::vault_legacy_encrypted().file().is_none());
+        assert!(DomainError::vault_legacy_encrypted()
+            .message()
+            .contains("encrypted Confidant ≤0.7"));
+        assert!(DomainError::vault_legacy_encrypted()
+            .message()
+            .contains("confidant init"));
         assert_eq!(
             DomainError::ledger_unreadable(2).code(),
             "E_LEDGER_UNREADABLE"

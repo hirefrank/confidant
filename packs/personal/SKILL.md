@@ -1,22 +1,34 @@
 ---
 name: "personal"
-description: "Personal relationships pack (personal@0.2): identity and contact fields, the touch ledger verb, birthdays/dates, keep-in-touch cadence with never/snooze, relationship edge kinds, the capture policy for who belongs in the vault, and every finding code the pack can emit — what each means and what to do about it."
+description: "Personal relationships, places, and things pack (personal@0.3): identity and contact fields, the touch ledger verb, birthdays/dates, keep-in-touch cadence with never/snooze, place/thing records with kind and address, relationship/place/thing edge kinds, the capture policy for what belongs in the vault, and every finding code the pack can emit — what each means and what to do about it."
 ---
 
-# personal@0.2
+# personal@0.3
 
 ## What this pack adds
 
-`personal@0.2` turns Confidant toward personal relationships without adding a
-second record type. People stay core `person` records; the pack owns optional
-fields on them (identity, contact details, relationship, birthdays, dates,
-keep-in-touch cadence), the `touch` ledger verb, relationship edge kinds, and
-two warning-level rules (keep-in-touch cadence, upcoming dates). It works
-alongside any external pack in one vault — a contact can also be a member
-of another pack's workflow, and each pack's data scopes independently
-(#178).
+`personal@0.3` is the 0.4 default personal pack. It keeps the 0.2 person
+schema and adds two entity types, `place` and `thing`, so the vault can hold
+**people you know, places that matter, things you're working on or care
+about, and the moments that connect them.**
 
-The pack is **implicit**: every vault has it, whether or not
+- People stay core `person` records; the pack owns optional fields on them
+  (identity, contact details, relationship, birthdays, dates, keep-in-touch
+  cadence), the `touch` ledger verb, relationship edge kinds, and two
+  warning-level rules.
+- `place` (`pl`, `places/`) and `thing` (`th`, `things/`) are pack-declared
+  entities with required `name` and `kind`, optional `address`/`tags`/`links`,
+  and their own edges. They are not person-like: no aliases, cadence, or
+  touchpoints.
+- It works alongside any external pack in one vault; each pack's data scopes
+  independently (#178).
+
+**Spec 0.4:** `personal@0.3` is active only in a 0.4 vault. Vaults on spec
+0.1–0.3 keep the frozen `personal@0.2`, which is person-only and declares no
+record types. The vault `spec` selects the active built-in version; a
+`personal@…` listing does not choose a version.
+
+The pack is **implicit**: every 0.4 vault has it, whether or not
 `confidant.toml` lists it. A vault that lists an external pack explicitly
 looks like:
 
@@ -27,20 +39,38 @@ packs = ["example-pack@0.1"]
 `packs = []` still enables the personal pack. A `personal@…` entry in
 `packs` is accepted as a no-op.
 
-Personal fields are owned by the pack, the personal edge kinds are known, and
-the cadence/date rules always run. A `touch` line is both a core mirror
-touchpoint and the pack's richer form; the pack owns it.
+**0.2 history.** `personal@0.2` kept the person-only default for spec 0.1–0.3.
+Its breaking changes from 0.1 still apply: the relationship field is
+`relationship` (not `relationship_to_me`), `cadence` accepts `never`, and the
+touch-kind list drops `coffee` (use `meal`).
 
-**0.1 history.** This is the 0.2 contract. The compiled `personal@0.1` pack
-(in place until the #551 cutover) kept the 0.1 field set: it named the
-relationship field `relationship_to_me` and claimed only `birthday`,
-`cadence`, `relationship_to_me`, and `dates`. It is gone; `personal@…`
-listings are no-ops and `personal@0.2` is the only personal pack.
+## Record types
+
+A place or thing earns a record when another record needs to point at it,
+when it has its own relationships, or when it needs a stable name in the
+roster. Otherwise it stays a note.
+
+| Type | Prefix | Collection | Required | Optional |
+|---|---|---|---|---|
+| `place` | `pl` | `places/` | `name`, `kind` | `address`, `tags`, `links` |
+| `thing` | `th` | `things/` | `name`, `kind` | `tags`, `links` |
+
+Suggested `kind` values: for a place, `home`, `work`, `venue`,
+`neighborhood`, `city`, `other`; for a thing, `project`, `object`, `work`,
+`idea`, `vehicle`, `book`, `tool`, `other`. A company is an `org`, not a
+thing. A one-off event is an `interaction` or a note.
+
+Use a note instead when the fact is dated, sensitive, or owned by exactly one
+person/place and never referenced elsewhere. A note carries its own date and
+`no-ai`, so it does not bypass note-level privacy. There is no `notes:` or
+`serial:` field.
 
 ## Fields
 
-All fields are optional, flat front-matter names on `person` records only
-(ADR-2: no nested YAML). None is stored truth: facts stay in the ledger.
+Person fields are optional flat front-matter names on `person` records.
+`place` and `thing` require `name` and `kind`; their other fields are
+optional. Fields are not nested YAML (ADR-2). None is stored truth: facts
+stay in the ledger.
 
 | Field | Grammar | Notes |
 |---|---|---|
@@ -56,6 +86,8 @@ All fields are optional, flat front-matter names on `person` records only
 | `relationship` | non-empty string | How the person relates to the operator (for example `friend`). Renamed from 0.1's `relationship_to_me`. |
 | `cadence` | `<N>d` or `never` | Keep-in-touch interval; `N` is `1..=3650`. `never` means never overdue. |
 | `snooze_until` | `YYYY-MM-DD` | One-off date; suppresses the cadence nudge until then. |
+| `kind` | non-empty string | Primary noun for a place or thing. Required on both types. |
+| `address` | non-empty string | Free-text place address; private context, never geocoded. |
 
 A list value is comma-separated, optionally wrapped in one `[...]`. Entries
 are whitespace-trimmed and non-empty; duplicates are rejected; a comma inside
@@ -75,13 +107,25 @@ the next `MM-DD` on or after `as_of`. A malformed value is `E_FRONTMATTER`.
 
 ## Edge kinds
 
-Core ships `married`, `introduced`, and `colleague`. `personal@0.2` adds:
+Core ships `married`, `introduced`, and `colleague`. `personal@0.3` adds:
 
 - Symmetric: `friend`, `family`, `sibling`, `partner`.
 - Directed: `parent` (`a` is the parent of `b`), `mentor` (`a` mentors `b`).
+- Directed place/thing kinds:
 
-A symmetric kind must not appear twice for the same unordered pair. An edge
-carries no body and no `no-ai`.
+| Kind | `a` | `b` | Meaning |
+|---|---|---|---|
+| `visited` | `person` | `place` | Durable "has been to". |
+| `lives_at` | `person` | `place` | Residence; `since` / `until`. |
+| `owns` | `person` | `thing` | Ownership; `since` / `until`. |
+| `located_at` | `thing` | `place` | Physical location; `since` / `until`. |
+
+`visited` is durable: a second visit is not a second edge; the same ordered
+pair is `E_DUPLICATE_EDGE`. Individual visits are interactions or notes
+attached to the place. `located_at` is only for physical things. A symmetric
+kind must not appear twice for the same unordered pair. An edge carries no
+body; edge-level `no-ai` hides the relation while both endpoints stay
+visible.
 
 ## Verbs
 
@@ -161,6 +205,15 @@ them by analogy.
 The threshold numbers above are defaults the operator can tune; the shape
 is the guidance: meetings in, email earned, silent below threshold,
 overrides both ways.
+
+### Places and things
+
+Use the same proposal discipline: propose, confirm, apply. Promote a place or
+thing only when another record needs to point at it, when it has its own
+relationships, or when it needs a stable name in the roster. A one-off fact
+stays a note. Give every place/thing one primary `kind`; put cross-cutting
+labels in `tags`. A company is an `org`; a one-off event is an `interaction`
+or a note. Do not create a `thing` for every object mentioned in passing.
 
 ## Configuration ([checks] keys)
 
@@ -260,13 +313,21 @@ can act on it. This is a nudge, not a task, and it never blocks a write.
   `no-ai: notes` keeps the person visible while their notes and
   interactions default to hidden (spec §13). An explicit `no-ai: false` on
   a child overrides the inherited default.
-- **Scope pack reads.** `--packs personal@0.2` limits reads to core and
-  personal-owned items. Personal fields, `touch` lines, and personal edge
-  kinds appear only when the pack is in scope (#178).
+- **Places and things are `no_ai: "full"` only.** `no-ai: true` hides the
+  place/thing and every edge touching it; `no-ai: false` keeps it visible.
+  There is no `no_ai: notes` mode for them. An uncleared place or thing
+  returns no agent `context` bundle at all, not an empty one. The operator
+  path still sees it with the badge.
+- **Address is private.** `context --exclude-private` strips `address`,
+  `tags`, and `links`; `kind` stays as the type marker.
+- **Scope pack reads.** `--packs personal@0.3` limits reads to core and
+  personal-owned items in a 0.4 vault; `personal@0.2` remains a no-op alias.
+  Personal fields, `touch` lines, and personal edge kinds appear only when
+  the pack is in scope (#178).
 - **The ledger line is plaintext.** A `touch` line carries only the date, the
   verb, the person's own ID, and a kind from the closed list — no other
   participant, no prose. Detail that does not fit the line goes in a note
   via `--note`; every record, notes included, is plaintext on disk.
-- **Fake data only.** Never place real names, emails, phone numbers, or notes
-  in tests, fixtures, docs, or examples. Use `Ada Example`, `Bea Demo`, and
-  fake ULIDs.
+- **Fake data only.** Never place real names, emails, phone numbers, places,
+  things, or notes in tests, fixtures, docs, or examples. Use `Ada Example`,
+  `Bea Demo`, `Example Studio`, `Example Bicycle`, and fake ULIDs.

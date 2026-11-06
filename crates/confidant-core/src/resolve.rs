@@ -113,6 +113,9 @@ pub fn resolve_person(vault: &Vault, query: &str) -> Result<PersonMatch, PersonR
     // `no-ai: true` person — working exactly as before.
     if let Ok(id) = RecordId::parse(query) {
         return match vault.records.get(&id) {
+            // A retired record is not an entity for any read. The miss is
+            // indistinguishable from an absent id (no existence oracle).
+            Some(_record) if vault.is_retired(&id) => Err(PersonResolveError::NotFound),
             Some(record) if record.kind == RecordKind::Person => Ok(PersonMatch {
                 id,
                 matched_by_name: false,
@@ -279,6 +282,13 @@ fn links_field_contains(record: &crate::record::Record, needle: &str) -> bool {
 /// canonicalize, and a name lookup needs a unique display name).
 /// It exposes no merge map and no canonicalization machinery.
 pub fn canonical_person_id(vault: &Vault, id: &RecordId) -> RecordId {
+    canonical_record_id(vault, id)
+}
+
+/// The merge-canonical id for any record type. Used by writes that must
+/// refuse a merged-away member (`record retire`), and by
+/// [`canonical_person_id`].
+pub fn canonical_record_id(vault: &Vault, id: &RecordId) -> RecordId {
     let as_of = resolve_as_of_date(vault);
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
     let mut merge_findings = Vec::new();
@@ -341,6 +351,45 @@ mod tests {
 
     const ADA: &str = "p-01J9Z3K4QF0000000000000000";
     const BEA: &str = "p-01J9Z3K4QF0000000000000002";
+
+    /// #814: a pack-declared entity type is a context target, never a
+    /// person name/alias match. The retired tombstone keeps its record
+    /// parseable without a pack directory.
+    #[test]
+    fn pack_types_do_not_resolve_as_people() {
+        let (_tmp, root) = vault("pack-type", |root| {
+            let place = "pl-01J9Z3K4QF0000000000000001";
+            let dir = root.join("places").join(place);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("place.md"),
+                "---\nid: pl-01J9Z3K4QF0000000000000001\ntype: place\nname: Example Studio\n---\n",
+            )
+            .unwrap();
+        });
+        std::fs::write(
+            root.join("confidant.toml"),
+            "spec = \"0.3\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n\
+             [[retired_types]]\nname = \"place\"\nid_prefix = \"pl\"\n\
+             collection = \"places\"\nmain_file = \"place.md\"\nentity = true\n\
+             person_like = false\nno_ai = \"full\"\nroster = true\n\
+             removed_pack = \"place-pack@0.1\"\n",
+        )
+        .unwrap();
+        let vault = load(&root);
+        assert_eq!(
+            resolve_person(&vault, "Example Studio"),
+            Err(PersonResolveError::NotFound)
+        );
+        assert_eq!(
+            resolve_person(&vault, "pl-01J9Z3K4QF0000000000000001"),
+            Err(PersonResolveError::NotFound)
+        );
+        assert_eq!(
+            resolve_alias(&vault, "name", "Example Studio"),
+            Err(PersonResolveError::NotFound)
+        );
+    }
 
     #[test]
     fn resolves_by_exact_name_and_by_id() {
@@ -744,6 +793,22 @@ mod tests {
         let vault = load(&root);
         assert_eq!(
             resolve_alias(&vault, "email", "ada@example.com"),
+            Err(PersonResolveError::NotFound)
+        );
+    }
+
+    #[test]
+    fn retired_person_does_not_resolve_by_name_or_id() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/vaults/corrections-0.4");
+        let vault = load(&root);
+        let retired = "p-01M3TC5H00MPJG001248000002";
+        assert_eq!(
+            resolve_person(&vault, "Cam Retired"),
+            Err(PersonResolveError::NotFound)
+        );
+        assert_eq!(
+            resolve_person(&vault, retired),
             Err(PersonResolveError::NotFound)
         );
     }

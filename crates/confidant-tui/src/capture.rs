@@ -1,7 +1,7 @@
-//! Quick capture (#556 phase 3): `s` session, `t` touch, `n` note, plus the
+//! Quick capture (#556 phase 3): `t` touch, `n` note, plus the
 //! `a` new-person form (#621).
 //!
-//! Each capture collects the fields the CLI needs. `s`/`t`/`n` pre-fill the
+//! Each capture collects the fields the CLI needs. `t`/`n` pre-fill the
 //! selected person's opaque id so the operator never types a ULID; `a` is the
 //! one surface that mints a fresh `p-<ULID>` for a brand-new person (see
 //! [`crate::ids`]). Nothing is written until the operator confirms the CLI's
@@ -24,8 +24,6 @@ use crate::apply::DryRunChange;
 /// Which quick-capture surface is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureKind {
-    /// `log session <person> <duration> [tag] [--note …]`.
-    Session,
     /// `log touch <person> <kind> [--note …]`.
     Touch,
     /// `note add --person <person> … --body-file <scratch>`.
@@ -40,7 +38,6 @@ impl CaptureKind {
     /// The modal title.
     pub fn title(self) -> &'static str {
         match self {
-            Self::Session => "Log session",
             Self::Touch => "Log touch",
             Self::Note => "Add note",
             Self::NewPerson => "New person",
@@ -50,7 +47,6 @@ impl CaptureKind {
     /// The noun used in result messages.
     pub fn noun(self) -> &'static str {
         match self {
-            Self::Session => "session",
             Self::Touch => "touch",
             Self::Note => "note",
             Self::NewPerson => "person",
@@ -66,22 +62,6 @@ impl CaptureKind {
     /// The fields this surface collects, in focus order.
     fn fields(self) -> Vec<CaptureField> {
         match self {
-            Self::Session => vec![
-                text(FieldId::Duration, "duration", true, "60m or 1h30m"),
-                text(
-                    FieldId::Tag,
-                    "tag",
-                    false,
-                    "paid | pps | comp (blank for none)",
-                ),
-                text(FieldId::Date, "date", false, "YYYY-MM-DD (blank for today)"),
-                text(
-                    FieldId::NoteText,
-                    "note",
-                    false,
-                    "inline note (blank for none)",
-                ),
-            ],
             Self::Touch => vec![
                 text(
                     FieldId::TouchKind,
@@ -108,7 +88,7 @@ impl CaptureKind {
                 toggle(FieldId::NoAi, "no-ai", "space toggles (hide from agents)"),
             ],
             // The pack's optional person front-matter fields the CLI accepts
-            // (personal@0.2) plus the profile body. `aliases` is *not* a
+            // (the active personal pack, 0.2 or 0.3) plus the profile body. `aliases` is *not* a
             // front-matter field — aliases are ledger lines managed by
             // `confidant alias` — so it is deliberately absent here.
             Self::NewPerson => vec![
@@ -150,8 +130,6 @@ pub enum CapturePhase {
 /// Identifies a field without depending on its display label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldId {
-    Duration,
-    Tag,
     Date,
     TouchKind,
     NoteText,
@@ -216,7 +194,7 @@ fn toggle(id: FieldId, label: &'static str, hint: &'static str) -> CaptureField 
 /// The in-flight quick capture.
 ///
 /// Field values and the dry-run `preview` hold operator plaintext (a note
-/// body, session note text), so the manual [`std::fmt::Debug`] impl redacts
+/// body, touch note text), so the manual [`std::fmt::Debug`] impl redacts
 /// them: nothing here may reach logs or a panic message.
 #[derive(Clone, PartialEq)]
 pub struct Capture {
@@ -228,7 +206,7 @@ pub struct Capture {
     pub phase: CapturePhase,
     pub preview: Vec<DryRunChange>,
     /// The staged note body, for `note add --body-file`. `None` for the
-    /// inline surfaces (session/touch), whose note travels as an argument.
+    /// inline touch surface, whose note travels as an argument.
     /// For a new person it is the composed record staged for `record add
     /// --file`.
     pub scratch: Option<PathBuf>,
@@ -356,21 +334,6 @@ impl Capture {
     /// preview and omits it for the confirmed write.
     pub fn argv(&self, scratch: Option<&str>) -> Vec<String> {
         match self.kind {
-            CaptureKind::Session => {
-                let mut argv = vec![
-                    "log".to_owned(),
-                    "session".to_owned(),
-                    self.person_id.clone(),
-                    self.value(FieldId::Duration).trim().to_owned(),
-                ];
-                let tag = self.value(FieldId::Tag).trim();
-                if !tag.is_empty() {
-                    argv.push(tag.to_owned());
-                }
-                push_opt(&mut argv, "--date", self.value(FieldId::Date).trim());
-                push_opt(&mut argv, "--note", self.value(FieldId::NoteText));
-                argv
-            }
             CaptureKind::Touch => {
                 let mut argv = vec![
                     "log".to_owned(),
@@ -491,40 +454,6 @@ mod tests {
     }
 
     #[test]
-    fn session_argv_prefills_person_and_orders_positionals() {
-        let mut capture = Capture::new(
-            CaptureKind::Session,
-            "p-01ABC".to_owned(),
-            Some("Ada Example".to_owned()),
-        );
-        capture.fields[0].value = "60m".to_owned();
-        capture.fields[1].value = "paid".to_owned();
-        capture.fields[2].value = "2026-10-13".to_owned();
-        capture.fields[3].value = "discussed goals".to_owned();
-        assert_eq!(
-            capture.argv(None),
-            s(&[
-                "log",
-                "session",
-                "p-01ABC",
-                "60m",
-                "paid",
-                "--date",
-                "2026-10-13",
-                "--note",
-                "discussed goals",
-            ])
-        );
-    }
-
-    #[test]
-    fn session_argv_omits_blank_optional_fields() {
-        let mut capture = Capture::new(CaptureKind::Session, "p-01ABC".to_owned(), None);
-        capture.fields[0].value = " 45m ".to_owned();
-        assert_eq!(capture.argv(None), s(&["log", "session", "p-01ABC", "45m"]));
-    }
-
-    #[test]
     fn touch_argv_carries_person_kind_date_and_note() {
         let mut capture = Capture::new(CaptureKind::Touch, "p-01ABC".to_owned(), None);
         capture.fields[0].value = "meal".to_owned();
@@ -569,7 +498,7 @@ mod tests {
         );
         assert_eq!(capture.kind.noun(), "person");
         assert!(capture.kind.stages_scratch());
-        assert!(!CaptureKind::Session.stages_scratch());
+        assert!(!CaptureKind::Touch.stages_scratch());
     }
 
     #[test]
@@ -614,13 +543,13 @@ mod tests {
 
     #[test]
     fn required_fields_gate_the_preview() {
-        let mut capture = Capture::new(CaptureKind::Session, "p-01ABC".to_owned(), None);
-        assert_eq!(capture.first_missing(), Some("duration"));
-        capture.fields[0].value = "60m".to_owned();
+        let mut capture = Capture::new(CaptureKind::Touch, "p-01ABC".to_owned(), None);
+        assert_eq!(capture.first_missing(), Some("kind"));
+        capture.fields[0].value = "meal".to_owned();
         assert_eq!(capture.first_missing(), None);
         // Whitespace is not a value.
         capture.fields[0].value = "   ".to_owned();
-        assert_eq!(capture.first_missing(), Some("duration"));
+        assert_eq!(capture.first_missing(), Some("kind"));
     }
 
     #[test]

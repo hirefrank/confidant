@@ -1,0 +1,12 @@
+{
+  "findings": [],
+  "ok": true,
+  "schema_version": "1",
+  "spec": "0.4",
+  "summary": {
+    "errors": 0,
+    "ledger_entries": 10,
+    "records": 5,
+    "warnings": 0
+  }
+}

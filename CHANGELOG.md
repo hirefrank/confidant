@@ -9,9 +9,39 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 ## [Unreleased]
 
 ### Breaking
+- Removed the top-level `confidant log session` command and the MCP `log_session` tool; the TUI's `s` session capture is gone too (#799 step 2). `confidant log touch` remains the core personal write. A pack that declares a `session` verb (a coaching/CRM pack) logs it through `confidant import --file`, the shared pack-verb path, driven by the pack's skill. The pack `session` verb and the `ledger-balance` / `session-checks` / `activity-gap` rule kinds are unchanged. The write-response `command` enum no longer contains `log-session` and now contains `log-touch`.
+
+### Added
+- Spec 0.4 ledger corrections and record retirement (#746): `confidant retract` appends an attributed `retract` line that supersedes an existing ledger line without editing it, `confidant correct` appends a replacement plus the retraction in one commit, and `confidant record retire|unretire` toggles the `retired` front-matter state. `check`/`find`/`allowlist`/`context`/`record list`/`resolve` skip superseded lines; a retired record leaves agent reads while `record list --for-operator` still shows it with a badge. `find --json` ledger hits carry a stable `ref`. Bulk `retract --verb/--match-date/--keep` clears a duplicate batch in one commit. The TUI badges retired records in operator mode and stays read-only for corrections; ADR-20, `docs/privacy.md`, and `docs/threat-model-agents.md` document the model.
+- Spec 0.4 default personal schema (#745): `personal@0.3` is the built-in personal pack for 0.4, adding `place` (`pl`, `places/`) and `thing` (`th`, `things/`) entities with required `name`/`kind`, optional `address`/`tags`/`links`, `no_ai = "full"`, and the `visited` / `lives_at` / `owns` / `located_at` edges. 0.1–0.3 keep the frozen person-only `personal@0.2`; the vault `spec` selects the version, and a `personal@…` listing remains a no-op. `context` exposes a non-person-like entity's declared fields in `entity.fields`, `--exclude-private` strips `address`/`tags`/`links`, and an uncleared place/thing returns no agent bundle at all. The built-in version selection, the `kind` core-key precedence fix, the `testdata/vaults/personal-0.4` fixture/golden, and the CLI/TUI contract coverage are included. A 0.4-compatible external pack cannot claim the built-in `place`/`thing` names, prefixes, or collections.
+- Spec 0.3 pack-declared record types (#814): a v3 pack manifest may claim `[[record_types]]` with a two-letter ID prefix, collection, main file, entity/person-like flags, `no_ai` policy, roster visibility, and required/optional fields. `record add`/`edit`/`list`, `context`, `schema`, `allowlist`, `find`, and MCP `note_add` accept these types; `entity:` attaches notes and interactions to any declared entity. The built-in `personal@0.2` pack stays person-only in 0.3; spec 0.4 selects `personal@0.3` (above). A checked-in `testdata/vaults/place-0.3` fixture and golden cover an external place pack, an `entity:` note, a hidden edge, and the pack pin.
+- Spec 0.3 edge-level `no-ai` (#820): an edge may carry `no-ai: true` / `false`. A hidden edge is omitted from every agent read while both endpoints stay visible; the operator path still sees it and `context` badges it. Orgs remain `no-ai`-free; 0.2 vaults reject the edge key with `E_FRONTMATTER`.
+
+### Fixed
+- Re-running `confidant init` on an existing vault no longer resets a per-vault git identity in `<vault>/.git/config` to `Confidant Operator`; the neutral identity is written only for keys the vault has not set, so the override the `FALLBACK_GIT_NAME` docs describe survives. `init --help` and the init comments now describe the always-neutral default instead of "only when git has no identity". (#845)
+- An edge with an unrecognized `kind` now lists the valid kinds for the vault in the `E_UNKNOWN_EDGE_KIND` fix instead of only suggesting enabling the pack that defines it; the pack suggestion stays for a kind owned by a disabled pack (`W_PACK_ORPHAN`). (#846)
+
+## [0.8.0] - 2026-11-01
+
+### Breaking
 - Confidant is plaintext-only. `crates/confidant-crypt`, the encrypted vault format (spec §14), OS keychain storage, HMAC alias hashing, recovery keys, the encrypted `inbox` queue and its `[trust]` signers, and the `reindex` decryption pipeline are removed. Records are plaintext on disk and in git history; the privacy boundary is the operator's encrypted disk, a private remote, and `no-ai` on agent-readable output (#795).
 - Removed commands: `confidant keys`, `recover`, `reset`, `inbox`, and `reindex`; `alias add` is gone, and `alias resolve` now matches the plain front-matter contact fields (`emails`/`phones`/`links`/`handles`) and names. `E_PLAINTEXT_REMOTE` is gone, so `sync --push` works against any git remote.
 - A vault written by an encrypted Confidant (0.7.x and earlier) must be re-created with `confidant init`; there is no migration. The now-unknown `[crypto]` table is ignored, and the retired finding codes (`E_KEY_COMMITMENT`, `E_ENVELOPE`, `E_REINDEX_REFUSED`, `E_PLAINTEXT_REMOTE`, `E_INBOX_*`, `E_ALIAS_PLAINTEXT`, `E_ALIAS_COLLISION`, `W_SKIPPED_ENCRYPTED`, `W_PARTIAL_RESULTS`) are reserved and must not be reused by packs.
+
+### Added
+- Entity edge endpoints (spec 0.2, #813): an edge's `a` / `b` may now be person or org IDs, constrained by the edge kind. 0.2 core kinds add `works_at`, `founder_of`, `investor_in`, and `advisor_to` (directed person→org); pack `[[edge_kinds]]` gain optional `from` / `to` type arrays (absent means the historical person↔person rule, and symmetric kinds must declare equal sets). 0.1 vaults are unchanged and still readable; `confidant init` now writes `spec = "0.2"`, and an existing vault opts in by changing that one line. In 0.2, `check` canonicalizes merge mappings for `E_SELF_EDGE` / `E_DUPLICATE_EDGE`; 0.1 keeps the raw comparison. A pack that declares a non-person endpoint must add `"0.2"` to `requires_spec`, or a 0.1 vault rejects it with `E_PACK_VERSION`.
+- `context <id>` accepts a person or org and returns an entity bundle with an `edges` array (#813). `entity` is the canonical target view; `person` remains a deprecated alias for person targets and is omitted for orgs. Org bundles include edges and records linked by `org:`, and are filtered by pack scope. Edges are merge-canonicalized and appear only when both endpoints are cleared; `--exclude-private` strips endpoint names while keeping opaque ids, kinds, and dates.
+- `record list` now defaults to every identity kind (`person`, `org`, `deal`) and accepts `--kind all`, so orgs are visible without already knowing to pass `--kind org`; `--kind person` keeps the people-only view. The roster JSON adds a `kinds` array, and `schema --json` documents the roster shape. `record list` remains operator-only and is still not an MCP tool.
+- The demo vault is spec 0.2 and now carries Example Studio plus Dana Example's `works_at` person→org edge, giving `context`, `record list`, and `find` a fake org fixture.
+- `confidant setup` installs a system-of-record declaration into each detected agent's always-on instruction file (`.claude/CLAUDE.md`, `.codex/AGENTS.md`, `~/.cursor/rules/confidant.mdc`, and the equivalents for the other supported agents), reports every path and the exact text, and preserves text outside its marked block. The declaration covers the claim, vault and CLI access path, read routing through `resolve`/`context`, `find`, and QMD, write routing through the CLI (dry-run → confirm → apply), the `no-ai` boundary, and failure honesty; `confidant routing` prints the same text (#727). `--no-instructions` skips the files and `--dry-run` writes nothing.
+- `confidant status` is a one-screen readiness rollup covering CLI/TUI versions, vault discovery and writability, skill links, the system-of-record rule, git state, QMD corpus state, and binary staleness, plus the completion brief for the install (vault, machine, fleet, perimeter, sync posture, search, standing orders, work discipline, and 3–5 routines). Optional layers report `absent`, never a false `ok`; it exits 1 when a required check is not ok (#716, #733).
+- `doctor` gains a summary count and a `system-of-record` check; `vault-access` reports the permission-bit answer without attempting a write (#716).
+
+### Changed
+- The personal context view's contact classification now comes from the pack's declared `cadence-overdue` `event_verbs`, not a core `touch || session` literal (#799 step 1). `log session` and its fate are unchanged.
+
+### Fixed
+- A vault written by the encrypted Confidant (≤0.7) now fails closed on every read path: `check` reports one `E_VAULT_LEGACY_ENCRYPTED` finding instead of a parse-error stream, and `find`, `context`, `allowlist`, `resolve`, and `alias resolve` return the same code instead of an empty or partial result (#821).
 
 ## [0.7.2] - 2026-10-30
 
@@ -733,7 +763,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/hirefrank/confidant/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/hirefrank/confidant/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/hirefrank/confidant/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/hirefrank/confidant/compare/v0.6.2...v0.7.0

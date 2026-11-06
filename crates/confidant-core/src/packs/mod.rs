@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::NaiveDate;
 
 use crate::check::{Finding, MergeMap};
+use crate::config::SpecVersion;
 use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
 use crate::vault::{SourcedEntry, Vault};
@@ -37,33 +38,125 @@ pub mod untrusted;
 
 pub use registry::PackRegistry;
 
-/// One edge kind a pack owns (#179). `name` is the `kind` front-matter
-/// value on an edge record; `symmetric` declares whether the relation
-/// reads the same in both directions (`married` is symmetric, `introduced`
-/// is directed). The kind list is closed: an edge whose kind no core or
-/// enabled pack claims is a `check` error, not free text.
+/// The entity endpoint set for a person (`a`/`b` may be `p-` IDs).
+pub const PERSON_ENDPOINT: &[Prefix] = &[Prefix::Person];
+/// The entity endpoint set for an org (`a`/`b` may be `o-` IDs).
+pub const ORG_ENDPOINT: &[Prefix] = &[Prefix::Org];
+
+/// One edge kind a pack owns (#179, #813). `name` is the `kind`
+/// front-matter value on an edge record; `symmetric` declares whether the
+/// relation reads the same in both directions (`married` is symmetric,
+/// `introduced` is directed). `from`/`to` are the endpoint type sets for
+/// `a`/`b`: a kind is the schema for which entity types its ends may hold.
+/// The kind list is closed: an edge whose kind no core or enabled pack
+/// claims is a `check` error, not free text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EdgeKind {
     pub name: &'static str,
     pub symmetric: bool,
+    /// Allowed endpoint types for `a`.
+    pub from: &'static [Prefix],
+    /// Allowed endpoint types for `b`.
+    pub to: &'static [Prefix],
 }
 
-/// Edge kinds core ships (#179). Packs add their own via
-/// [`Pack::edge_kinds`].
-pub const CORE_EDGE_KINDS: &[EdgeKind] = &[
+impl EdgeKind {
+    /// Whether `a`/`b` match this kind's endpoint declaration.
+    pub fn allows(&self, a: Prefix, b: Prefix) -> bool {
+        self.from.contains(&a) && self.to.contains(&b)
+    }
+}
+
+/// Edge kinds core ships in 0.1 (#179). Packs add their own via
+/// [`Pack::edge_kinds`]. These are person↔person only; 0.2 keeps them
+/// unchanged and adds the person→org kinds below.
+pub const CORE_EDGE_KINDS_0_1: &[EdgeKind] = &[
     EdgeKind {
         name: "married",
         symmetric: true,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
     },
     EdgeKind {
         name: "introduced",
         symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
     },
     EdgeKind {
         name: "colleague",
         symmetric: true,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
     },
 ];
+
+/// Edge kinds core ships in 0.2 (#813): the 0.1 kinds plus directed
+/// person→org relations.
+pub const CORE_EDGE_KINDS_0_2: &[EdgeKind] = &[
+    EdgeKind {
+        name: "married",
+        symmetric: true,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
+    },
+    EdgeKind {
+        name: "introduced",
+        symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
+    },
+    EdgeKind {
+        name: "colleague",
+        symmetric: true,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
+    },
+    EdgeKind {
+        name: "works_at",
+        symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: ORG_ENDPOINT,
+    },
+    EdgeKind {
+        name: "founder_of",
+        symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: ORG_ENDPOINT,
+    },
+    EdgeKind {
+        name: "investor_in",
+        symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: ORG_ENDPOINT,
+    },
+    EdgeKind {
+        name: "advisor_to",
+        symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: ORG_ENDPOINT,
+    },
+];
+
+/// The core edge kinds for a vault spec. 0.1 is frozen: the new
+/// person→org kinds are 0.2-only, so a 0.1 vault still reports `works_at`
+/// as `E_UNKNOWN_EDGE_KIND`.
+pub fn core_edge_kinds(spec: SpecVersion) -> &'static [EdgeKind] {
+    match spec {
+        SpecVersion::V01 => CORE_EDGE_KINDS_0_1,
+        SpecVersion::V02 | SpecVersion::V03 | SpecVersion::V04 => CORE_EDGE_KINDS_0_2,
+    }
+}
+
+/// Whether `name` is any core edge kind, across every frozen spec version.
+/// External packs may never claim one, even a kind the newest spec no
+/// longer ships.
+pub fn is_core_edge_kind(name: &str) -> bool {
+    CORE_EDGE_KINDS_0_1
+        .iter()
+        .chain(CORE_EDGE_KINDS_0_2)
+        .any(|kind| kind.name == name)
+}
 
 /// Pack-owned state produced by [`Pack::fold`].
 ///
@@ -83,7 +176,7 @@ pub trait PackState {
 /// `context_view` methods receive the state this pack's `fold` produced.
 pub trait Pack: Send + Sync {
     /// The `name@version` string as listed in `confidant.toml`, e.g.
-    /// `"coaching@0.1"`.
+    /// `"example-pack@0.1"`.
     fn name(&self) -> &'static str;
     /// Ledger verbs this pack defines (e.g. `open`, `session`).
     fn verbs(&self) -> &'static [&'static str];
@@ -91,9 +184,23 @@ pub trait Pack: Send + Sync {
     /// Core kinds (`person`, `org`, `deal`, `interaction`, `note`, `edge`)
     /// are never claimed; a pack that introduces a new kind claims it here.
     fn record_types(&self) -> &'static [&'static str];
+
+    /// Full declarations for the types this pack owns (spec 0.3). The default
+    /// keeps compiled packs that only claim names (none today) source
+    /// compatible.
+    fn record_type_decls(&self) -> &'static [crate::record_type::RecordTypeDecl] {
+        &[]
+    }
     /// Front-matter fields this pack owns on shared records (flat names,
     /// e.g. `birthday`). Namespace only on conflict (#177 Q1).
     fn fields(&self) -> &'static [&'static str];
+    /// The grammar a declared field uses (spec §6), when the pack is
+    /// declarative. `context` uses it to emit a non-person-like entity's
+    /// fields with the same typed shapes as validation (#745). Defaults to
+    /// no grammar for packs that only claim field names.
+    fn field_grammar(&self, _field: &str) -> Option<&'static str> {
+        None
+    }
     /// Balance metrics this pack verifies on `balance` lines.
     fn balance_metrics(&self) -> &'static [&'static str];
     /// Ledger verbs this pack's `ledger-balance` rules use to open units
@@ -102,22 +209,11 @@ pub trait Pack: Send + Sync {
     fn balance_open_verbs(&self) -> &'static [&'static str] {
         &[]
     }
-    /// Edge kinds this pack owns (#179). Core ships
-    /// [`CORE_EDGE_KINDS`]; a pack that introduces a kind claims it here.
+    /// Edge kinds this pack owns (#179). Core ships the per-spec lists in
+    /// [`core_edge_kinds`]; a pack that introduces a kind claims it here.
     /// Defaults to none.
     fn edge_kinds(&self) -> &'static [EdgeKind] {
         &[]
-    }
-    /// Billing tags this pack's `session-checks` rules declare (#747
-    /// round 3). Only rules whose `verb` is `session` count: a rule
-    /// checking another verb's lines does not change what `log
-    /// session` accepts. Defaults to none — a pack without a
-    /// `session-checks` rule for `session` has no opinion, and the
-    /// caller falls back to [`crate::ledger::SESSION_TAGS`].
-    /// Manifest packs override this from their manifest; other packs
-    /// keep the default.
-    fn session_billing_tags(&self) -> Vec<String> {
-        Vec::new()
     }
     /// Finding codes this pack's rules can emit (its `fold`, `findings`,
     /// and `check_balance` implementations). Every code listed here must
@@ -190,10 +286,10 @@ pub trait Pack: Send + Sync {
     /// ships with the binary; an external pack's bytes were read from the
     /// vault. The label that marks agent-facing external-pack text keys on
     /// this, never on the pack's name — an external pack whose base name
-    /// matches a compiled pack (`coaching@0.9` next to `coaching@0.1`) is
-    /// still external. Defaults to compiled-in; the runtime declarative
-    /// pack ([`manifest_pack::ManifestPack`]) carries the manifest's
-    /// origin.
+    /// matches a compiled pack (`example-pack@0.9` next to
+    /// `example-pack@0.1`) is still external. Defaults to compiled-in; the
+    /// runtime declarative pack ([`manifest_pack::ManifestPack`]) carries
+    /// the manifest's origin.
     fn origin(&self) -> manifest::PackOrigin {
         manifest::PackOrigin::CompiledIn
     }
@@ -211,8 +307,8 @@ pub trait Pack: Send + Sync {
     }
     /// The kind of `context` view this pack serves, if any (#594, spec
     /// §13.9). Defaults to `None`. This is a secondary guard: `context`
-    /// only populates the legacy `coaching` alias from the pack named
-    /// `coaching` (any origin) that also reports the
+    /// only populates the legacy "coaching" compatibility alias from the
+    /// pack that carries that base name (any origin) and also reports the
     /// [`crate::context::ledger_sessions::LEDGER_SESSIONS_VIEW`] kind, so a
     /// `[context]` pack under another name serves its own `packs` entry but
     /// never the alias. `None` for every pack that serves no core view.
@@ -253,7 +349,7 @@ pub(crate) fn pack_manifests_for_config() -> Vec<&'static manifest::PackManifest
 }
 
 /// The parsed manifest for a compiled or built-in pack, by `name@version`
-/// (e.g. `"coaching@0.1"`). Used by the CLI's drift tests to check
+/// (e.g. `"example-pack@0.1"`). Used by the CLI's drift tests to check
 /// manifest text against the embedded SKILL.md (#345).
 pub fn pack_manifest(name: &str) -> Option<&'static manifest::PackManifest> {
     pack_manifests_for_config()
@@ -303,41 +399,11 @@ pub fn resolve_enabled<'a>(
     (found, unknown)
 }
 
-/// The billing-tag vocabulary `log session` accepts for this vault
-/// (#747 round 3): the union, in enabled-pack order, of every enabled
-/// pack's `session-checks` tags for verb `session`, deduplicated. When
-/// no enabled pack declares any (the implicit personal pack has no
-/// `session-checks` rule, so this is the common case), this is the core
-/// default [`crate::ledger::SESSION_TAGS`]. The union is deliberate:
-/// tag validation at log time is permissive across packs, while each
-/// pack's own `session-checks` rule still counts only its declared
-/// tags at `check` time, so a tag valid in one pack but not another is
-/// accepted at log time and flagged by the stricter pack's check, never
-/// silently dropped. Unknown pack listings contribute nothing (they
-/// are reported elsewhere as orphans); a pack whose manifest fails to
-/// load is not enabled, so its tags cannot widen validation.
-pub fn session_billing_tags_for_vault(vault: &Vault) -> Vec<String> {
-    let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
-    let mut tags: Vec<String> = Vec::new();
-    for pack in enabled {
-        for tag in pack.session_billing_tags() {
-            if !tag.trim().is_empty() && !tags.contains(&tag) {
-                tags.push(tag);
-            }
-        }
-    }
-    if tags.is_empty() {
-        tags = crate::ledger::SESSION_TAGS
-            .iter()
-            .map(|t| t.to_string())
-            .collect();
-    }
-    tags
-}
-
-/// A claim two packs make on the same verb, record type, field, balance
-/// metric, or edge kind. `kind` is one of `"verb"`, `"record type"`,
-/// `"field"`, `"balance metric"`, `"edge kind"`.
+/// A claim two packs make on the same verb, record type, record-type prefix,
+/// record-type collection, field, balance metric, or edge kind. `kind` is one
+/// of `"verb"`, `"record type"`, `"record type prefix"`,
+/// `"record type collection"`, `"field"`, `"balance metric"`,
+/// `"edge kind"`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackConflict {
     pub kind: &'static str,
@@ -356,6 +422,8 @@ pub fn find_conflict(packs: &[&dyn Pack]) -> Option<PackConflict> {
     let mut seen_metrics: HashMap<&'static str, &'static str> = HashMap::new();
     let mut seen_edge_kinds: HashMap<&'static str, &'static str> = HashMap::new();
     let mut seen_codes: HashMap<&'static str, &'static str> = HashMap::new();
+    let mut seen_type_prefixes: HashMap<&'static str, &'static str> = HashMap::new();
+    let mut seen_type_collections: HashMap<&'static str, &'static str> = HashMap::new();
     for pack in packs {
         for (kind, claims, seen) in [
             ("verb", pack.verbs(), &mut seen_verbs),
@@ -364,6 +432,30 @@ pub fn find_conflict(packs: &[&dyn Pack]) -> Option<PackConflict> {
             ("balance metric", pack.balance_metrics(), &mut seen_metrics),
         ] {
             for claim in claims {
+                if let Some(first) = seen.get(claim) {
+                    return Some(PackConflict {
+                        kind,
+                        name: claim,
+                        first,
+                        second: pack.name(),
+                    });
+                }
+                seen.insert(claim, pack.name());
+            }
+        }
+        for decl in pack.record_type_decls() {
+            for (kind, claim, seen) in [
+                (
+                    "record type prefix",
+                    decl.id_prefix,
+                    &mut seen_type_prefixes,
+                ),
+                (
+                    "record type collection",
+                    decl.collection,
+                    &mut seen_type_collections,
+                ),
+            ] {
                 if let Some(first) = seen.get(claim) {
                     return Some(PackConflict {
                         kind,
@@ -488,6 +580,8 @@ mod tests {
             &[EdgeKind {
                 name: "mentor",
                 symmetric: false,
+                from: PERSON_ENDPOINT,
+                to: PERSON_ENDPOINT,
             }]
         }
         fn finding_codes(&self) -> &'static [&'static str] {
@@ -540,13 +634,13 @@ mod tests {
             .iter()
             .map(|p| p.name())
             .collect();
-        assert_eq!(names, vec!["personal@0.2"]);
+        assert_eq!(names, vec!["personal@0.2", "personal@0.3"]);
         assert!(ALL_PACKS.is_empty());
     }
 
     #[test]
     fn registry_resolve_enabled_dedups_and_reports_unknown() {
-        let registry = PackRegistry::compiled();
+        let registry = PackRegistry::compiled_for_spec(SpecVersion::V03);
         let names = vec!["nope@9.9".to_string()];
         let (found, unknown) = registry.resolve_enabled(&names);
         // The implicit built-in is always appended.
@@ -557,28 +651,47 @@ mod tests {
 
     #[test]
     fn implicit_personal_is_enabled_with_empty_packs() {
-        let registry = PackRegistry::compiled();
-        let (found, unknown) = registry.resolve_enabled(&[]);
+        let older = PackRegistry::compiled_for_spec(SpecVersion::V03);
+        let (found, unknown) = older.resolve_enabled(&[]);
         assert!(unknown.is_empty(), "{unknown:?}");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name(), "personal@0.2");
+
+        let four = PackRegistry::compiled_for_spec(SpecVersion::V04);
+        let (found, unknown) = four.resolve_enabled(&[]);
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name(), "personal@0.3");
     }
 
     #[test]
     fn personal_listings_are_noops_at_any_version() {
         for listed in ["personal@0.1", "personal@0.2", "personal@9.9"] {
-            let registry = PackRegistry::compiled();
+            let registry = PackRegistry::compiled_for_spec(SpecVersion::V03);
             let names = vec![listed.to_string()];
             let (found, unknown) = registry.resolve_enabled(&names);
             assert!(unknown.is_empty(), "{listed}: {unknown:?}");
             assert_eq!(found.len(), 1, "{listed}");
             assert_eq!(found[0].name(), "personal@0.2", "{listed}");
         }
+        for listed in [
+            "personal@0.1",
+            "personal@0.2",
+            "personal@0.3",
+            "personal@9.9",
+        ] {
+            let registry = PackRegistry::compiled_for_spec(SpecVersion::V04);
+            let names = vec![listed.to_string()];
+            let (found, unknown) = registry.resolve_enabled(&names);
+            assert!(unknown.is_empty(), "{listed}: {unknown:?}");
+            assert_eq!(found.len(), 1, "{listed}");
+            assert_eq!(found[0].name(), "personal@0.3", "{listed}");
+        }
     }
 
     #[test]
     fn registry_orphan_owners_matches_free_function() {
-        let registry = PackRegistry::compiled();
+        let registry = PackRegistry::compiled_for_spec(SpecVersion::V03);
         let personal = registry
             .all()
             .iter()
@@ -696,6 +809,8 @@ mod tests {
                 &[EdgeKind {
                     name: "mentor",
                     symmetric: false,
+                    from: PERSON_ENDPOINT,
+                    to: PERSON_ENDPOINT,
                 }]
             }
             fn finding_codes(&self) -> &'static [&'static str] {

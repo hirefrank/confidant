@@ -1,19 +1,24 @@
 //! Load a vault from disk: config, records, ledger.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::check::{Finding, FindingCode, Severity};
-use crate::config::{VaultConfig, SPEC_VERSION};
+use crate::config::{SpecVersion, VaultConfig};
+use crate::corrections::Corrections;
 use crate::id::{collect_uncovered_ulid_windows, scan_id_tokens, IdToken, Prefix, RecordId};
-use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
+use crate::ledger::{parse_ledger, LedgerEntry, LineRef, ParseErrorKind};
 use crate::packs::embedded as packs_embedded;
 use crate::packs::external as packs_external;
+use crate::packs::Pack;
 use crate::packs::PackRegistry;
 use crate::paths::{self, EntryKind};
 use crate::record::{
-    frontmatter_line_spec_key, frontmatter_region, has_conflict_markers, parse_record, Record,
-    RecordKind,
+    frontmatter_line_spec_key, frontmatter_region, has_conflict_markers, parse_record_with_schema,
+    Record,
+};
+use crate::record_type::{
+    retired_decls, RecordSchema, TypeOwner, TypeProblem, TypeRegistry, TypeSource,
 };
 
 const COLLECTIONS: &[&str] = &["people", "orgs", "deals", "interactions", "notes", "edges"];
@@ -23,6 +28,10 @@ pub struct SourcedEntry {
     pub file: String,
     pub line: u32,
     pub entry: LedgerEntry,
+    /// Stable identity of this parsed line (#746). Occurrence is assigned
+    /// once the whole vault has been walked, so byte-identical lines get
+    /// distinct 1-based occurrences in `(file, line)` order.
+    pub line_ref: LineRef,
 }
 
 /// Original ledger file line, including unparsable ones, for search.
@@ -32,6 +41,8 @@ pub struct LedgerLine {
     pub line: u32,
     pub text: String,
     pub id: Option<String>,
+    /// Stable identity when this line parses; `None` for a malformed line.
+    pub line_ref: Option<LineRef>,
     /// Canonical `ledger/YYYY/MM.cfd` lines are searchable. Other `*.cfd`
     /// files are read only for link tokens (notes, merges, package openers).
     pub searchable: bool,
@@ -44,6 +55,10 @@ pub struct Vault {
     pub records: BTreeMap<RecordId, Record>,
     pub entries: Vec<SourcedEntry>,
     pub ledger_lines: Vec<LedgerLine>,
+    /// The retraction graph (#746). Empty before spec 0.4.
+    pub corrections: Corrections,
+    /// Records with `retired: true` (spec 0.4). Empty before 0.4.
+    pub retired_ids: BTreeSet<RecordId>,
     pub load_findings: Vec<Finding>,
     /// Number of unreadable ledger paths (code+count only; never a path).
     /// `find` refuses when this is greater than zero.
@@ -62,9 +77,26 @@ pub struct Vault {
     /// The vault's own pack registry: compiled packs plus the loaded
     /// external packs (#438). Replaces #432's process-wide static.
     pack_registry: PackRegistry,
+    /// Resolved record types for this vault: core plus enabled/disabled/
+    /// retired pack types (spec 0.3).
+    type_registry: TypeRegistry,
     /// External packs that failed to load, fail closed (PD12). Converted
     /// to findings in `check.rs`; read commands ignore them.
     pub pack_problems: Vec<packs_external::PackProblem>,
+    /// Vendored packs that are no longer listed. Their type declarations are
+    /// known (so records parse and warn) and their edge kinds/fields warn as
+    /// orphans, but their verbs/rules are not enabled.
+    disabled_packs: Vec<DisabledPackClaims>,
+}
+
+/// Claims from a vendored but unlisted pack that still need orphan warnings.
+#[derive(Clone, Copy, Debug)]
+pub struct DisabledPackClaims {
+    pub name: &'static str,
+    pub verbs: &'static [&'static str],
+    pub edge_kinds: &'static [crate::packs::EdgeKind],
+    pub fields: &'static [&'static str],
+    pub balance_metrics: &'static [&'static str],
 }
 
 impl Vault {
@@ -74,6 +106,185 @@ impl Vault {
     pub fn pack_registry(&self) -> &PackRegistry {
         &self.pack_registry
     }
+
+    /// The resolved record-type table for this vault.
+    pub fn type_registry(&self) -> &TypeRegistry {
+        &self.type_registry
+    }
+
+    /// Vendored packs whose listing was removed from `confidant.toml`.
+    pub fn disabled_packs(&self) -> &[DisabledPackClaims] {
+        &self.disabled_packs
+    }
+
+    /// The declared spec version, when this binary implements it. `check`
+    /// and every read path gate on this first, so callers that already
+    /// passed the gate can use the value; an unsupported vault has no
+    /// records loaded.
+    pub fn spec_version(&self) -> Option<SpecVersion> {
+        SpecVersion::parse(&self.config.spec)
+    }
+
+    /// The correction graph (#746).
+    pub fn corrections(&self) -> &Corrections {
+        &self.corrections
+    }
+
+    /// Whether a parsed ledger entry is superseded.
+    pub fn is_voided(&self, sourced: &SourcedEntry) -> bool {
+        self.corrections.is_voided(&sourced.line_ref)
+    }
+
+    /// Whether a `(file, line)` location is a superseded parsed entry.
+    pub fn is_voided_location(&self, file: &str, line: u32) -> bool {
+        self.corrections.is_voided_location(file, line)
+    }
+
+    /// Whether a raw ledger line is superseded. Malformed lines cannot be
+    /// retracted.
+    pub fn is_voided_line(&self, line: &LedgerLine) -> bool {
+        line.line_ref
+            .is_some_and(|line_ref| self.corrections.is_voided(&line_ref))
+    }
+
+    /// Current-state effective entries. Dated arithmetic (a balance
+    /// assertion) must use `corrections().voided_on` instead, because a
+    /// retraction dated after the assertion does not apply to it.
+    pub fn effective_entries(&self) -> impl Iterator<Item = &SourcedEntry> {
+        self.entries.iter().filter(|s| !self.is_voided(s))
+    }
+
+    /// Whether a record is retired (spec 0.4). Before 0.4 the set is empty.
+    pub fn is_retired(&self, id: &RecordId) -> bool {
+        self.retired_ids.contains(id)
+    }
+}
+
+/// The placeholder a freshly initialized `keys/` tree may hold. Alone it
+/// is not key material.
+const KEYS_PLACEHOLDER: &str = ".gitkeep";
+
+/// How much of a candidate file the legacy sniff reads. Enough for any
+/// front-matter envelope header, and bounded so `doctor` never slurps a
+/// large ledger.
+const LEGACY_SNIFF_BYTES: u64 = 16 * 1024;
+
+/// Whether `root` looks like a vault written by the encrypted Confidant
+/// (≤0.7), which this plaintext-only CLI cannot read (#809).
+///
+/// Two strong, cheap signals, both read-only:
+///
+/// - a `keys/` tree holding anything besides [`KEYS_PLACEHOLDER`] (key
+///   material, even a half-initialized tree);
+/// - an `enc:` envelope header in a record file's front matter, or an
+///   `enc:`-prefixed line in a ledger file.
+///
+/// A plaintext vault never produces either. The sniff never decrypts,
+/// reads at most [`LEGACY_SNIFF_BYTES`] from a candidate file, and never
+/// returns content, names, or paths; unreadable entries are skipped (a
+/// broken vault is `check`'s problem).
+pub fn is_legacy_encrypted_vault(root: &Path) -> bool {
+    has_legacy_key_material(&root.join("keys"))
+        || COLLECTIONS
+            .iter()
+            .any(|collection| has_envelope_in(&root.join(collection)))
+        || has_ledger_envelope(&root.join("ledger"))
+}
+
+fn has_legacy_key_material(keys_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(keys_dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy() != KEYS_PLACEHOLDER)
+}
+
+fn has_envelope_in(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            if has_envelope_in(&path) {
+                return true;
+            }
+        } else if file_type.is_file() && has_envelope_frontmatter(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Front matter opens with `---` and carries an `enc:` header line before
+/// the closing `---`. That is the shell the encrypted CLI wrote; a body
+/// line that happens to mention `enc:` never matches.
+fn has_envelope_frontmatter(path: &Path) -> bool {
+    let head = read_legacy_head(path);
+    let Ok(text) = std::str::from_utf8(&head) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some("---") {
+        return false;
+    }
+    for line in lines {
+        if line == "---" {
+            // The front matter closed without an envelope header.
+            return false;
+        }
+        if line.split_once(':').map(|(key, _)| key.trim()) == Some("enc") {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_ledger_envelope(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            if has_ledger_envelope(&path) {
+                return true;
+            }
+        } else if file_type.is_file()
+            && path.extension().and_then(|ext| ext.to_str()) == Some("cfd")
+        {
+            let head = read_legacy_head(&path);
+            let Ok(text) = std::str::from_utf8(&head) else {
+                continue;
+            };
+            if text
+                .lines()
+                .any(|line| line.trim_start().starts_with("enc:"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn read_legacy_head(path: &Path) -> Vec<u8> {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::with_capacity(4096);
+    if file.take(LEGACY_SNIFF_BYTES).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    buf
 }
 
 pub fn load_vault(root: &Path) -> Result<Vault, crate::error::DomainError> {
@@ -115,9 +326,16 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     // vault cannot install or shadow one (the external loader refuses any
     // vendored directory or pin for its name, #504 R8).
     let builtins: &[packs_embedded::EmbeddedPack] = packs_embedded::embedded_packs();
+    let spec = SpecVersion::parse(&config.spec);
+    let compiled = match spec {
+        Some(spec) => PackRegistry::compiled_for_spec(spec),
+        // Unsupported specs fail `check` on the spec itself; keep the
+        // all-versions registry so the failure does not cascade into pack
+        // findings.
+        None => PackRegistry::compiled(),
+    };
     let (pack_registry, pack_problems, external_manifests, lockfile_error) =
-        if config.spec == SPEC_VERSION {
-            let compiled = PackRegistry::compiled();
+        if SpecVersion::is_supported(&config.spec) {
             let load = packs_external::load_external_packs(
                 root,
                 &config.spec,
@@ -131,7 +349,7 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
             }
             (registry, load.problems, load.manifests, load.lockfile_error)
         } else {
-            (PackRegistry::compiled(), Vec::new(), Vec::new(), false)
+            (compiled, Vec::new(), Vec::new(), false)
         };
 
     let mut manifests = crate::packs::pack_manifests_for_config();
@@ -165,11 +383,63 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     let mut ledger_lines = Vec::new();
     let mut ledger_unread_count = 0u32;
 
-    if config.spec == SPEC_VERSION {
+    // Record types (spec 0.3): core plus every registered pack's
+    // declarations. Disabled packs stay known (orphans warn); retired types
+    // come from `[[retired_types]]`. The registry is built before the record
+    // walk because collections come from it.
+    let (enabled, _) = pack_registry.resolve_enabled(&config.packs);
+    let enabled_names: HashSet<&str> = enabled.iter().map(|pack| pack.name()).collect();
+    let mut sources: Vec<TypeSource> = pack_registry
+        .all()
+        .iter()
+        .map(|pack| TypeSource {
+            owner: TypeOwner::Pack(pack.name()),
+            decls: pack.record_type_decls(),
+            enabled: enabled_names.contains(pack.name()),
+        })
+        .collect();
+    let mut disabled_packs = Vec::new();
+    let spec_03_or_newer = spec.is_some_and(|s| s >= SpecVersion::V03);
+    if spec_03_or_newer {
+        let (extra_sources, extra_packs) = unlisted_type_sources(
+            root,
+            &config,
+            &pack_registry,
+            spec.unwrap_or(SpecVersion::V02),
+        );
+        sources.extend(extra_sources);
+        disabled_packs = extra_packs;
+    }
+    let (retired, retired_problems) = if spec_03_or_newer {
+        retired_decls(&config.retired_types)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (type_registry, type_problems) = TypeRegistry::build(
+        spec.unwrap_or(SpecVersion::V02),
+        &sources,
+        retired,
+        retired_problems,
+    );
+    push_type_problems(&mut findings, &type_problems);
+
+    if SpecVersion::is_supported(&config.spec) {
         let mut jobs = Vec::new();
         let mut names = Vec::new();
-        scan_collections(root, &mut path_ids, &mut findings, &mut jobs, &mut names);
-        let outs = load_markdown_jobs(root, &jobs);
+        scan_collections(
+            root,
+            &type_registry,
+            &mut path_ids,
+            &mut findings,
+            &mut jobs,
+            &mut names,
+        );
+        let outs = load_markdown_jobs(
+            root,
+            &jobs,
+            &type_registry,
+            spec.unwrap_or(SpecVersion::V02),
+        );
         for (job, out) in jobs.iter().zip(outs) {
             if out.conflicted {
                 if let Some(id) = &job.path_id {
@@ -185,10 +455,28 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
             &mut findings,
             &mut ledger_unread_count,
         );
-        scan_unexpected_top_level(root, &mut findings);
-        walk_seed_names(root, Path::new(""), &mut path_ids, &mut names);
+        scan_unexpected_top_level(root, &type_registry, &mut findings);
+        walk_seed_names(
+            root,
+            Path::new(""),
+            &mut path_ids,
+            &mut names,
+            &type_registry,
+        );
         seed_path_ulids(&names, &records, &mut path_ulids);
     }
+
+    assign_occurrences(&mut entries, &mut ledger_lines);
+    let corrections = Corrections::build(&entries, spec);
+    let retired_ids = if spec.is_some_and(|s| s >= SpecVersion::V04) {
+        records
+            .values()
+            .filter(|record| (**record).is_retired())
+            .map(|record| record.id.clone())
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
 
     Ok(Vault {
         root: root.to_path_buf(),
@@ -196,13 +484,17 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         records,
         entries,
         ledger_lines,
+        corrections,
+        retired_ids,
         load_findings: findings,
         ledger_unread_count,
         path_ids,
         conflicted_ids,
         path_ulids,
         pack_registry,
+        type_registry,
         pack_problems,
+        disabled_packs,
     })
 }
 
@@ -290,6 +582,7 @@ fn walk_seed_names(
     rel: &Path,
     path_ids: &mut BTreeSet<RecordId>,
     names: &mut Vec<String>,
+    types: &TypeRegistry,
 ) {
     let Ok(listing) = paths::read_dir(root, rel) else {
         return;
@@ -311,10 +604,10 @@ fn walk_seed_names(
             // Collection subtrees were already seeded name-by-name during
             // scan_collections; descending again would re-list hundreds of
             // directories for identical seeds (#2).
-            if rel.as_os_str().is_empty() && COLLECTIONS.contains(&ent.name.as_str()) {
+            if rel.as_os_str().is_empty() && types.get_by_collection(&ent.name).is_some() {
                 continue;
             }
-            walk_seed_names(root, &rel.join(&ent.name), path_ids, names);
+            walk_seed_names(root, &rel.join(&ent.name), path_ids, names, types);
         }
     }
 }
@@ -346,6 +639,10 @@ fn leftover_tmp(name: &str, child: &Path, findings: &mut Vec<Finding>) -> bool {
 /// or `./`-prefixed path fails the trust test on its first component and
 /// collapses to a bare marker, losing the parent directory).
 fn redacted_filename(child: &Path) -> String {
+    redacted_filename_with(&TypeRegistry::default(), child)
+}
+
+fn redacted_filename_with(types: &TypeRegistry, child: &Path) -> String {
     const MARKER: &str = "<invalid-filename>";
     let mut kept: Vec<&str> = Vec::new();
     let mut truncated = false;
@@ -354,7 +651,7 @@ fn redacted_filename(child: &Path) -> String {
             truncated = true;
             break;
         };
-        if is_trusted_component(s) {
+        if is_trusted_component_with(types, s) {
             kept.push(s);
         } else {
             truncated = true;
@@ -374,7 +671,12 @@ fn redacted_filename(child: &Path) -> String {
 /// Path components that can never be a client name: structural directories,
 /// valid record IDs (bare or with the `.md` record-file suffix), ledger
 /// years/months, and fixed filenames.
+#[cfg(test)]
 fn is_trusted_component(name: &str) -> bool {
+    is_trusted_component_with(&TypeRegistry::default(), name)
+}
+
+fn is_trusted_component_with(types: &TypeRegistry, name: &str) -> bool {
     matches!(
         name,
         "people"
@@ -393,7 +695,9 @@ fn is_trusted_component(name: &str) -> bool {
             | "deal.md"
             | "interaction.md"
             | "edge.md"
-    ) || is_yyyy(name)
+    ) || types.get_by_collection(name).is_some()
+        || types.main_files().contains(&name)
+        || is_yyyy(name)
         || is_month_cfd(name)
         || RecordId::parse(name).is_ok()
         || name
@@ -402,6 +706,15 @@ fn is_trusted_component(name: &str) -> bool {
 }
 
 fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Finding>) {
+    flag_entry_with(&TypeRegistry::default(), ent, child, findings);
+}
+
+fn flag_entry_with(
+    types: &TypeRegistry,
+    ent: &paths::DirectoryEntry,
+    child: &Path,
+    findings: &mut Vec<Finding>,
+) {
     if !ent.utf8 {
         findings.push(
             Finding::new(
@@ -409,7 +722,7 @@ fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Find
                 Severity::Error,
                 "non-UTF-8 filename".to_owned(),
             )
-            .at_file(redacted_filename(child))
+            .at_file(redacted_filename_with(types, child))
             .with_fix("Rename the file to a UTF-8 record ID"),
         );
         return;
@@ -421,28 +734,177 @@ fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Find
                 Severity::Error,
                 "symbolic link".to_owned(),
             )
-            .at_file(redacted_filename(child))
+            .at_file(redacted_filename_with(types, child))
             .with_fix("Replace the symlink with a real file or directory"),
         );
     }
 }
 
-fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
-    let allowed = [
+/// Declarations from a vendored pack that is no longer listed. They stay
+/// known so a disabled pack's records parse and warn instead of turning the
+/// collection into an unknown directory. They are registered only as type
+/// sources and orphan claims, never as enabled packs: rules and writes stay
+/// disabled, while their records/fields/edges warn as orphans. A pack whose
+/// manifest does not verify or support this spec is skipped (its data then
+/// fails closed as an unknown collection).
+fn unlisted_type_sources(
+    root: &Path,
+    config: &VaultConfig,
+    registered: &PackRegistry,
+    spec: SpecVersion,
+) -> (Vec<TypeSource>, Vec<DisabledPackClaims>) {
+    let listed: HashSet<&str> = config
+        .packs
+        .iter()
+        .filter_map(|pack| pack.split_once('@').map(|(name, _)| name))
+        .collect();
+    let already: HashSet<&str> = registered.all().iter().map(|pack| pack.name()).collect();
+    let retired_names: HashSet<&str> = config
+        .retired_types
+        .iter()
+        .map(|retired| retired.name.as_str())
+        .collect();
+    let retired_prefixes: HashSet<&str> = config
+        .retired_types
+        .iter()
+        .map(|retired| retired.id_prefix.as_str())
+        .collect();
+    let retired_collections: HashSet<&str> = config
+        .retired_types
+        .iter()
+        .map(|retired| retired.collection.as_str())
+        .collect();
+    let Ok(listing) = paths::read_dir(root, Path::new("packs")) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut packs: Vec<DisabledPackClaims> = Vec::new();
+    for ent in listing.entries {
+        if !ent.utf8 || !ent.kind.is_directory() {
+            continue;
+        }
+        let Some((name, version)) = ent.name.split_once('@') else {
+            continue;
+        };
+        if listed.contains(name)
+            || already.contains(ent.name.as_str())
+            || packs_embedded::is_builtin_listing(&ent.name)
+            || crate::packs::manifest::is_reserved_pack_name(name)
+        {
+            continue;
+        }
+        let dir = root.join("packs").join(&ent.name);
+        let Some(manifest) = crate::packs::dir::read_manifest_best_effort(&dir) else {
+            continue;
+        };
+        if manifest.pack.name != name
+            || manifest.pack.version != version
+            || manifest.record_types.decls.is_empty()
+            || !manifest
+                .pack
+                .requires_spec
+                .iter()
+                .any(|supported| supported == spec.as_str())
+        {
+            continue;
+        }
+        let pack = crate::packs::manifest_pack::build_manifest_pack(manifest, String::new());
+        let decls: Vec<crate::record_type::RecordTypeDecl> = pack
+            .record_type_decls()
+            .iter()
+            .filter(|decl| {
+                !retired_names.contains(decl.name)
+                    && !retired_prefixes.contains(decl.id_prefix)
+                    && !retired_collections.contains(decl.collection)
+            })
+            .copied()
+            .collect();
+        if decls.is_empty() {
+            continue;
+        }
+        out.push(TypeSource {
+            owner: TypeOwner::Pack(pack.name()),
+            decls: Box::leak(decls.into_boxed_slice()),
+            enabled: false,
+        });
+        if !packs.iter().any(|existing| existing.name == pack.name()) {
+            packs.push(DisabledPackClaims {
+                name: pack.name(),
+                verbs: pack.verbs(),
+                edge_kinds: pack.edge_kinds(),
+                fields: pack.fields(),
+                balance_metrics: pack.balance_metrics(),
+            });
+        }
+    }
+    (out, packs)
+}
+
+fn push_type_problems(findings: &mut Vec<Finding>, problems: &[TypeProblem]) {
+    for problem in problems {
+        match problem {
+            TypeProblem::Conflict {
+                claim_kind,
+                claim,
+                first,
+                second,
+            } => findings.push(
+                Finding::new(
+                    FindingCode::PackConflict,
+                    Severity::Error,
+                    format!("two packs claim the same {claim_kind} '{claim}'"),
+                )
+                .with_fix(format!(
+                    "Rename or remove one of the declarations (packs {first} and {second})"
+                )),
+            ),
+            TypeProblem::CoreCollision {
+                claim_kind,
+                claim,
+                pack,
+            } => findings.push(
+                Finding::new(
+                    FindingCode::PackInvalid,
+                    Severity::Error,
+                    format!("{pack} claims reserved {claim_kind} '{claim}'"),
+                )
+                .with_fix("Remove the declaration or choose a different name/prefix/collection"),
+            ),
+            TypeProblem::RetiredCollision {
+                claim_kind,
+                claim,
+                live,
+            } => findings.push(
+                Finding::new(
+                    FindingCode::Config,
+                    Severity::Error,
+                    format!("a retired type reuses the live {claim_kind} '{claim}' ({live})"),
+                )
+                .at_file("confidant.toml")
+                .with_fix("Remove the stale [[retired_types]] entry"),
+            ),
+            TypeProblem::InvalidRetired { message } => findings.push(
+                Finding::new(FindingCode::Config, Severity::Error, message.clone())
+                    .at_file("confidant.toml")
+                    .with_fix("Fix or remove the [[retired_types]] entry"),
+            ),
+        }
+    }
+}
+
+fn scan_unexpected_top_level(root: &Path, types: &TypeRegistry, findings: &mut Vec<Finding>) {
+    let mut allowed: BTreeSet<&str> = [
         "confidant.toml",
         "confidant.lock",
         "packs",
-        "people",
-        "orgs",
-        "deals",
-        "interactions",
-        "notes",
-        "edges",
         "ledger",
         "keys",
         "README.md",
         "LICENSE",
-    ];
+    ]
+    .into_iter()
+    .collect();
+    allowed.extend(types.collections());
     let Listed::Ok(entries) = list_dir(root, Path::new(""), findings) else {
         return;
     };
@@ -452,7 +914,7 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
             continue;
         }
         if !ent.utf8 || ent.kind == EntryKind::Symlink {
-            flag_entry(&ent, child, findings);
+            flag_entry_with(types, &ent, child, findings);
             continue;
         }
         if paths::skip_walk_entry(&ent.name, ent.kind) {
@@ -465,8 +927,8 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
                     Severity::Error,
                     "unexpected vault entry".to_owned(),
                 )
-                .at_file(redacted_filename(Path::new(&ent.name)))
-                .with_fix("Use the layout in spec/0.1.md (people/, orgs/, deals/, ledger/, …)"),
+                .at_file(redacted_filename_with(types, Path::new(&ent.name)))
+                .with_fix("Use the vault layout in spec/ (people/, orgs/, deals/, ledger/, …)"),
             );
         }
     }
@@ -474,12 +936,18 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
 
 fn scan_collections(
     root: &Path,
+    types: &TypeRegistry,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
     jobs: &mut Vec<MarkdownJob>,
     names: &mut Vec<String>,
 ) {
-    for collection in COLLECTIONS {
+    for collection in types.collections() {
+        let Some(decl) = types.get_by_collection(collection) else {
+            continue;
+        };
+        let expected_prefix = decl.prefix;
+        let main_file = decl.main_file;
         let rel = Path::new(collection);
         match paths::read_dir(root, rel) {
             Err(err) if crate::error::is_missing(&err) => continue,
@@ -496,11 +964,10 @@ fn scan_collections(
                             Severity::Error,
                             "path is unreadable".to_owned(),
                         )
-                        .at_file(redacted_filename(&rel.join(&name)))
+                        .at_file(redacted_filename_with(types, &rel.join(&name)))
                         .with_fix("Fix permissions or replace the unreadable entry"),
                     );
                 }
-                let prefix = Prefix::from_collection(collection).expect("known collection");
                 for ent in listing.entries {
                     let child = rel.join(&ent.name);
                     if ent.utf8 {
@@ -510,7 +977,7 @@ fn scan_collections(
                         continue;
                     }
                     if !ent.utf8 || ent.kind == EntryKind::Symlink {
-                        flag_entry(&ent, &child, findings);
+                        flag_entry_with(types, &ent, &child, findings);
                         continue;
                     }
                     if paths::skip_walk_entry(&ent.name, ent.kind) {
@@ -519,7 +986,17 @@ fn scan_collections(
                     match ent.kind {
                         EntryKind::File => {
                             if let Some(stem) = ent.name.strip_suffix(".md") {
-                                ingest_file(&child, stem, prefix, path_ids, findings, jobs, None);
+                                ingest_file(
+                                    &child,
+                                    stem,
+                                    expected_prefix,
+                                    collection,
+                                    types,
+                                    path_ids,
+                                    findings,
+                                    jobs,
+                                    None,
+                                );
                             } else {
                                 findings.push(
                                     Finding::new(
@@ -527,14 +1004,25 @@ fn scan_collections(
                                         Severity::Error,
                                         "filename is not a valid record ID".to_owned(),
                                     )
-                                    .at_file(redacted_filename(&child))
+                                    .at_file(redacted_filename_with(types, &child))
                                     .with_fix("Rename to <prefix>-<ULID>.md or move it out of the collection"),
                                 );
                             }
                         }
                         EntryKind::Directory => {
                             ingest_dir(
-                                root, &child, &ent.name, prefix, path_ids, findings, jobs, names,
+                                root,
+                                &child,
+                                &ent.name,
+                                expected_prefix,
+                                collection,
+                                main_file,
+                                expected_prefix == Prefix::Person,
+                                types,
+                                path_ids,
+                                findings,
+                                jobs,
+                                names,
                             );
                         }
                         EntryKind::Other => findings.push(
@@ -543,7 +1031,7 @@ fn scan_collections(
                                 Severity::Error,
                                 "record directory contains an unexpected entry".to_owned(),
                             )
-                            .at_file(redacted_filename(&child)),
+                            .at_file(redacted_filename_with(types, &child)),
                         ),
                         EntryKind::Symlink => {}
                     }
@@ -553,10 +1041,13 @@ fn scan_collections(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_file(
     relative: &Path,
     stem: &str,
     expected_prefix: Prefix,
+    expected_collection: &str,
+    types: &TypeRegistry,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
     jobs: &mut Vec<MarkdownJob>,
@@ -572,7 +1063,7 @@ fn ingest_file(
                     Severity::Error,
                     "filename is not a valid record ID".to_owned(),
                 )
-                .at_file(redacted_filename(relative))
+                .at_file(redacted_filename_with(types, relative))
                 .with_fix("Name the file <prefix>-<26-character ULID>.md"),
             );
             return;
@@ -584,10 +1075,7 @@ fn ingest_file(
             Finding::new(
                 FindingCode::TypePathMismatch,
                 Severity::Error,
-                format!(
-                    "id '{path_id}' does not belong in '{}'",
-                    expected_prefix.collection().unwrap_or("?")
-                ),
+                format!("id '{path_id}' does not belong in '{expected_collection}'"),
             )
             .at_file(&file)
             .for_id(&path_id),
@@ -607,6 +1095,10 @@ fn ingest_dir(
     relative: &Path,
     name: &str,
     expected_prefix: Prefix,
+    expected_collection: &str,
+    main_file: &str,
+    allow_notes: bool,
+    types: &TypeRegistry,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
     jobs: &mut Vec<MarkdownJob>,
@@ -622,13 +1114,13 @@ fn ingest_dir(
                     Severity::Error,
                     "directory name is not a valid record ID".to_owned(),
                 )
-                .at_file(redacted_filename(relative))
+                .at_file(redacted_filename_with(types, relative))
                 .with_fix("Name the directory <prefix>-<26-character ULID>"),
             );
             // The walk stops here, but the seed walk must still see the
             // names below: an unexpected directory can hide ID-shaped file
             // names that seed bare-ULID matching (#116 hold).
-            walk_seed_names(root, relative, path_ids, names);
+            walk_seed_names(root, relative, path_ids, names, types);
             return;
         }
     };
@@ -638,18 +1130,13 @@ fn ingest_dir(
             Finding::new(
                 FindingCode::TypePathMismatch,
                 Severity::Error,
-                format!(
-                    "id '{path_id}' does not belong in '{}'",
-                    expected_prefix.collection().unwrap_or("?")
-                ),
+                format!("id '{path_id}' does not belong in '{expected_collection}'"),
             )
             .at_file(&dir)
             .for_id(&path_id),
         );
     }
-    let main = expected_prefix
-        .main_filename()
-        .expect("collection records have a main file");
+    let main = main_file;
     let mut saw_main = false;
     let entries = match list_dir(root, relative, findings) {
         Listed::Failed => return,
@@ -664,7 +1151,7 @@ fn ingest_dir(
             continue;
         }
         if !ent.utf8 || ent.kind == EntryKind::Symlink {
-            flag_entry(&ent, &child, findings);
+            flag_entry_with(types, &ent, &child, findings);
             if ent.name == main {
                 saw_main = true;
             }
@@ -682,11 +1169,10 @@ fn ingest_dir(
             });
             continue;
         }
-        if expected_prefix == Prefix::Person
-            && ent.name == "notes"
-            && ent.kind == EntryKind::Directory
-        {
-            scan_person_notes(root, relative, &path_id, path_ids, findings, jobs, names);
+        if allow_notes && ent.name == "notes" && ent.kind == EntryKind::Directory {
+            scan_person_notes(
+                root, relative, &path_id, types, path_ids, findings, jobs, names,
+            );
             continue;
         }
         findings.push(
@@ -695,17 +1181,19 @@ fn ingest_dir(
                 Severity::Error,
                 "record directory contains an unexpected entry".to_owned(),
             )
-            .at_file(redacted_filename(&child))
+            .at_file(redacted_filename_with(types, &child))
             .for_id(&path_id)
-            .with_fix(format!(
-                "Keep only {main} (and notes/ for people) in the record directory"
-            )),
+            .with_fix(if allow_notes {
+                format!("Keep only {main} (and notes/ for people) in the record directory")
+            } else {
+                format!("Keep only {main} in the record directory")
+            }),
         );
         // Same seed-walk reasoning as the invalid-dir return above: the
         // walk stops here, so an unexpected directory's subtree still
         // needs name seeding (#116 hold).
         if ent.kind == EntryKind::Directory {
-            walk_seed_names(root, &child, path_ids, names);
+            walk_seed_names(root, &child, path_ids, names, types);
         }
     }
     if !saw_main {
@@ -722,10 +1210,12 @@ fn ingest_dir(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_person_notes(
     root: &Path,
     person_dir: &Path,
     person_id: &RecordId,
+    types: &TypeRegistry,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
     jobs: &mut Vec<MarkdownJob>,
@@ -746,7 +1236,7 @@ fn scan_person_notes(
                         Severity::Error,
                         "path is unreadable".to_owned(),
                     )
-                    .at_file(redacted_filename(&notes_rel.join(&name)))
+                    .at_file(redacted_filename_with(types, &notes_rel.join(&name)))
                     .with_fix("Fix permissions or replace the unreadable entry"),
                 );
             }
@@ -759,7 +1249,7 @@ fn scan_person_notes(
                     continue;
                 }
                 if !ent.utf8 || ent.kind == EntryKind::Symlink {
-                    flag_entry(&ent, &child, findings);
+                    flag_entry_with(types, &ent, &child, findings);
                     continue;
                 }
                 if paths::skip_walk_entry(&ent.name, ent.kind) {
@@ -772,12 +1262,12 @@ fn scan_person_notes(
                             Severity::Error,
                             "filename is not a valid record ID".to_owned(),
                         )
-                        .at_file(redacted_filename(&child)),
+                        .at_file(redacted_filename_with(types, &child)),
                     );
                     // Unexpected directories (e.g. notes/sub/) still need
                     // name seeding for the seed walk (#116 hold).
                     if ent.kind == EntryKind::Directory {
-                        walk_seed_names(root, &child, path_ids, names);
+                        walk_seed_names(root, &child, path_ids, names, types);
                     }
                     continue;
                 }
@@ -786,6 +1276,8 @@ fn scan_person_notes(
                     &child,
                     stem,
                     Prefix::Note,
+                    "notes",
+                    types,
                     path_ids,
                     findings,
                     jobs,
@@ -812,7 +1304,12 @@ struct MarkdownJob {
 
 /// Read, parse and check the jobs on worker threads, preserving job
 /// order in the output so the merge is deterministic.
-fn load_markdown_jobs(root: &Path, jobs: &[MarkdownJob]) -> Vec<JobOutput> {
+fn load_markdown_jobs(
+    root: &Path,
+    jobs: &[MarkdownJob],
+    types: &TypeRegistry,
+    spec: SpecVersion,
+) -> Vec<JobOutput> {
     if jobs.is_empty() {
         return Vec::new();
     }
@@ -827,7 +1324,7 @@ fn load_markdown_jobs(root: &Path, jobs: &[MarkdownJob]) -> Vec<JobOutput> {
         for part in jobs.chunks(chunk) {
             handles.push(s.spawn(|| {
                 part.iter()
-                    .map(|job| run_markdown_job(root, job))
+                    .map(|job| run_markdown_job(root, job, types, spec))
                     .collect::<Vec<_>>()
             }));
         }
@@ -890,7 +1387,12 @@ fn merge_markdown_job(
     }
 }
 
-fn run_markdown_job(root: &Path, job: &MarkdownJob) -> JobOutput {
+fn run_markdown_job(
+    root: &Path,
+    job: &MarkdownJob,
+    types: &TypeRegistry,
+    spec: SpecVersion,
+) -> JobOutput {
     let mut findings = Vec::new();
     let file = paths::display_relative(&job.relative);
     let fail = |findings: Vec<Finding>, conflicted: bool| JobOutput {
@@ -938,7 +1440,12 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob) -> JobOutput {
             return fail(findings, true);
         }
     }
-    match parse_record(&text, &file) {
+    let schema = RecordSchema {
+        spec,
+        types: Some(types),
+        require_declared: false,
+    };
+    match parse_record_with_schema(&text, &file, &schema) {
         Err(err) => {
             let mut finding =
                 Finding::new(FindingCode::Frontmatter, Severity::Error, err.message).at_file(&file);
@@ -974,29 +1481,27 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob) -> JobOutput {
                     Finding::new(
                         FindingCode::TypePathMismatch,
                         Severity::Error,
-                        format!(
-                            "id '{}' prefix does not match type '{}'",
-                            rec.id,
-                            rec.kind.as_str()
-                        ),
+                        "id prefix does not match the record's type".to_owned(),
                     )
                     .at_file(&file)
                     .for_id(&rec.id),
                 );
             }
-            if let Some(expected) = rec.kind.prefix().collection() {
-                if !file.starts_with(expected)
-                    && !(rec.kind == RecordKind::Note && file.contains("/notes/"))
-                {
-                    findings.push(
-                        Finding::new(
-                            FindingCode::TypePathMismatch,
-                            Severity::Error,
-                            format!("type '{}' does not belong at this path", rec.kind.as_str()),
-                        )
-                        .at_file(&file)
-                        .for_id(&rec.id),
-                    );
+            if let Some(collection) = file.split('/').next() {
+                if let Some(decl) = types.get_by_collection(collection) {
+                    let note_in_person_dir =
+                        decl.name == "person" && rec.is_note() && file.contains("/notes/");
+                    if rec.kind.as_str() != decl.name && !note_in_person_dir {
+                        findings.push(
+                            Finding::new(
+                                FindingCode::TypePathMismatch,
+                                Severity::Error,
+                                "record type does not belong at this path".to_owned(),
+                            )
+                            .at_file(&file)
+                            .for_id(&rec.id),
+                        );
+                    }
                 }
             }
             // Duplicate detection and insert happen at merge, in walk
@@ -1456,11 +1961,15 @@ fn ingest_ledger_text(
             continue;
         }
         let entry = by_line.remove(&line);
+        let line_ref = entry
+            .as_ref()
+            .map(|entry| crate::ledger::line_ref(entry, 1));
         ledger_lines.push(LedgerLine {
             file: file.to_owned(),
             line,
             text: raw.to_owned(),
             id: entry.as_ref().map(|e| e.id.to_string()),
+            line_ref,
             searchable,
         });
         if searchable {
@@ -1468,8 +1977,31 @@ fn ingest_ledger_text(
                 entries.push(SourcedEntry {
                     file: file.to_owned(),
                     line,
+                    line_ref: crate::ledger::line_ref(&entry, 1),
                     entry,
                 });
+            }
+        }
+    }
+}
+
+/// Assign 1-based occurrences to byte-identical parsed lines in `(file,
+/// line)` order. `entries` and `ledger_lines` are pushed in the same walk
+/// order, so one pass over entries yields the same numbering for both.
+fn assign_occurrences(entries: &mut [SourcedEntry], ledger_lines: &mut [LedgerLine]) {
+    let mut counts: HashMap<[u8; 32], u32> = HashMap::new();
+    let mut by_location: HashMap<(String, u32), LineRef> = HashMap::new();
+    for sourced in entries.iter_mut() {
+        let hash = *sourced.line_ref.hash();
+        let occurrence = counts.entry(hash).or_insert(0);
+        *occurrence += 1;
+        sourced.line_ref = LineRef::new(hash, *occurrence);
+        by_location.insert((sourced.file.clone(), sourced.line), sourced.line_ref);
+    }
+    for line in ledger_lines.iter_mut() {
+        if let Some(line_ref) = &mut line.line_ref {
+            if let Some(assigned) = by_location.get(&(line.file.clone(), line.line)) {
+                *line_ref = *assigned;
             }
         }
     }
@@ -1501,7 +2033,10 @@ fn is_month_cfd(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::Prefix;
-    use super::{is_month_cfd, is_trusted_component, redacted_filename, COLLECTIONS};
+    use super::{
+        is_legacy_encrypted_vault, is_month_cfd, is_trusted_component, redacted_filename,
+        COLLECTIONS,
+    };
     use std::path::Path;
 
     #[test]
@@ -1606,5 +2141,81 @@ mod tests {
                 "main filename not trusted: {filename}"
             );
         }
+    }
+
+    // #809: the legacy encrypted-vault sniff. Fake key material and a
+    // fake envelope header only; the sniff never decrypts.
+
+    #[test]
+    fn legacy_sniff_detects_key_material() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("keys/shared")).unwrap();
+        std::fs::write(dir.path().join("keys/operator.toml"), "fake operator\n").unwrap();
+        assert!(is_legacy_encrypted_vault(dir.path()));
+    }
+
+    #[test]
+    fn legacy_sniff_ignores_a_bare_keys_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("keys")).unwrap();
+        std::fs::write(dir.path().join("keys/.gitkeep"), "").unwrap();
+        assert!(!is_legacy_encrypted_vault(dir.path()));
+    }
+
+    #[test]
+    fn legacy_sniff_detects_an_envelope_frontmatter_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let person = dir.path().join("people/p-01M3TC5H00MPJG000000000101");
+        std::fs::create_dir_all(&person).unwrap();
+        std::fs::write(
+            person.join("profile.md"),
+            "---\nid: p-01M3TC5H00MPJG000000000101\ntype: person\nname: Robin Example\nenc: xchacha20poly1305\nkey_id: p-01M3TC5H00MPJG000000000101/e0\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\n\nAQID\n",
+        )
+        .unwrap();
+        assert!(is_legacy_encrypted_vault(dir.path()));
+    }
+
+    #[test]
+    fn legacy_sniff_ignores_a_body_line_that_mentions_enc() {
+        let dir = tempfile::tempdir().unwrap();
+        let person = dir.path().join("people/p-01M3TC5H00MPJG000000000101");
+        std::fs::create_dir_all(&person).unwrap();
+        std::fs::write(
+            person.join("profile.md"),
+            "---\nid: p-01M3TC5H00MPJG000000000101\ntype: person\nname: Robin Example\n---\n\nA note that mentions enc: in prose, not a header.\n",
+        )
+        .unwrap();
+        assert!(!is_legacy_encrypted_vault(dir.path()));
+    }
+
+    #[test]
+    fn legacy_sniff_detects_an_enc_ledger_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+        std::fs::write(
+            dir.path().join("ledger/2026/10.cfd"),
+            "enc: xchacha20poly1305\n",
+        )
+        .unwrap();
+        assert!(is_legacy_encrypted_vault(dir.path()));
+    }
+
+    #[test]
+    fn legacy_sniff_ignores_a_plaintext_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let person = dir.path().join("people/p-01M3TC5H00MPJG000000000101");
+        std::fs::create_dir_all(&person).unwrap();
+        std::fs::write(
+            person.join("profile.md"),
+            "---\nid: p-01M3TC5H00MPJG000000000101\ntype: person\nname: Robin Example\n---\n\nFake person.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+        std::fs::write(
+            dir.path().join("ledger/2026/10.cfd"),
+            "2026-10-01 touch p-01M3TC5H00MPJG000000000101 call\n",
+        )
+        .unwrap();
+        assert!(!is_legacy_encrypted_vault(dir.path()));
     }
 }

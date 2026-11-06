@@ -32,7 +32,7 @@ finding_codes = [
 name = "personal"
 version = "0.2"
 skill = "SKILL.md"
-requires_spec = ["0.1"]
+requires_spec = ["0.1", "0.2", "0.3", "0.4"]
 
 [[verbs]]
 name = "touch"

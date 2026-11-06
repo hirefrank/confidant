@@ -47,12 +47,14 @@
 //!   (date descending, then kind), capped at ten. Entries are
 //!   `{"date": …, "kind": …}`; `kind` is omitted when the line carries none.
 //!
-//! Contact for `last_touch` / `overdue` follows the counts-as-contact rule
-//! that predates #444: a `touch` or a coaching `session` ledger line, or an
+//! Contact for `last_touch` / `overdue` counts any ledger verb the pack
+//! declares in its `cadence-overdue` rule's `event_verbs` (#799), plus an
 //! `interaction` record whose primary `person:` is a merge-group member or
-//! that lists one in `with:`. `recent_touches` is ledger-only (the core
-//! `touch` verb). Everything is merge-aware: a value or a touchpoint
-//! recorded against a merged-away id counts for the canonical person.
+//! that lists one in `with:`. Core does not hard-code a pack verb;
+//! `recent_touches` remains ledger-only for the core `touch` verb (its
+//! entries carry a touch kind). Everything is merge-aware: a value or a
+//! touchpoint recorded against a merged-away id counts for the canonical
+//! person.
 //!
 //! For every declared field the merge rule is the 0.1 rule: the canonical
 //! person's own value first, else the first merged member's value in record
@@ -117,7 +119,8 @@ use crate::vault::Vault;
 ///
 /// `title`, `company`, `cadence`, and `snooze_until` are deliberately
 /// absent: they stay so an agent can still see the cadence state that drove a
-/// nudge.
+/// nudge. `address` is a place field (#745), included here so the same
+/// `--exclude-private` switch strips it from `entity.fields`.
 ///
 /// `relationship` is the 0.2 name (#509). `relationship_to_me` is kept in the
 /// list too: it is harmless (no view carries it after the #551 cutover) and
@@ -132,6 +135,7 @@ pub const PRIVATE_CONTEXT_FIELDS: &[&str] = &[
     "dates",
     "relationship",
     "relationship_to_me",
+    "address",
 ];
 
 /// Declared fields a person outside the §12 cleared set still exposes: the
@@ -233,6 +237,7 @@ pub fn build_personal_view(
     canonical: &RecordId,
     as_of: NaiveDate,
     declared: &[FieldDecl],
+    event_verbs: &[&str],
 ) -> Option<Value> {
     // A declared field named after a derived key would serialize a duplicate
     // JSON key; skip it in release and fail loudly in debug.
@@ -337,7 +342,7 @@ pub fn build_personal_view(
     // "no cadence set" (both leave `cadence_days` absent).
     view.cadence_never = matches!(cadence, Some(Cadence::Never));
 
-    let last_touch = last_contact_on(vault, canonical, &members, as_of);
+    let last_touch = last_contact_on(vault, canonical, &members, as_of, event_verbs);
     view.days_since_touch = last_touch.map(|d| as_of.signed_duration_since(d).num_days());
     view.last_touch = last_touch.map(|d| d.to_string());
     view.overdue = match view.cadence_days {
@@ -417,20 +422,21 @@ fn merged_field_value(
         })
 }
 
-/// Latest contact on or before `as_of` for any merge-group member: a `touch`
-/// or coaching `session` ledger line, or an `interaction` record whose
-/// primary is a member or that lists one in `with:`.
+/// Latest contact on or before `as_of` for any merge-group member: a ledger
+/// line whose verb the pack declares as an event (`cadence-overdue`'s
+/// `event_verbs`), or an `interaction` record whose primary is a member or
+/// that lists one in `with:`.
 fn last_contact_on(
     vault: &Vault,
     canonical: &RecordId,
     members: &[RecordId],
     as_of: NaiveDate,
+    event_verbs: &[&str],
 ) -> Option<NaiveDate> {
     let is_member = |id: &RecordId| id == canonical || members.contains(id);
     let ledger = vault
-        .entries
-        .iter()
-        .filter(|s| s.entry.verb == "touch" || s.entry.verb == "session")
+        .effective_entries()
+        .filter(|s| event_verbs.contains(&s.entry.verb.as_str()))
         .filter(|s| s.entry.date <= as_of)
         .filter(|s| is_member(&s.entry.id))
         .map(|s| s.entry.date)
@@ -439,6 +445,7 @@ fn last_contact_on(
         .records
         .values()
         .filter(|r| r.kind == RecordKind::Interaction)
+        .filter(|r| !vault.is_retired(&r.id))
         .filter_map(|r| {
             let date = r.field("date").and_then(parse_strict_date)?;
             if date > as_of {
@@ -465,8 +472,7 @@ fn recent_touches(
     as_of: NaiveDate,
 ) -> Vec<RecentTouch> {
     let mut touches: Vec<RecentTouch> = vault
-        .entries
-        .iter()
+        .effective_entries()
         .filter(|s| {
             s.entry.verb == "touch"
                 && s.entry.date <= as_of
