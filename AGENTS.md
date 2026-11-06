@@ -65,6 +65,7 @@ Read before changing behaviour:
 | `crates/confidant-cli/` | The `confidant` binary (package `confidant-cli`) |
 | `crates/confidant-tui/` | Terminal UI (`confidant-tui`): reference second consumer of the ADR-7 `--json --no-input` CLI contract. Ships as a GitHub Releases binary and on crates.io; launched via `confidant tui` |
 | `fuzz/` | cargo-fuzz harnesses for the ledger parser (own workspace, excluded from the main one; not run in CI) |
+| `spikes/` | Throwaway spikes, each its own workspace excluded from the main one (see `spikes/rune-desktop-app/`); not run in CI |
 | `spec/` | Format spec and finding codes |
 | `packs/` | Schema packs (built-in personal; external packs live in the vault) |
 | `crates/confidant-cli/pack-skills/`, `crates/confidant-core/pack-manifests/` | In-crate vendored pack skill/manifest copies the binary embeds; regenerate with `python3 .github/scripts/sync-packs.py` (drift tests guard them) |

@@ -2,7 +2,9 @@
 resolver = "2"
 # fuzz/ is its own cargo-fuzz workspace (see fuzz/Cargo.toml); keep
 # libfuzzer-sys/arbitrary out of the main dependency graph (MSRV/deny).
-exclude = ["fuzz"]
+# spikes/ holds throwaway spikes, each its own workspace; keep Rune's
+# graph out of the main dependency graph and out of CI's gate.
+exclude = ["fuzz", "spikes/rune-desktop-app"]
 members = [
     "crates/confidant-core",
     "crates/confidant-cli",
