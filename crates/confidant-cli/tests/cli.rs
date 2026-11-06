@@ -1348,7 +1348,8 @@ fn help_pack_compiled_is_unlabelled() {
     );
 }
 
-/// #745: a 0.4 vault serves the 0.3 built-in skill, byte for byte.
+/// #745, #750: a 0.4 vault serves the 0.4 built-in skill, byte for byte,
+/// including when the listing names a frozen version (0.3) or an alias.
 #[test]
 fn help_pack_personal_0_3_serves_the_0_4_skill() {
     let vault = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/corrections-0.4");
@@ -1368,12 +1369,12 @@ fn help_pack_personal_0_3_serves_the_0_4_skill() {
     assert_eq!(
         stdout,
         format!("{shipped}\n"),
-        "0.4 must serve the personal@0.3 skill text"
+        "0.4 must serve the personal@0.4 skill text"
     );
 
     // A versioned built-in listing names the active version at any version.
     let alias = Command::new(bin())
-        .args(["help", "pack:personal@0.2", "--vault"])
+        .args(["help", "pack:personal@0.3", "--vault"])
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/corrections-0.4"))
         .output()
         .unwrap();
@@ -1385,7 +1386,7 @@ fn help_pack_personal_0_3_serves_the_0_4_skill() {
     assert_eq!(
         String::from_utf8(alias.stdout).unwrap(),
         format!("{shipped}\n"),
-        "personal@0.2 is a no-op alias on 0.4"
+        "personal@0.3 is a no-op alias on 0.4"
     );
 }
 

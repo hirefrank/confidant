@@ -6,9 +6,9 @@ the in-crate copies (`include_dir!` / `include_str!`), and crates.io
 tarballs do not include the repo-root `../../packs`:
 
   packs/personal/SKILL.md        -> crates/confidant-cli/pack-skills/personal/SKILL.md
-  packs/personal/manifest.toml   -> crates/confidant-core/pack-manifests/personal-0.3/manifest.toml
-  packs/personal/SKILL.md        -> crates/confidant-core/pack-manifests/personal-0.3/SKILL.md
-  packs/personal/0.3.md          -> crates/confidant-core/pack-manifests/personal-0.3/0.3.md
+  packs/personal/manifest.toml   -> crates/confidant-core/pack-manifests/personal-0.4/manifest.toml
+  packs/personal/SKILL.md        -> crates/confidant-core/pack-manifests/personal-0.4/SKILL.md
+  packs/personal/0.4.md          -> crates/confidant-core/pack-manifests/personal-0.4/0.4.md
 
 Edit the repo-root source, then run this once. The drift tests
 (`crates/confidant-cli/src/embedded.rs`,
@@ -21,9 +21,9 @@ Usage:
 
 Generated copies, never symlinks: symlinks are unsafe for `cargo publish`
 tarballs and `include_dir!`. The frozen
-`pack-manifests/personal-0.1/` and `personal-0.2/` copies have no
-repo-root source (0.2 is the 0.1–0.3 built-in, 0.3 is the 0.4 source) and
-are deliberately not synced.
+`pack-manifests/personal-0.1/`, `personal-0.2/`, and `personal-0.3/` copies
+have no repo-root source (0.2 is the 0.1–0.3 built-in, 0.3 is the frozen
+0.4-era built-in, 0.4 is the 0.4 source) and are deliberately not synced.
 """
 from __future__ import annotations
 
@@ -37,11 +37,11 @@ COPIES = [
     ("packs/personal/SKILL.md",
      "crates/confidant-cli/pack-skills/personal/SKILL.md"),
     ("packs/personal/manifest.toml",
-     "crates/confidant-core/pack-manifests/personal-0.3/manifest.toml"),
+     "crates/confidant-core/pack-manifests/personal-0.4/manifest.toml"),
     ("packs/personal/SKILL.md",
-     "crates/confidant-core/pack-manifests/personal-0.3/SKILL.md"),
-    ("packs/personal/0.3.md",
-     "crates/confidant-core/pack-manifests/personal-0.3/0.3.md"),
+     "crates/confidant-core/pack-manifests/personal-0.4/SKILL.md"),
+    ("packs/personal/0.4.md",
+     "crates/confidant-core/pack-manifests/personal-0.4/0.4.md"),
 ]
 
 

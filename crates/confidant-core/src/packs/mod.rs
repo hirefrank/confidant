@@ -634,7 +634,7 @@ mod tests {
             .iter()
             .map(|p| p.name())
             .collect();
-        assert_eq!(names, vec!["personal@0.2", "personal@0.3"]);
+        assert_eq!(names, vec!["personal@0.2", "personal@0.3", "personal@0.4"]);
         assert!(ALL_PACKS.is_empty());
     }
 
@@ -661,7 +661,7 @@ mod tests {
         let (found, unknown) = four.resolve_enabled(&[]);
         assert!(unknown.is_empty(), "{unknown:?}");
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].name(), "personal@0.3");
+        assert_eq!(found[0].name(), "personal@0.4");
     }
 
     #[test]
@@ -678,6 +678,7 @@ mod tests {
             "personal@0.1",
             "personal@0.2",
             "personal@0.3",
+            "personal@0.4",
             "personal@9.9",
         ] {
             let registry = PackRegistry::compiled_for_spec(SpecVersion::V04);
@@ -685,7 +686,7 @@ mod tests {
             let (found, unknown) = registry.resolve_enabled(&names);
             assert!(unknown.is_empty(), "{listed}: {unknown:?}");
             assert_eq!(found.len(), 1, "{listed}");
-            assert_eq!(found[0].name(), "personal@0.3", "{listed}");
+            assert_eq!(found[0].name(), "personal@0.4", "{listed}");
         }
     }
 

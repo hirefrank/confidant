@@ -450,6 +450,13 @@ enum LogAction {
         /// Source token, stored as src:<value>.
         #[arg(long)]
         src: Option<String>,
+        /// How long the touch lasted (for example 60m, 1h, 1h30m), stored
+        /// as duration:<minutes>m (#741).
+        #[arg(long)]
+        duration: Option<String>,
+        /// Social mode: one-on-one or group (#741).
+        #[arg(long)]
+        mode: Option<String>,
         /// Log even when an identical touch (same person, date, kind)
         /// is already in the ledger (#747).
         #[arg(long)]
@@ -1012,6 +1019,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     date,
                     note,
                     src,
+                    duration,
+                    mode,
                     force,
                 } => cmd_log_touch(
                     &cli,
@@ -1021,6 +1030,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     date.clone(),
                     note.clone(),
                     src.clone(),
+                    duration.clone(),
+                    mode.clone(),
                     *force,
                 ),
             }
@@ -3310,6 +3321,8 @@ fn cmd_log_touch(
     date_raw: Option<String>,
     note: Option<String>,
     src: Option<String>,
+    duration: Option<String>,
+    mode: Option<String>,
     force: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
@@ -3327,6 +3340,28 @@ fn cmd_log_touch(
             "bad touch kind '{kind}'; use one of: {}",
             confidant_core::touch::TOUCH_KINDS.join(", ")
         ))));
+    }
+    // #741: the rich pairs are optional; validate before writing so a typo
+    // is a usage error, not an E_TOUCH_MALFORMED line in the vault.
+    let duration_minutes = match duration.as_deref() {
+        Some(raw) => Some(
+            confidant_core::ledger::parse_duration_minutes(raw)
+                .filter(|minutes| *minutes > 0)
+                .ok_or_else(|| {
+                    anyhow::Error::new(DomainError::usage(format!(
+                        "bad touch duration '{raw}'; use minutes like 60m, or 1h / 1h30m"
+                    )))
+                })?,
+        ),
+        None => None,
+    };
+    if let Some(mode) = mode.as_deref() {
+        if !confidant_core::touch::is_valid_touch_mode(mode) {
+            return Err(anyhow::Error::new(DomainError::usage(format!(
+                "bad touch mode '{mode}'; use one of: {}",
+                confidant_core::touch::TOUCH_MODES.join(", ")
+            ))));
+        }
     }
     let date = parse_date_arg(&date_raw)?;
 
@@ -3372,18 +3407,37 @@ fn cmd_log_touch(
     if let Some(s) = &src {
         parts.push(format!("src:{s}"));
     }
+    if let Some(minutes) = duration_minutes {
+        parts.push(format!(
+            "{}:{minutes}m",
+            confidant_core::touch::TOUCH_DURATION_PAIR
+        ));
+    }
+    if let Some(mode) = &mode {
+        parts.push(format!("{}:{mode}", confidant_core::touch::TOUCH_MODE_PAIR));
+    }
     let line = parts.join(" ");
     changes.push(FileChange::AppendLines {
         path: month_path(&date),
         lines: vec![line.clone()],
     });
 
-    let canonical = format!(
+    // The canonical-request digest keeps its historical shape for a plain
+    // touch, so a retry of a request id written before #741 still replays.
+    // The rich pairs are appended only when present, and then they DO
+    // distinguish content (a reused id with a different duration conflicts).
+    let mut canonical = format!(
         "log-touch/v1\nperson={}\ndate={date}\nkind={kind}\nnote={}\nsrc={}\n",
         person.id,
         note_body.as_deref().unwrap_or(""),
         src.as_deref().unwrap_or(""),
     );
+    if let Some(minutes) = duration_minutes {
+        canonical.push_str(&format!("duration={minutes}m\n"));
+    }
+    if let Some(mode) = &mode {
+        canonical.push_str(&format!("mode={mode}\n"));
+    }
     let summary = format!("touch {} {kind}", person.id);
     // #747: refuse an identical touch before applying or queueing
     // anything, unless --force or the write path owns the decision
@@ -9717,7 +9771,7 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
         Some(name) => {
             if name.is_empty() {
                 return Err(anyhow::Error::new(DomainError::usage(
-                    "empty pack name: use `help pack:<name>`, e.g. `help pack:personal@0.3`",
+                    "empty pack name: use `help pack:<name>`, e.g. `help pack:personal@0.4`",
                 )));
             }
             // A built-in listing names the active version at any version

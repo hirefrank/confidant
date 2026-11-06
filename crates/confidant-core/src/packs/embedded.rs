@@ -1,11 +1,15 @@
 //! Built-in declarative packs compiled into the binary (#550).
 //!
-//! `personal@0.2` and `personal@0.3` ship inside the binary as small pack
-//! directories (`manifest.toml`, `SKILL.md`, `<version>.md`) and are loaded
+//! `personal@0.2`, `personal@0.3`, and `personal@0.4` ship inside the
+//! binary as small pack directories (`manifest.toml`, `SKILL.md`,
+//! `<version>.md`) and are loaded
 //! through the same declarative path external packs use — the same
 //! [`ManifestPack`] type, the same rule kinds, the same field-grammar
 //! validation. 0.2 is a v2 manifest for specs 0.1–0.3; 0.3 is a v3 manifest
-//! for spec 0.4. The only difference is the manifest's [`PackOrigin`]:
+//! for spec 0.4 that adds places and things; 0.4 is the v3 manifest for
+//! spec 0.4 that adds cadence semantics and rich touches and supersedes 0.3
+//! (0.3 is frozen and no spec selects it). The only difference is the
+//! manifest's [`PackOrigin`]:
 //!
 //! - the bytes are compiled in, so the manifest is parsed with
 //!   [`parse_manifest_compiled_in`] and is trusted as core (#504 decision 3):
@@ -17,10 +21,10 @@
 //!   keyed on the origin, **never the pack name**.
 //!
 //! This module is pure data: no filesystem, no network (PD9). The in-crate
-//! 0.3 bytes are the vendored copy of repo-root `packs/personal/`; the 0.2
-//! bytes are frozen (older fixtures and vaults). A drift test pins 0.3 to
-//! the root, and another proves both versions pass the pack-directory loader
-//! (allowlist and limits) and hash stably.
+//! 0.4 bytes are the vendored copy of repo-root `packs/personal/`; the 0.2
+//! and 0.3 bytes are frozen (older fixtures and vaults). A drift test pins
+//! 0.4 to the root, and another proves every version passes the
+//! pack-directory loader (allowlist and limits) and hash stably.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -36,6 +40,11 @@ pub const PERSONAL_0_2: &str = "personal@0.2";
 
 /// `name@version` of the built-in personal pack for spec 0.4 (#745).
 pub const PERSONAL_0_3: &str = "personal@0.3";
+
+/// `name@version` of the built-in personal pack for spec 0.4 (#750, #741).
+/// 0.3 is frozen: it stays compiled for fixtures and history, but no spec
+/// selects it (a 0.4 vault selects this version).
+pub const PERSONAL_0_4: &str = "personal@0.4";
 
 /// Whether `listed` names a built-in pack, at any version (#551).
 ///
@@ -102,6 +111,27 @@ const PERSONAL_0_3_CONTRACT: &str = include_str!(concat!(
     "/pack-manifests/personal-0.3/0.3.md"
 ));
 
+/// The embedded personal@0.4 manifest (vendored from
+/// `packs/personal/manifest.toml`).
+const PERSONAL_0_4_MANIFEST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/pack-manifests/personal-0.4/manifest.toml"
+));
+
+/// The embedded personal@0.4 skill text (vendored from
+/// `packs/personal/SKILL.md`).
+const PERSONAL_0_4_SKILL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/pack-manifests/personal-0.4/SKILL.md"
+));
+
+/// The embedded personal@0.4 contract doc (vendored from
+/// `packs/personal/0.4.md`).
+const PERSONAL_0_4_CONTRACT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/pack-manifests/personal-0.4/0.4.md"
+));
+
 /// One pack compiled into the binary as a declarative pack directory.
 pub struct EmbeddedPack {
     /// The `name@version` a vault lists to enable it.
@@ -143,12 +173,16 @@ impl EmbeddedPack {
 
     /// Whether this built-in version is active in a vault with `spec`.
     ///
-    /// `personal@0.2` serves 0.1–0.3; `personal@0.3` serves 0.4. A future
-    /// built-in defaults to active everywhere until it gets its own rule.
+    /// `personal@0.2` serves 0.1–0.3; `personal@0.4` serves 0.4.
+    /// `personal@0.3` is frozen: it stays embedded so old fixtures and the
+    /// 0.3 contract resolve, but no spec selects it. A future built-in
+    /// defaults to active everywhere until it gets its own rule.
     pub fn active_in(&self, spec: SpecVersion) -> bool {
         if self.listed == PERSONAL_0_2 {
             spec < SpecVersion::V04
         } else if self.listed == PERSONAL_0_3 {
+            false
+        } else if self.listed == PERSONAL_0_4 {
             spec >= SpecVersion::V04
         } else {
             true
@@ -192,6 +226,12 @@ pub fn embedded_packs() -> &'static [EmbeddedPack] {
                 PERSONAL_0_3_MANIFEST,
                 PERSONAL_0_3_SKILL,
                 PERSONAL_0_3_CONTRACT,
+            ),
+            build(
+                PERSONAL_0_4,
+                PERSONAL_0_4_MANIFEST,
+                PERSONAL_0_4_SKILL,
+                PERSONAL_0_4_CONTRACT,
             ),
         ]
     })
@@ -256,23 +296,43 @@ mod tests {
         dir.is_dir().then_some(dir)
     }
 
-    /// Drift test (#550, #745): the embedded personal@0.3 bytes must match
-    /// the repo-root human contract (`packs/personal/`). 0.2 is frozen.
+    /// Drift test (#550, #745, #750): the embedded personal@0.4 bytes must
+    /// match the repo-root human contract (`packs/personal/`). 0.2 is
+    /// frozen; 0.3 is frozen except for its contract doc, pinned below.
     #[test]
-    fn embedded_personal_0_3_matches_repo_root() {
+    fn embedded_personal_0_4_matches_repo_root() {
         let Some(root) = repo_root_pack("personal") else {
             return; // published crate tarball: no repo root to compare against
         };
-        let declared = find(PERSONAL_0_3).expect("personal@0.3 is embedded");
+        let declared = find(PERSONAL_0_4).expect("personal@0.4 is embedded");
         for (rel, bytes) in declared.files() {
             let actual = std::fs::read(root.join(rel))
                 .unwrap_or_else(|e| panic!("read packs/personal/{rel}: {e}"));
             assert_eq!(
                 &actual, bytes,
-                "embedded pack-manifests/personal-0.3/{rel} has drifted from \
+                "embedded pack-manifests/personal-0.4/{rel} has drifted from \
                  packs/personal/{rel}; copy the repo-root file over"
             );
         }
+    }
+
+    /// The frozen 0.3 contract doc still has a repo-root source, so a
+    /// stray edit to `packs/personal/0.3.md` cannot silently diverge from
+    /// what the binary serves for the frozen pack.
+    #[test]
+    fn embedded_personal_0_3_contract_matches_repo_root() {
+        let Some(root) = repo_root_pack("personal") else {
+            return; // published crate tarball: no repo root to compare against
+        };
+        let declared = find(PERSONAL_0_3).expect("personal@0.3 is embedded");
+        let actual = std::fs::read(root.join("0.3.md"))
+            .unwrap_or_else(|e| panic!("read packs/personal/0.3.md: {e}"));
+        assert_eq!(
+            declared.files().get("0.3.md"),
+            Some(&actual),
+            "embedded pack-manifests/personal-0.3/0.3.md has drifted from \
+             packs/personal/0.3.md"
+        );
     }
 
     /// Acceptance (#550): both embedded versions pass the pack-directory
@@ -399,9 +459,14 @@ mod tests {
             .iter()
             .map(|p| p.listed())
             .collect();
-        assert_eq!(four, vec![PERSONAL_0_3]);
+        assert_eq!(four, vec![PERSONAL_0_4]);
         assert_eq!(find(PERSONAL_0_2).unwrap().manifest().pack.version, "0.2");
+        // 0.3 is frozen: embedded for fixtures and history, never active.
         assert_eq!(find(PERSONAL_0_3).unwrap().manifest().pack.version, "0.3");
+        assert!(active_for_spec(SpecVersion::V02)
+            .iter()
+            .all(|p| p.listed() != PERSONAL_0_3));
+        assert_eq!(find(PERSONAL_0_4).unwrap().manifest().pack.version, "0.4");
     }
 
     /// #551 nit: a malformed `personal@` (empty version) is not a built-in
@@ -411,6 +476,7 @@ mod tests {
         assert!(is_builtin_listing("personal@0.1"));
         assert!(is_builtin_listing("personal@0.2"));
         assert!(is_builtin_listing("personal@0.3"));
+        assert!(is_builtin_listing("personal@0.4"));
         assert!(is_builtin_listing("personal@9.9"));
         assert!(!is_builtin_listing("personal@"));
         assert!(!is_builtin_listing("personal"));
@@ -419,8 +485,8 @@ mod tests {
         assert!(declared.matches_listing("personal@0.1"));
         assert!(!declared.matches_listing("personal@"));
         assert!(!declared.matches_listing("personal"));
-        let declared = find(PERSONAL_0_3).expect("personal@0.3 is embedded");
-        assert!(declared.matches_listing("personal@0.2"));
+        let declared = find(PERSONAL_0_4).expect("personal@0.4 is embedded");
+        assert!(declared.matches_listing("personal@0.3"));
         assert!(!declared.matches_listing("personal@"));
     }
 }
@@ -432,7 +498,7 @@ mod version_tests {
     #[test]
     fn personal_versions_keep_the_same_checks_and_codes() {
         let old = find(PERSONAL_0_2).unwrap().manifest();
-        let new = find(PERSONAL_0_3).unwrap().manifest();
+        let new = find(PERSONAL_0_4).unwrap().manifest();
         let severity = |m: &PackManifest| {
             m.checks
                 .severity
@@ -450,8 +516,16 @@ mod version_tests {
         assert_eq!(severity(old), severity(new));
         assert_eq!(ints(old), ints(new));
         assert_eq!(old.finding_codes, new.finding_codes);
-        assert_eq!(new.pack.version, "0.3");
+        assert_eq!(new.pack.version, "0.4");
         assert_eq!(new.record_types.decls.len(), 2);
         assert!(new.edge_kinds.iter().any(|k| k.name == "visited"));
+        // #750: 0.4 adds the cadence basis and mode note; 0.3 had neither.
+        let fields = |m: &PackManifest| m.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+        let three = fields(find(PERSONAL_0_3).unwrap().manifest());
+        let four = fields(new);
+        for added in ["cadence_basis", "cadence_note"] {
+            assert!(!three.contains(&added.to_owned()), "{added} already in 0.3");
+            assert!(four.contains(&added.to_owned()), "{added} missing in 0.4");
+        }
     }
 }

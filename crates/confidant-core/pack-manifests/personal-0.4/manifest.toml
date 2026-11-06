@@ -1,0 +1,260 @@
+# Pack manifest for personal@0.4 (spec/pack-manifest.md).
+#
+# This is the built-in declarative pack (#550). Its bytes live inside the
+# binary and are loaded through the same manifest-v3 / declarative path
+# external packs use. Because it is loaded from compiled-in bytes it is
+# trusted as core (#504 decision 3): its rules name the stable finding
+# codes directly and it may claim the core `touch` verb. The allowance is
+# keyed on the bytes' origin, never the pack name, so a vault directory
+# `packs/personal@…` still fails `E_PACK_INVALID` (#504 R8).
+#
+# Root `packs/personal/` is the 0.4 source; the frozen 0.2 and 0.3 bytes
+# live in `crates/confidant-core/pack-manifests/personal-0.2/` and
+# `personal-0.3/`. A drift test pins the root 0.4 files to their embedded
+# copies.
+
+manifest_version = 3
+
+# Top-level keys come before the first [table] header: in TOML anything
+# after a table header belongs to that table.
+balance_metrics = []
+
+finding_codes = [
+  "E_FRONTMATTER",
+  "E_INVALID_ID",
+  "E_WRONG_ID_TYPE",
+  "E_UNKNOWN_RECORD",
+  "W_CADENCE_OVERDUE",
+  "W_DATE_UPCOMING",
+]
+
+[pack]
+name = "personal"
+version = "0.4"
+skill = "SKILL.md"
+# 0.3 is required because this manifest declares record types (a 0.3
+# capability); 0.4 is the vault spec that selects this built-in version.
+requires_spec = ["0.3", "0.4"]
+
+[[record_types]]
+name = "place"
+id_prefix = "pl"
+collection = "places"
+main_file = "place.md"
+entity = true
+person_like = false
+no_ai = "full"
+roster = true
+required_fields = ["name", "kind"]
+optional_fields = ["address", "tags", "links"]
+
+[[record_types]]
+name = "thing"
+id_prefix = "th"
+collection = "things"
+main_file = "thing.md"
+entity = true
+person_like = false
+no_ai = "full"
+roster = true
+required_fields = ["name", "kind"]
+optional_fields = ["tags", "links"]
+
+[[verbs]]
+name = "touch"
+id_type = "person"
+
+[[fields]]
+name = "title"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "company"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "location"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "emails"
+grammar = "list"
+
+[[fields]]
+name = "phones"
+grammar = "list"
+
+[[fields]]
+name = "links"
+grammar = "labeled-list"
+
+[[fields]]
+name = "tags"
+grammar = "list"
+
+[[fields]]
+name = "birthday"
+grammar = "recurring-date"
+
+[[fields]]
+name = "dates"
+grammar = "dates-list"
+
+[[fields]]
+name = "relationship"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "cadence"
+grammar = "cadence"
+
+# #750: why the cadence is what it is. `observed` is a rhythm derived from
+# touch history; `intention` is the rhythm the operator wants. The
+# vocabulary is documented and enforced by the capture skill, not by a
+# closed grammar (the same call as place/thing `kind`), so a future value
+# does not need a spec change.
+[[fields]]
+name = "cadence_basis"
+grammar = "non-empty-string"
+
+# #750: the mode note. When the relationship's shape changes (frequent 1:1s
+# to occasional updates), record why the cadence moved with it. Free text;
+# private context, because it can name people and situations.
+[[fields]]
+name = "cadence_note"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "snooze_until"
+grammar = "date"
+
+[[fields]]
+name = "kind"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "address"
+grammar = "non-empty-string"
+
+[[edge_kinds]]
+name = "friend"
+symmetric = true
+
+[[edge_kinds]]
+name = "family"
+symmetric = true
+
+[[edge_kinds]]
+name = "sibling"
+symmetric = true
+
+[[edge_kinds]]
+name = "partner"
+symmetric = true
+
+[[edge_kinds]]
+name = "parent"
+symmetric = false
+
+[[edge_kinds]]
+name = "mentor"
+symmetric = false
+
+[[edge_kinds]]
+name = "visited"
+symmetric = false
+from = ["person"]
+to = ["place"]
+
+[[edge_kinds]]
+name = "lives_at"
+symmetric = false
+from = ["person"]
+to = ["place"]
+
+[[edge_kinds]]
+name = "owns"
+symmetric = false
+from = ["person"]
+to = ["thing"]
+
+[[edge_kinds]]
+name = "located_at"
+symmetric = false
+from = ["thing"]
+to = ["place"]
+
+[checks]
+[[checks.severity]]
+key = "personal.cadence_overdue"
+default = "warning"
+
+[[checks.severity]]
+key = "personal.date_upcoming"
+default = "warning"
+
+[[checks.int]]
+key = "personal.date_upcoming_days"
+default = 7
+
+# Keep-in-touch cadence. Reproduces the compiled personal pack's rule (ledger contacts
+# only, per the accepted §13.4 rule 7 divergence) and adds `snooze_until`.
+[[rules]]
+id = "cadence_overdue"
+kind = "cadence-overdue"
+code = "W_CADENCE_OVERDUE"
+severity_key = "personal.cadence_overdue"
+cadence_field = "cadence"
+# Only these verbs count as touchpoints; the list is fixed and does not
+# auto-extend with other packs' verbs.
+event_verbs = ["touch", "session"]
+snooze_field = "snooze_until"
+
+# Upcoming birthdays and other recurring dates.
+[[rules]]
+id = "date_upcoming"
+kind = "date-upcoming"
+code = "W_DATE_UPCOMING"
+severity_key = "personal.date_upcoming"
+date_fields = ["birthday", "dates"]
+window_key = "personal.date_upcoming_days"
+
+# `note:` integrity on `touch` lines, with the core codes the compiled
+# pack emits (allowed because these bytes are compiled in). Every code
+# parameter is set explicitly (#629): the kinds have no fallbacks.
+[[rules]]
+id = "touch_note"
+kind = "note-ref"
+code = "E_UNKNOWN_RECORD"
+verb = "touch"
+pair = "note"
+invalid_code = "E_INVALID_ID"
+wrong_type_code = "E_WRONG_ID_TYPE"
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
+
+[messages."E_INVALID_ID"]
+default = "touch note is not a record ID"
+default_fix = "Point note: at an existing n-<ULID> note"
+
+[messages."E_WRONG_ID_TYPE"]
+default = "touch note '{id}' is not a note id"
+default_fix = "Use note:n-<ULID>"
+
+[messages."E_UNKNOWN_RECORD"]
+missing = "touch note '{id}' does not exist"
+missing_fix = "Point note: at an existing n-<ULID> note"
+wrong_owner = "touch note '{id}' does not belong to {person}"
+wrong_owner_fix = "Point note: at a note for this person"
+
+[messages."W_CADENCE_OVERDUE"]
+last = "person {id} has no touchpoint on or after {start} (last was {d}, cadence {cadence_days}d)"
+last_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
+none = "person {id} has no touchpoint logged (cadence {cadence_days}d)"
+none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
+
+[messages."W_DATE_UPCOMING"]
+default = "upcoming date for {id} on {occ} (in {delta}d)"
+default_fix = "Reach out to {id} or set `[checks] personal.date_upcoming = \"off\"`"

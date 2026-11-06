@@ -168,7 +168,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "log_touch",
-            "Append a personal touchpoint ledger line (call, text, email, meet, meal, event, gift, video, or other). One commit; check-gated.",
+            "Append a personal touchpoint ledger line (call, text, email, meet, meal, event, gift, video, or other). Optional duration and 1:1/group mode describe the touch. One commit; check-gated.",
             obj(
                 &["person", "kind"],
                 json!({
@@ -177,6 +177,8 @@ fn tools() -> Vec<Value> {
                     "date": str_prop("YYYY-MM-DD; default today."),
                     "note": str_prop("Touchpoint note text; creates a note record."),
                     "src": str_prop("Source token."),
+                    "duration": str_prop("How long the touch lasted: 60m, 1h, or 1h30m."),
+                    "mode": str_prop("Social mode: one-on-one or group."),
                     "request_id": str_prop("Idempotency key."),
                     "dry_run": {"type": "boolean", "description": "Show the logical change only."},
                     "force": {"type": "boolean", "description": "Log even when an identical touchpoint is already in the ledger; use only for a genuinely separate contact the same day."},
@@ -332,7 +334,13 @@ fn build_argv(
             cli.push("touch".to_owned());
             cli.push(get_str(args, "person")?);
             cli.push(get_str(args, "kind")?);
-            for (flag, key) in [("--date", "date"), ("--note", "note"), ("--src", "src")] {
+            for (flag, key) in [
+                ("--date", "date"),
+                ("--note", "note"),
+                ("--src", "src"),
+                ("--duration", "duration"),
+                ("--mode", "mode"),
+            ] {
                 if let Some(v) = opt_str(args, key) {
                     cli.push(flag.to_owned());
                     cli.push(v);
@@ -702,6 +710,40 @@ mod tests {
             !argv.iter().any(|a| a == "--force"),
             "log_touch passed force unasked: {argv:?}"
         );
+    }
+
+    /// #741: the MCP agent surface can log a rich touch. The options must be
+    /// absent unless the caller sets them (an agent that omits them writes
+    /// the plain line).
+    #[test]
+    fn mcp_passes_rich_touch_options_only_when_set() {
+        let vault = Path::new("/tmp/vault");
+        let argv = build_argv(
+            "log_touch",
+            &json!({"person": "p-01ABC", "kind": "meal", "duration": "60m", "mode": "one-on-one"}),
+            vault,
+            &None,
+        )
+        .unwrap();
+        let value_after = |flag: &str| {
+            let at = argv
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} missing: {argv:?}"));
+            argv[at + 1].as_str()
+        };
+        assert_eq!(value_after("--duration"), "60m");
+        assert_eq!(value_after("--mode"), "one-on-one");
+
+        let argv = build_argv(
+            "log_touch",
+            &json!({"person": "p-01ABC", "kind": "meal"}),
+            vault,
+            &None,
+        )
+        .unwrap();
+        assert!(!argv.iter().any(|a| a == "--duration"), "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "--mode"), "{argv:?}");
     }
 
     #[test]

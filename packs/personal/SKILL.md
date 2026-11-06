@@ -1,21 +1,24 @@
 ---
 name: "personal"
-description: "Personal relationships, places, and things pack (personal@0.3): identity and contact fields, the touch ledger verb, birthdays/dates, keep-in-touch cadence with never/snooze, place/thing records with kind and address, relationship/place/thing edge kinds, the capture policy for what belongs in the vault, and every finding code the pack can emit — what each means and what to do about it."
+description: "Personal relationships, places, and things pack (personal@0.4): identity and contact fields, the touch ledger verb with optional duration and 1:1/group mode, birthdays/dates, keep-in-touch cadence with basis, mode note, never/snooze, place/thing records with kind and address, relationship/place/thing edge kinds, the capture policy for what belongs in the vault, and every finding code the pack can emit — what each means and what to do about it."
 ---
 
-# personal@0.3
+# personal@0.4
 
 ## What this pack adds
 
-`personal@0.3` is the 0.4 default personal pack. It keeps the 0.2 person
-schema and adds two entity types, `place` and `thing`, so the vault can hold
-**people you know, places that matter, things you're working on or care
-about, and the moments that connect them.**
+`personal@0.4` is the 0.4 default personal pack. It keeps the 0.2 person
+schema, the 0.3 places and things, and adds cadence semantics and richer
+touches, so the vault can hold **people you know, places that matter, things
+you're working on or care about, and the moments that connect them.**
 
 - People stay core `person` records; the pack owns optional fields on them
   (identity, contact details, relationship, birthdays, dates, keep-in-touch
-  cadence), the `touch` ledger verb, relationship edge kinds, and two
-  warning-level rules.
+  cadence and its basis), the `touch` ledger verb, relationship edge kinds,
+  and two warning-level rules.
+- A touch can carry an optional `duration:` and `mode:` (1:1 vs group), so a
+  60-minute session and a birthday party are facts on the line rather than
+  prose in a note.
 - `place` (`pl`, `places/`) and `thing` (`th`, `things/`) are pack-declared
   entities with required `name` and `kind`, optional `address`/`tags`/`links`,
   and their own edges. They are not person-like: no aliases, cadence, or
@@ -23,10 +26,11 @@ about, and the moments that connect them.**
 - It works alongside any external pack in one vault; each pack's data scopes
   independently (#178).
 
-**Spec 0.4:** `personal@0.3` is active only in a 0.4 vault. Vaults on spec
+**Spec 0.4:** `personal@0.4` is active only in a 0.4 vault. Vaults on spec
 0.1–0.3 keep the frozen `personal@0.2`, which is person-only and declares no
-record types. The vault `spec` selects the active built-in version; a
-`personal@…` listing does not choose a version.
+record types; `personal@0.3` is frozen and no spec selects it. The vault
+`spec` selects the active built-in version; a `personal@…` listing does not
+choose a version.
 
 The pack is **implicit**: every 0.4 vault has it, whether or not
 `confidant.toml` lists it. A vault that lists an external pack explicitly
@@ -84,7 +88,9 @@ stay in the ledger.
 | `birthday` | `YYYY-MM-DD` or `--MM-DD` | The `--MM-DD` form is year-less. |
 | `dates` | comma-separated `LABEL:DATE` | Other recurring dates (for example an anniversary). |
 | `relationship` | non-empty string | How the person relates to the operator (for example `friend`). Renamed from 0.1's `relationship_to_me`. |
-| `cadence` | `<N>d` or `never` | Keep-in-touch interval; `N` is `1..=3650`. `never` means never overdue. |
+| `cadence` | `<N>d` or `never` | Keep-in-touch interval; `N` is `1..=3650`. `never` is the explicit "none, by design": never overdue, distinct from unset. |
+| `cadence_basis` | non-empty string | Why this cadence: `observed` (a rhythm derived from touch history) or `intention` (the rhythm the operator wants). Open vocabulary. |
+| `cadence_note` | non-empty string | The mode the cadence was set for, and why it changed. Free text; private context. |
 | `snooze_until` | `YYYY-MM-DD` | One-off date; suppresses the cadence nudge until then. |
 | `kind` | non-empty string | Primary noun for a place or thing. Required on both types. |
 | `address` | non-empty string | Free-text place address; private context, never geocoded. |
@@ -105,9 +111,31 @@ dates: [anniversary:2020-06-15, graduation:--05-20]
 A year-less `--MM-DD` birthday or date has no year, so its next occurrence is
 the next `MM-DD` on or after `as_of`. A malformed value is `E_FRONTMATTER`.
 
+### Cadence semantics (#750)
+
+A cadence is a claim about the future, so record where it came from:
+
+- `cadence_basis: observed` means the interval describes a rhythm you can
+  see in the touch history. `cadence_basis: intention` means it is the
+  rhythm you want, which may differ from the observed one. `context` shows
+  the basis next to the cadence for a cleared person.
+- `cadence_note` records the mode the cadence was set for. When the
+  relationship changes shape (frequent 1:1s become occasional updates),
+  update the note and the cadence together instead of silently keeping a
+  window that no longer describes the relationship.
+- `cadence: never` is the explicit "none, by design" state. `context` marks
+  it with `cadence_never: true`, and `W_CADENCE_OVERDUE` never fires. An
+  unset `cadence` means no cadence has been chosen; the two are different
+  states and only one of them is an oversight. Pair `never` with
+  `cadence_basis: intention` to make the intent explicit.
+
+A cadence set to a number that flags the person on day one is usually the
+wrong number, not a neglected relationship. If the mode changed, revisit the
+cadence or set `never` deliberately.
+
 ## Edge kinds
 
-Core ships `married`, `introduced`, and `colleague`. `personal@0.3` adds:
+Core ships `married`, `introduced`, and `colleague`. `personal@0.4` adds:
 
 - Symmetric: `friend`, `family`, `sibling`, `partner`.
 - Directed: `parent` (`a` is the parent of `b`), `mentor` (`a` mentors `b`).
@@ -132,7 +160,7 @@ visible.
 ### `touch`
 
 ```
-DATE touch PERSON-ID call|text|email|meet|meal|event|gift|video|other [note:NOTE-ID] [src:PROVENANCE]
+DATE touch PERSON-ID call|text|email|meet|meal|event|gift|video|other [note:NOTE-ID] [src:PROVENANCE] [duration:<N>m] [mode:one-on-one|group]
 ```
 
 Records one touchpoint on a date. The kind is a closed list: `call`, `text`,
@@ -148,10 +176,21 @@ Rich, multi-person events stay in core `interaction` records. Optional
 `note:NOTE-ID` must name a note that belongs to the touched person (after
 merge canonicalization). Optional `src:PROVENANCE` dedupes re-imported lines.
 
+Optional richness (#741), both independent of the kind:
+
+- `duration:<N>m` — how long the touch lasted (`duration:60m`; `1h` and
+  `1h30m` are accepted and normalized to minutes). At least one minute.
+- `mode:one-on-one|group` — a 1:1 or a gathering. This is what lets a
+  days-since-touch read tell a birthday party from a coffee catch-up.
+
+Record what you know and omit the rest: a rough duration beats a guess, and
+a missing mode is better than a wrong one. Neither pair changes
+`W_CADENCE_OVERDUE`, and neither distinguishes two touches for idempotency.
+
 ### `confidant log touch`
 
 ```
-confidant log touch <person> <kind> [--note <text>] [--date YYYY-MM-DD] [--src <token>]
+confidant log touch <person> <kind> [--note <text>] [--date YYYY-MM-DD] [--src <token>] [--duration <N>m] [--mode one-on-one|group]
 ```
 
 Writes one `touch` ledger line in one commit. `--note <text>` creates and
@@ -233,11 +272,13 @@ Every code this pack can emit. Branch on `code`, never on message text.
 ### `E_TOUCH_MALFORMED`
 
 A `touch` line does not match either accepted shape: an unknown kind, a
-missing kind, an unexpected argument, or more than one `kind:` pair. (Core
-code, emitted by `check`.)
+missing kind, an unexpected argument, more than one `kind:` pair, or a
+`duration:` / `mode:` value outside its grammar. (Core code, emitted by
+`check`.)
 
 **Do:** rewrite the line as
-`DATE touch PERSON-ID <kind> [note:NOTE-ID] [src:…]` with a kind from
+`DATE touch PERSON-ID <kind> [note:NOTE-ID] [src:…] [duration:<N>m] [mode:one-on-one|group]`
+with a kind from
 `call`, `text`, `email`, `meet`, `meal`, `event`, `gift`, `video`, `other`. Use
 `interaction` for anything richer.
 
@@ -285,8 +326,9 @@ name the key when it is a known spec key, otherwise give the line number.
 A person with `cadence: <N>d` has no touchpoint on or after
 `as_of - N days` (and on or before `as_of`). Touchpoints are `touch` lines
 and `session` lines, after merge canonicalization. Skipped entirely
-when `cadence: never`, and while `snooze_until` is later than `as_of` (the
-person is eligible again on the snooze date; a past date has no effect).
+when `cadence: never` ("none, by design"), and while `snooze_until` is later
+than `as_of` (the person is eligible again on the snooze date; a past date
+has no effect). `cadence_basis` and `cadence_note` do not change the answer.
 
 **Do:** reach out and record it — `confidant log touch <person> <kind>`
 records the contact and clears the warning. If the cadence is wrong, edit the
@@ -318,16 +360,19 @@ can act on it. This is a nudge, not a task, and it never blocks a write.
   There is no `no_ai: notes` mode for them. An uncleared place or thing
   returns no agent `context` bundle at all, not an empty one. The operator
   path still sees it with the badge.
-- **Address is private.** `context --exclude-private` strips `address`,
-  `tags`, and `links`; `kind` stays as the type marker.
-- **Scope pack reads.** `--packs personal@0.3` limits reads to core and
-  personal-owned items in a 0.4 vault; `personal@0.2` remains a no-op alias.
+- **Address and the cadence note are private.** `context --exclude-private`
+  strips `address`, `tags`, `links`, and `cadence_note`; `kind`,
+  `cadence_basis`, and the derived cadence state stay.
+- **Scope pack reads.** `--packs personal@0.4` limits reads to core and
+  personal-owned items in a 0.4 vault; `personal@0.3` and `personal@0.2`
+  remain no-op aliases.
   Personal fields, `touch` lines, and personal edge kinds appear only when
   the pack is in scope (#178).
 - **The ledger line is plaintext.** A `touch` line carries only the date, the
-  verb, the person's own ID, and a kind from the closed list — no other
-  participant, no prose. Detail that does not fit the line goes in a note
-  via `--note`; every record, notes included, is plaintext on disk.
+  verb, the person's own ID, a kind from the closed list, and an optional
+  duration and mode — no other participant, no prose. Detail that does not
+  fit the line goes in a note via `--note`; every record, notes included, is
+  plaintext on disk.
 - **Fake data only.** Never place real names, emails, phone numbers, places,
   things, or notes in tests, fixtures, docs, or examples. Use `Ada Example`,
   `Bea Demo`, `Example Studio`, `Example Bicycle`, and fake ULIDs.

@@ -139,7 +139,7 @@ pub fn resolve_scope(
 
 /// The implicit built-in a `name@version` listing names, at any version
 /// (#551): `personal@0.1` names the active built-in (`personal@0.2` on
-/// 0.1–0.3, `personal@0.3` on 0.4). The version must be non-empty, so a
+/// 0.1–0.3, `personal@0.4` on 0.4). The version must be non-empty, so a
 /// malformed `personal@` names nothing.
 fn implicit_for_listing<'a>(implicit: &[&'a dyn Pack], listed: &str) -> Option<&'a dyn Pack> {
     let (name, version) = listed.split_once('@')?;
@@ -172,7 +172,7 @@ pub fn intersect_scope(
         for name in names {
             // Canonicalize a built-in alias before the membership check,
             // so `personal@0.1` matches the active personal ceiling (`personal@0.2`
-            // on 0.1–0.3, `personal@0.3` on 0.4). The name
+            // on 0.1–0.3, `personal@0.4` on 0.4). The name
             // must still be in the ceiling: the per-call scope never
             // widens it (#551).
             let canonical = implicit_for_listing(implicit, name)
@@ -533,11 +533,11 @@ mod tests {
         ]
     }
 
-    /// The 0.4 implicit built-in (`personal@0.3`) for scope tests.
-    fn implicit_personal_03() -> Vec<&'static dyn Pack> {
+    /// The 0.4 implicit built-in (`personal@0.4`) for scope tests.
+    fn implicit_personal_04() -> Vec<&'static dyn Pack> {
         vec![
-            crate::packs::embedded::find(crate::packs::embedded::PERSONAL_0_3)
-                .expect("personal@0.3 is embedded")
+            crate::packs::embedded::find(crate::packs::embedded::PERSONAL_0_4)
+                .expect("personal@0.4 is embedded")
                 .pack(),
         ]
     }
@@ -575,11 +575,11 @@ mod tests {
 
     #[test]
     fn resolve_scope_personal_alias_uses_the_active_builtin() {
-        let implicit = implicit_personal_03();
+        let implicit = implicit_personal_04();
         let enabled: Vec<&dyn Pack> = vec![implicit[0]];
         assert_eq!(
-            resolve_scope(Some(&["personal@0.2".to_string()]), &enabled, &implicit,).unwrap(),
-            PackScope::Only(["personal@0.3".to_string()].into_iter().collect())
+            resolve_scope(Some(&["personal@0.3".to_string()]), &enabled, &implicit,).unwrap(),
+            PackScope::Only(["personal@0.4".to_string()].into_iter().collect())
         );
     }
 
@@ -660,11 +660,11 @@ mod tests {
         assert_eq!(owner_of_field("Person", &enabled), Some(OwnerKey::Core));
         assert_eq!(owner_of_field("mystery", &enabled), None);
 
-        // #745: `kind` is a core edge key even though personal@0.3 declares
+        // #745: `kind` is a core edge key even though personal@0.4 declares
         // it as a record field. Core precedence keeps an edge's `kind:` line
         // visible under a scope that excludes personal.
-        let personal = crate::packs::embedded::find(crate::packs::embedded::PERSONAL_0_3)
-            .expect("personal@0.3 is embedded")
+        let personal = crate::packs::embedded::find(crate::packs::embedded::PERSONAL_0_4)
+            .expect("personal@0.4 is embedded")
             .pack();
         assert_eq!(owner_of_field("kind", &[personal]), Some(OwnerKey::Core));
     }
