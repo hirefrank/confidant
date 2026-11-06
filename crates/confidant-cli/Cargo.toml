@@ -23,6 +23,7 @@ dist = true
 
 [dependencies]
 anyhow.workspace = true
+axoupdater.workspace = true
 chrono.workspace = true
 clap.workspace = true
 confidant-core.workspace = true

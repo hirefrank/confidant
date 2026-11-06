@@ -186,14 +186,39 @@ Report back: CLI version (`confidant --version`), which skills you linked,
 the vault branch, the `check` result, and any `confidant doctor` warnings.
 ```
 
-**No agent?** `cargo install confidant-cli confidant-tui && confidant setup --agent auto`
-(Rust 1.88+; if `rustc --version` says "no default is configured", run
-`rustup default stable`). Prebuilt binaries are on
+**No agent?** The CLI has a one-liner that needs no Rust toolchain:
+`curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh`,
+then `confidant setup --agent auto`. With a Rust toolchain 1.88+ you can
+install both binaries instead: `cargo install confidant-cli confidant-tui &&
+confidant setup --agent auto` (if `rustc --version` says "no default is
+configured", run `rustup default stable`). Prebuilt binaries are on
 [GitHub Releases](https://github.com/hirefrank/confidant/releases) for macOS
 and Linux (x86_64), Windows under
 [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install). To update,
-re-run the installer or `cargo install` both packages, then `confidant setup`.
-Contributors: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+run `confidant update` (see [Updating](#updating)). Contributors:
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+### Updating
+
+`confidant update` compares this binary with the latest GitHub Release and
+then follows the install method it detects:
+
+- **One-liner / release installer:** it updates itself in place — the
+  receipt the installer writes says where it lives — and prints the new
+  version. Run `confidant setup` afterwards to re-link skills from the new
+  binary. The one-liner, if you prefer to re-run it yourself, is
+  `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh`.
+- **Homebrew:** it prints `brew upgrade confidant-cli`; Homebrew owns that
+  copy and Confidant never replaces it.
+- **`cargo install`:** it offers to run `cargo install confidant-cli` in an
+  interactive terminal (default No), or prints that command.
+- **Unknown:** it prints the generic reinstall guidance.
+
+If the receipt names a different copy than the running binary (two installs
+on `PATH`), `confidant update` refuses with `E_CONFLICT` instead of
+replacing the wrong one. `CONFIDANT_OFFLINE=1` skips the release check, and
+`--json` reports `install_method`, `update_command`, and `self_update`
+without changing the binary.
 
 ### Remote (optional)
 

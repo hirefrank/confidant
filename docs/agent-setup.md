@@ -12,17 +12,25 @@ current.
 ## Install
 
 ```sh
+# One-liner (no Rust toolchain needed). Writes the install receipt that
+# `confidant update` uses to replace itself later.
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh
+confidant setup --agent auto
+
+# Or, with Rust 1.88+:
 cargo install confidant-cli confidant-tui
 confidant setup --agent auto
 ```
 
 Install the CLI and TUI from the same release so their versions match;
 `confidant tui` and `confidant doctor` warn when they differ (see
-[TUI versions](#tui-versions)). This needs Rust 1.88+. If `rustc --version`
+[TUI versions](#tui-versions)). The `cargo install` path needs Rust 1.88+.
+If `rustc --version`
 fails with "no default is configured", run `rustup default stable` and
 retry. Put `~/.cargo/bin` on `PATH` first
 (`export PATH="$HOME/.cargo/bin:$PATH"`), or the next step fails with
-`confidant: command not found`.
+`confidant: command not found`. The shell installer targets `CARGO_HOME`
+too (`~/.cargo/bin` by default), so both paths end up in the same place.
 
 Prebuilt binaries for macOS (x86_64 and Apple silicon) and Linux (x86_64)
 are on [GitHub Releases](https://github.com/hirefrank/confidant/releases);
@@ -249,7 +257,7 @@ last-fetched copy.
 | Command | What |
 |---|---|
 | `confidant setup [--agent auto\|all\|a,b] [--force] [--copy] [--no-instructions] [-v]` | Materialize embedded skills, link into agent skill dirs, install the system-of-record rule, print the completion brief, both integration surfaces, and the optional-layers checklist |
-| `confidant update [--agent …] [--force] [-v]` | Report latest release, re-link skills from this binary |
+| `confidant update [--agent …] [--force] [-v]` | Report the latest release; self-replace a cargo-dist install (or print the per-method command), then re-link skills from this binary |
 | `confidant doctor` | Vault health + CLI staleness + skills link health + system-of-record rule + `git-remote` + `local-commits`, with a summary |
 | `confidant status` | One-screen readiness rollup and the completion brief; exits 1 when a required check is not `ok` |
 | `confidant sync [--dry-run] [--pull\|--push] [--yes]` | Fetch and report ahead/behind; `--pull`/`--push` are confirmed network writes |
@@ -475,21 +483,35 @@ warn when their versions differ.
 
 `confidant doctor` reports how far the local install is behind the latest
 GitHub Release (warning only — a stale install never fails `doctor`, and
-when GitHub cannot be reached it reads `staleness unknown`). Skills are
-version-locked to the CLI and share its version string. Apply updates with
-this loop:
+when GitHub cannot be reached it reads `staleness unknown`). The nudge
+names the update command that fits the detected install method. Skills are
+version-locked to the CLI and share its version string. Apply updates with:
 
-- **CLI and TUI:** compare `confidant --version` and
-  `confidant-tui --version` against the latest GitHub Release
-  (https://github.com/hirefrank/confidant/releases), or run
-  `confidant update` to be told. If behind, re-run the installer or
-  `cargo install confidant-cli confidant-tui`, then `confidant setup` to
-  re-point the skill links at the new version dir and refresh the
-  system-of-record rule. Upgrading only one of the two is what trips the
-  version warning.
+- **One-liner / release installer:** `confidant update` replaces the
+  binary in place from the receipt the installer wrote, then prints the new
+  version. Run `confidant setup` afterwards to re-point the skill links at
+  the new version dir and refresh the system-of-record rule. The equivalent
+  manual command is the one-liner:
+  `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh`.
+- **Homebrew:** `confidant update` prints `brew upgrade confidant-cli`;
+  Homebrew owns that copy and Confidant never replaces it by hand.
+- **`cargo install`:** `confidant update` offers to run
+  `cargo install confidant-cli` in an interactive terminal (default No), or
+  prints the command. Install both packages
+  (`cargo install confidant-cli confidant-tui`) and upgrade both together:
+  compare `confidant --version` and `confidant-tui --version` against the
+  latest GitHub Release (https://github.com/hirefrank/confidant/releases).
+  Upgrading only one of the two is what trips the version warning.
+- **Two copies on `PATH`:** if the install receipt names a different copy
+  than the running binary, `confidant update` refuses with `E_CONFLICT`
+  rather than replacing the wrong one. Remove the stray copy or run the one
+  the receipt names.
 - **Skills:** they re-link from the new binary — no separate step, no tag
   to pin. `doctor` warns (`skills-links`) when a detected agent is missing
   links; fix with `confidant setup --agent auto`.
+- **Offline:** `CONFIDANT_OFFLINE=1` skips the release check (and therefore
+  self-update) entirely; `--json` reports `install_method`,
+  `update_command`, and `self_update` without changing the binary.
 
 ## Optional search backend (qmd)
 

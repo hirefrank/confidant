@@ -28,6 +28,11 @@ description = "Relationship memory you own: plain-text records in a git repo, fo
 
 [workspace.dependencies]
 anyhow = "1.0"
+# cargo-dist's companion updater (#876): reads the install receipt the
+# one-liner writes, checks GitHub Releases, and runs the release installer in
+# place. `blocking` gives the sync entry point (`run_sync`); Confidant has no
+# async runtime of its own. MSRV 1.88, matching the workspace.
+axoupdater = { version = "0.10.3", features = ["blocking"] }
 chrono = { version = "0.4.38", default-features = false, features = ["alloc", "std", "clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 confidant-core = { path = "crates/confidant-core", version = "0.8.0" }
