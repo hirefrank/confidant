@@ -190,6 +190,19 @@ pub struct TouchpointView {
     pub superseded: bool,
 }
 
+/// One entry in the merged contact timeline (#749): either an interaction
+/// record or a ledger touchpoint, tagged by `type`. Built from the already
+/// filtered [`PersonContext::interactions`] and
+/// [`PersonContext::touchpoints`] arrays, so the §12 cleared set, merge
+/// canonicalization, pack scope, retirement, and the operator-only
+/// `superseded` badge apply exactly as they do there.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TimelineEntry {
+    Touch(TouchpointView),
+    Interaction(InteractionView),
+}
+
 /// One interaction record linked to the person.
 #[derive(Clone, Debug, Serialize)]
 pub struct InteractionView {
@@ -221,6 +234,11 @@ pub struct PersonContext {
     /// ledger lines. Participants in a multi-person interaction see their
     /// touchpoint here, not the interaction content. Empty for an org.
     pub touchpoints: Vec<TouchpointView>,
+    /// The merged contact timeline (#749): interactions and touchpoints in
+    /// date order, each tagged `touch` or `interaction`. It is a view over
+    /// the two arrays above (same filters, same privacy), not a third source
+    /// of truth. A dateless interaction sorts last.
+    pub timeline: Vec<TimelineEntry>,
     /// Edges whose endpoint is this entity (#813), already filtered by the
     /// §12 cleared set, the kind's endpoint declaration, merge
     /// canonicalization, and pack scope.
@@ -246,6 +264,26 @@ pub struct PersonContext {
 /// `skip_serializing_if` for the operator flag (#572).
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Sort key for the merged timeline (#749): date ascending, a dateless
+/// interaction last, and a touch before an interaction on the same date;
+/// ties break on the touch kind or the interaction id so the order is stable.
+fn timeline_sort_key(entry: &TimelineEntry) -> (bool, &str, u8, &str) {
+    match entry {
+        TimelineEntry::Touch(touch) => (
+            false,
+            touch.date.as_str(),
+            0,
+            touch.kind.as_deref().unwrap_or(""),
+        ),
+        TimelineEntry::Interaction(interaction) => (
+            interaction.date.is_none(),
+            interaction.date.as_deref().unwrap_or(""),
+            1,
+            interaction.id.as_str(),
+        ),
+    }
 }
 
 /// The declared fields of a non-person-like pack entity, in the shape their
@@ -676,6 +714,18 @@ pub fn build_context(
         });
     }
 
+    // #749: one timeline over the two filtered arrays above. Building it
+    // from them (rather than re-querying the vault) keeps the cleared set,
+    // pack scope, retirement, superseded markers, and no-ai behavior
+    // identical by construction.
+    let mut timeline: Vec<TimelineEntry> = touchpoints
+        .iter()
+        .cloned()
+        .map(TimelineEntry::Touch)
+        .chain(interactions.iter().cloned().map(TimelineEntry::Interaction))
+        .collect();
+    timeline.sort_by(|a, b| timeline_sort_key(a).cmp(&timeline_sort_key(b)));
+
     // #813: edges from this entity. The §12 allowlist scans the edge's own
     // front-matter IDs, so `cleared.contains(edge.id)` already means both
     // endpoints are cleared; the explicit endpoint checks below fail closed
@@ -810,6 +860,7 @@ pub fn build_context(
         touchpoints,
         edges,
         packs,
+        timeline,
         aliases,
         scope: scope_names,
         for_operator,
@@ -1637,6 +1688,15 @@ mod tests {
         );
         assert!(!ada_operator.touchpoints[0].superseded);
         assert!(ada_operator.touchpoints[1].superseded);
+        // #749: the merged timeline carries the same superseded markers.
+        assert_eq!(ada_bundle.timeline.len(), 1);
+        assert_eq!(ada_operator.timeline.len(), 2);
+        match &ada_operator.timeline[1] {
+            TimelineEntry::Touch(touch) => {
+                assert!(touch.superseded, "{:?}", ada_operator.timeline);
+            }
+            other => panic!("expected a touch timeline entry: {other:?}"),
+        }
         let agent_json = serde_json::to_string(&ada_bundle).unwrap();
         assert!(!agent_json.contains("superseded"), "{agent_json}");
         let operator_json = serde_json::to_string(&ada_operator).unwrap();

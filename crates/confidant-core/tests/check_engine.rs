@@ -8139,6 +8139,128 @@ fn personal_0_4_bad_provenance_is_frontmatter() {
     }
 }
 
+/// #749: `context` returns one merged, date-ordered timeline over touches and
+/// interactions, each entry tagged with its type and carrying the same fields
+/// as its source array.
+#[test]
+fn context_timeline_merges_touches_and_interactions_in_date_order() {
+    let dir = personal_04_vault(
+        "",
+        &format!(
+            "2026-10-02 touch {ADA} call\n\
+             2026-10-01 touch {ADA} meal duration:60m mode:group\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("interactions/{IXN}/interaction.md"),
+        &format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Group dinner\ndate: 2026-10-03\nperson: {ADA}\n---\n\nFake group dinner.\n"
+        ),
+    );
+    let vault = load_vault(dir.path()).unwrap();
+    let id = confidant_core::id::RecordId::parse(ADA).unwrap();
+    let bundle = build_context(&vault, &id, true, &PackScope::All, false).unwrap();
+
+    assert_eq!(
+        bundle.timeline.len(),
+        bundle.touchpoints.len() + bundle.interactions.len(),
+        "the timeline is a view over the two source arrays"
+    );
+    assert_eq!(
+        serde_json::to_value(&bundle.timeline).unwrap(),
+        json!([
+            {"type": "touch", "date": "2026-10-01", "kind": "meal", "duration_minutes": 60, "mode": "group"},
+            {"type": "touch", "date": "2026-10-02", "kind": "call"},
+            {"type": "interaction", "date": "2026-10-03", "id": IXN, "title": "Group dinner", "body": "Fake group dinner.\n"},
+        ])
+    );
+}
+
+/// #749: a dateless interaction sorts last, and a touch precedes an
+/// interaction on the same date, so the order is stable and explained.
+#[test]
+fn context_timeline_orders_dateless_last_and_touch_before_interaction() {
+    let dir = personal_04_vault("", &format!("2026-10-03 touch {ADA} call\n"));
+    write(
+        dir.path(),
+        &format!("interactions/{IXN}/interaction.md"),
+        &format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Same-day lunch\ndate: 2026-10-03\nperson: {ADA}\n---\n\nFake lunch.\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "interactions/i-01M3TC5H00MPJG0048H0000009/interaction.md",
+        &format!(
+            "---\nid: i-01M3TC5H00MPJG0048H0000009\ntype: interaction\nname: Undated catch-up\nperson: {ADA}\n---\n\nFake catch-up.\n"
+        ),
+    );
+    let vault = load_vault(dir.path()).unwrap();
+    let id = confidant_core::id::RecordId::parse(ADA).unwrap();
+    let bundle = build_context(&vault, &id, true, &PackScope::All, false).unwrap();
+    let types: Vec<&str> = bundle
+        .timeline
+        .iter()
+        .map(|entry| match entry {
+            confidant_core::context::TimelineEntry::Touch(_) => "touch",
+            confidant_core::context::TimelineEntry::Interaction(_) => "interaction",
+        })
+        .collect();
+    assert_eq!(
+        types,
+        vec!["touch", "interaction", "interaction"],
+        "{types:?}"
+    );
+    let json = serde_json::to_value(&bundle.timeline).unwrap();
+    assert_eq!(json[0]["date"], "2026-10-03", "{json}");
+    assert_eq!(json[1]["title"], "Same-day lunch", "{json}");
+    assert_eq!(json[2]["title"], "Undated catch-up", "{json}");
+    assert!(json[2]["date"].is_null(), "{json}");
+}
+
+/// #749: the timeline honors no-ai exactly like the source arrays. A hidden
+/// interaction is absent from the agent timeline (and its body never leaks);
+/// the operator path includes it with the badge.
+#[test]
+fn context_timeline_honours_no_ai_like_the_source_arrays() {
+    let dir = personal_04_vault("", "");
+    write(
+        dir.path(),
+        &format!("interactions/{IXN}/interaction.md"),
+        &format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Visible lunch\ndate: 2026-10-03\nperson: {ADA}\n---\n\nVisible body.\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "interactions/i-01M3TC5H00MPJG0048H0000009/interaction.md",
+        &format!(
+            "---\nid: i-01M3TC5H00MPJG0048H0000009\ntype: interaction\nname: Hidden lunch\ndate: 2026-10-04\nperson: {ADA}\nno-ai: true\n---\n\nHIDDEN0BODY.\n"
+        ),
+    );
+    let vault = load_vault(dir.path()).unwrap();
+    let id = confidant_core::id::RecordId::parse(ADA).unwrap();
+
+    let agent = build_context(&vault, &id, true, &PackScope::All, false).unwrap();
+    assert_eq!(agent.timeline.len(), 1, "{:?}", agent.timeline);
+    let dumped = serde_json::to_string(&agent).unwrap();
+    assert!(!dumped.contains("HIDDEN0BODY"), "{dumped}");
+    assert!(!dumped.contains("Hidden lunch"), "{dumped}");
+
+    let operator = build_context(&vault, &id, true, &PackScope::All, true).unwrap();
+    assert_eq!(operator.timeline.len(), 2, "{:?}", operator.timeline);
+    let json = serde_json::to_value(&operator.timeline).unwrap();
+    let hidden = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["title"] == "Hidden lunch")
+        .expect("operator sees the hidden interaction");
+    assert_eq!(hidden["no_ai"], "true", "{hidden}");
+    assert_eq!(hidden["body"], "HIDDEN0BODY.\n", "{hidden}");
+}
+
 // ---------------------------------------------------------------------------
 // personal@0.2 embedded declarative pack (#550, cutover #551)
 //
