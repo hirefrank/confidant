@@ -68,12 +68,21 @@ LEDGER_VAULT_LINE = 1
 OLD_PROBE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’\- ]{8,}")
 
 FAKE_QMD = '''#!/usr/bin/env python3
-"""Fake qmd: `status` reports no vectors, everything else prints canned hits."""
+"""Fake qmd: `status` reports $FAKE_QMD_VECTORS vectors, else canned hits.
+
+When $FAKE_QMD_ARGV_LOG is set, every invocation appends its argv as JSON, so
+tests can assert which flags the wrapper passed through (issues #794).
+"""
+import json
 import os
 import sys
 
+if os.environ.get("FAKE_QMD_ARGV_LOG"):
+    with open(os.environ["FAKE_QMD_ARGV_LOG"], "a", encoding="utf-8") as log:
+        log.write(json.dumps(sys.argv[1:]) + "\\n")
+
 if len(sys.argv) > 1 and sys.argv[1] == "status":
-    print("Vectors: 0 embedded")
+    print("Vectors: %s embedded" % os.environ.get("FAKE_QMD_VECTORS", "0"))
     sys.exit(0)
 with open(os.environ["FAKE_QMD_HITS"], encoding="utf-8") as f:
     print(f.read())
@@ -175,12 +184,15 @@ class QmdQueryTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def query(self, hits, query="anything", packs=None, with_qmd=True):
+    def query(self, hits, query="anything", packs=None, with_qmd=True,
+              extra=(), vectors=0):
         """Run qmd-query.py; return (returncode, parsed stdout, spawn log)."""
         hits_file = self.root / "hits.json"
         hits_file.write_text(json.dumps(hits), encoding="utf-8")
         spawn_log = self.root / "spawns.log"
         spawn_log.write_text("", encoding="utf-8")
+        argv_log = self.root / "qmd-argv.log"
+        argv_log.write_text("", encoding="utf-8")
         bindir = self.bin if with_qmd else self.root / "no-qmd"
         if with_qmd:
             path = f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"
@@ -192,10 +204,13 @@ class QmdQueryTest(unittest.TestCase):
             path = os.pathsep.join([str(bindir), os.path.dirname(sys.executable),
                                     "/usr/bin", "/bin"])
         env = dict(os.environ, PATH=path, FAKE_QMD_HITS=str(hits_file),
-                   CONFIDANT_SPAWN_LOG=str(spawn_log))
+                   CONFIDANT_SPAWN_LOG=str(spawn_log),
+                   FAKE_QMD_ARGV_LOG=str(argv_log),
+                   FAKE_QMD_VECTORS=str(vectors))
         argv = [sys.executable, str(QUERY), "--vault", str(self.vault)]
         if packs:
             argv += ["--packs", packs]
+        argv += list(extra)
         argv.append(query)
         p = subprocess.run(argv, capture_output=True, text=True, env=env)
         data = json.loads(p.stdout) if p.stdout.strip() else None
@@ -260,6 +275,36 @@ class QmdQueryTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.paths(data), [LINKED_NOTE, LEDGER_REL])
         self.assertEqual(data["dropped_uncleared"], 1)
+
+    def test_hybrid_cpu_fallback_flags_are_forwarded(self):
+        """#794: hybrid --no-rerank and -C reach qmd; the JSON mode is hybrid."""
+        p, data, _ = self.query(
+            [hit(LINKED_NOTE, 5, "Kickofftoken. Dana wants a vault that agents can write.")],
+            extra=["--mode", "hybrid", "--no-rerank", "-C", "5"],
+            vectors=3,
+        )
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(data["mode"], "hybrid")
+        lines = (self.root / "qmd-argv.log").read_text(encoding="utf-8").splitlines()
+        argv = json.loads(lines[-1])
+        self.assertEqual(argv[:2], ["query", "anything"])
+        self.assertIn("--no-rerank", argv)
+        self.assertEqual(argv[argv.index("-C") + 1], "5")
+
+    def test_cpu_fallback_flags_are_rejected_without_hybrid(self):
+        """#794 flags describe the rerank stage, which only hybrid has."""
+        for extra in (["--mode", "bm25", "--no-rerank"],
+                      ["--mode", "vector", "-C", "5"]):
+            p, _, _ = self.query([], extra=extra, vectors=3)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertEqual(p.returncode, 1, p.stderr)
+            self.assertIn("only to --mode hybrid", p.stderr)
+
+    def test_candidate_limit_must_be_positive(self):
+        p, _, _ = self.query([], extra=["--mode", "hybrid", "-C", "0"], vectors=3)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("at least 1", p.stderr)
 
     def test_fallback_when_qmd_is_missing(self):
         """No qmd: plain `find` fallback and the JSON contract are unchanged."""
@@ -678,6 +723,48 @@ class QmdQueryConfigTest(unittest.TestCase):
             data = json.loads(out.getvalue())
             self.assertEqual(data["mode"], "find-fallback")
             self.assertEqual(data["fallback_hint"], want)
+
+    def test_hybrid_timeout_hint_names_the_rerank_fallback(self):
+        """#794: a stalled rerank must say so, not blame the hub alone."""
+        vault = Path(self.tmp.name) / "vault"
+        vault.mkdir()
+        (vault / "confidant.toml").write_text("", encoding="utf-8")
+        (vault / ".confidant" / "qmd-corpus").mkdir(parents=True)
+        find_envelope = {"ok": True, "matches": [
+            {"path": "people/p-01M3TC5H00MPJG000000000101/profile.md"}]}
+
+        def fake_run(cmd, **kwargs):
+            if "find" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=json.dumps(find_envelope), stderr="")
+            if len(cmd) > 1 and cmd[1] == "status":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="Vectors: 3 embedded\n", stderr="")
+            raise subprocess.TimeoutExpired(cmd, 180)
+
+        def run(argv):
+            out = io.StringIO()
+            with unittest.mock.patch.object(sys, "argv", argv), \
+                    unittest.mock.patch.object(
+                        shutil, "which", return_value="/fake/bin"), \
+                    unittest.mock.patch.object(
+                        subprocess, "run", side_effect=fake_run), \
+                    contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = self.query.main()
+            self.assertEqual(code, 0)
+            return json.loads(out.getvalue())
+
+        base = ["qmd-query.py", "--vault", str(vault), "--mode", "hybrid"]
+        data = run(base + ["hello"])
+        hint = data["fallback_hint"]
+        self.assertIn("Reranking", hint)
+        self.assertIn("--no-rerank", hint)
+        self.assertIn("--mode bm25", hint)
+
+        # Already using the fallback: the rerank note is not repeated.
+        data = run(base + ["--no-rerank", "hello"])
+        self.assertEqual(data["fallback_hint"], self.query.TIMEOUT_HINT)
 
 
 class QmdPreflightTest(unittest.TestCase):
