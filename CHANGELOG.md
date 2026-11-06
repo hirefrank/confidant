@@ -17,6 +17,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 - Spec 0.3 pack-declared record types (#814): a v3 pack manifest may claim `[[record_types]]` with a two-letter ID prefix, collection, main file, entity/person-like flags, `no_ai` policy, roster visibility, and required/optional fields. `record add`/`edit`/`list`, `context`, `schema`, `allowlist`, `find`, and MCP `note_add` accept these types; `entity:` attaches notes and interactions to any declared entity. The built-in `personal@0.2` pack stays person-only in 0.3; spec 0.4 selects `personal@0.3` (above). A checked-in `testdata/vaults/place-0.3` fixture and golden cover an external place pack, an `entity:` note, a hidden edge, and the pack pin.
 - Spec 0.3 edge-level `no-ai` (#820): an edge may carry `no-ai: true` / `false`. A hidden edge is omitted from every agent read while both endpoints stay visible; the operator path still sees it and `context` badges it. Orgs remain `no-ai`-free; 0.2 vaults reject the edge key with `E_FRONTMATTER`.
 
+### Fixed
+- Re-running `confidant init` on an existing vault no longer resets a per-vault git identity in `<vault>/.git/config` to `Confidant Operator`; the neutral identity is written only for keys the vault has not set, so the override the `FALLBACK_GIT_NAME` docs describe survives. `init --help` and the init comments now describe the always-neutral default instead of "only when git has no identity".
+
 ## [0.8.0] - 2026-11-01
 
 ### Breaking

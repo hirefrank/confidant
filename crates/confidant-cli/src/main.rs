@@ -327,8 +327,9 @@ enum Command {
     /// (`people/`, `orgs/`, `deals/`, `interactions/`, `notes/`, `edges/`,
     /// `ledger/`) are created, and a minimal `confidant.toml` is written
     /// (its `packs` list comes from the global `--packs` flag, defaulting
-    /// to `[]`) and committed. When git has no identity at all, a
-    /// repo-local fallback identity is set so the skeleton commit works.
+    /// to `[]`) and committed. A neutral repo-local git identity is set
+    /// (even when a global one exists, so it never leaks into the vault's
+    /// history); a per-vault identity already in `.git/config` is kept.
     /// `--remote <url>` then adds `origin` (it does not push). Only packs
     /// built into this binary (today the implicit `personal@0.2`) may be
     /// listed: an external pack is vendored into an existing vault by
@@ -8443,7 +8444,8 @@ const FALLBACK_GIT_NAME: &str = "Confidant Operator";
 const FALLBACK_GIT_EMAIL: &str = "operator@confidant.local";
 
 /// Create the collection directories and write the repo-local fallback
-/// identity into `<vault>/.git/config`. Both steps are idempotent.
+/// identity into `<vault>/.git/config` for any key the vault has not set.
+/// Both steps are idempotent, and a per-vault override survives a re-run.
 fn initialize_vault_shape(root: &Path, no_input: bool) -> anyhow::Result<()> {
     for dir in VAULT_DIRS {
         std::fs::create_dir_all(root.join(dir)).map_err(|e| {
@@ -8456,6 +8458,12 @@ fn initialize_vault_shape(root: &Path, no_input: bool) -> anyhow::Result<()> {
         ("user.name", FALLBACK_GIT_NAME),
         ("user.email", FALLBACK_GIT_EMAIL),
     ] {
+        // `git config --get` exits non-zero when the key is unset; only then
+        // write the neutral value, so an operator's per-vault edit is kept.
+        if confidant_core::write::git(root, &["config", "--local", "--get", key], no_input).is_ok()
+        {
+            continue;
+        }
         confidant_core::write::git(root, &["config", "--local", key, value], no_input)?;
     }
     Ok(())
@@ -8774,9 +8782,9 @@ fn bootstrap_vault(cli: &Cli, create: bool) -> anyhow::Result<BootstrapPlan> {
         )?;
     }
 
-    // The vault's shape (`people/` … `ledger/`) and, on a machine with no
-    // git identity at all, the repo-local fallback identity the skeleton
-    // commit needs. An operator's real identity is never overridden.
+    // The vault's shape (`people/` … `ledger/`) and the neutral repo-local
+    // identity the skeleton commit uses, so the operator's global identity
+    // never lands in the vault's history.
     initialize_vault_shape(&root, no_input)?;
 
     // `.confidant/` holds the plaintext search corpus and must never be
@@ -8862,7 +8870,7 @@ fn bootstrap_vault(cli: &Cli, create: bool) -> anyhow::Result<BootstrapPlan> {
 /// Records are plaintext, so there is no key, keychain, anchor, or recovery
 /// step. With `--create` the skeleton is already written and committed by
 /// [`bootstrap_vault`], including the collection directories and a
-/// repo-local fallback git identity when the machine has none; this
+/// neutral repo-local git identity; this
 /// validates the result and reports the plan. Without `--create` the same
 /// idempotent shape step runs on the existing vault.
 fn cmd_init(cli: &Cli, root: &Path, scaffold: Option<Scaffold>) -> anyhow::Result<ExitCode> {
@@ -8908,7 +8916,7 @@ fn cmd_init(cli: &Cli, root: &Path, scaffold: Option<Scaffold>) -> anyhow::Resul
         Some(mut scaffold) => scaffold.disarm(),
         // `--create` on an existing vault, or `init` on a hand-written one:
         // make the on-disk shape match what a fresh scaffold produces.
-        // Idempotent, and it never overwrites an existing identity.
+        // Idempotent, and it keeps a per-vault identity already set.
         None => initialize_vault_shape(root, no_input)?,
     }
     if json {
