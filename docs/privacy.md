@@ -334,8 +334,16 @@ reports `staleness check disabled`.
 
 `confidant update` makes the same request (same endpoint, same
 `CONFIDANT_OFFLINE=1` opt-out) to decide whether the local binary is behind
-the latest release. When behind, `update` re-links nothing and tells you to
-upgrade the binary first.
+the latest release. For a cargo-dist (one-liner) install it then downloads
+`sha256.sum` and the release installer from
+`github.com/hirefrank/confidant/releases`, checks the installer's embedded
+archive checksums against that file, and runs the installer, which
+re-verifies the platform archive before replacing the binary in place under
+the prefix named by the install receipt. No vault
+data is sent. Homebrew and `cargo install` installs are never replaced:
+`update` prints the command that owns them, and `--json` never changes the
+binary. When behind, `update` re-links nothing: skills are re-linked from
+the new binary by `confidant setup`.
 
 `confidant status` makes the same request (same endpoint, same
 `CONFIDANT_OFFLINE=1` opt-out) as part of its readiness rollup, which reuses

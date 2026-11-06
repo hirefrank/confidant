@@ -28,7 +28,7 @@ use confidant_core::config::parse_iso_date;
 use confidant_core::config::UserConfig;
 use confidant_core::context::build_context;
 use confidant_core::discover::{load_user_config, resolve, Discovery};
-use confidant_core::error::DomainError;
+use confidant_core::error::{DomainError, ErrorKind};
 use confidant_core::id::{Prefix, RecordId};
 use confidant_core::ledger::{
     format_entry, line_fingerprint, parse_line, parse_strict_date, LineRef, RetractReason,
@@ -3745,19 +3745,37 @@ fn cmd_log_touch(
     finish_write(cli, root, "log-touch", outcome, extra)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The app name cargo-dist uses for Confidant: the package name. It names
+/// the release assets (`confidant-cli-installer.sh`) and the receipt
+/// directory/file (`<config>/confidant-cli/confidant-cli-receipt.json`).
+const DIST_APP_NAME: &str = "confidant-cli";
+
+/// The published one-liner. For a cargo-dist install it is also the update
+/// command: re-running it installs the latest release over the old copy.
+const DIST_INSTALLER_ONELINER: &str = "curl --proto '=https' --tlsv1.2 -LsSf \
+     https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum InstallMethod {
-    /// The binary lives in `<cargo-home>/bin`. This covers `cargo install`;
-    /// the cargo-dist shell installer also targets `CARGO_HOME`, so an
-    /// installer-based setup lands here too and gets the `cargo install`
-    /// command, which is a working upgrade path for both.
+    /// A cargo-dist install (the one-liner / release installer), identified
+    /// by the receipt that installer writes (#876). The receipt's install
+    /// prefix is captured so `update` can refuse the wrong-copy case.
+    CargoDist {
+        install_prefix: PathBuf,
+    },
+    /// A Homebrew formula install (`brew upgrade confidant-cli`).
+    Brew,
+    /// The binary lives in `<cargo-home>/bin`, installed with
+    /// `cargo install confidant-cli`.
     CargoInstall,
     Unknown,
 }
 
 impl InstallMethod {
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
+            InstallMethod::CargoDist { .. } => "cargo-dist",
+            InstallMethod::Brew => "brew",
             InstallMethod::CargoInstall => "cargo-install",
             InstallMethod::Unknown => "unknown",
         }
@@ -3765,35 +3783,203 @@ impl InstallMethod {
 
     /// The single update command to print for this method, or `None` when
     /// the method is unknown (the caller prints the generic wording).
-    fn update_command(self) -> Option<&'static str> {
+    fn update_command(&self) -> Option<&'static str> {
         match self {
+            InstallMethod::CargoDist { .. } => Some(DIST_INSTALLER_ONELINER),
+            InstallMethod::Brew => Some("brew upgrade confidant-cli"),
             InstallMethod::CargoInstall => Some("cargo install confidant-cli"),
             InstallMethod::Unknown => None,
         }
     }
 
-    /// Program + argv to run when the operator confirms the offer.
-    fn run_spec(self) -> Option<(&'static std::ffi::OsStr, &'static [&'static str])> {
+    /// Program + argv to run when the operator confirms the offer. Only
+    /// `cargo install` is offered: a cargo-dist install self-replaces from
+    /// its verified release installer (#876), and brew must never be
+    /// replaced by hand.
+    fn run_spec(&self) -> Option<(&'static std::ffi::OsStr, &'static [&'static str])> {
         match self {
             InstallMethod::CargoInstall => {
                 Some((std::ffi::OsStr::new("cargo"), &["install", "confidant-cli"]))
             }
-            InstallMethod::Unknown => None,
+            InstallMethod::CargoDist { .. } | InstallMethod::Brew | InstallMethod::Unknown => None,
         }
+    }
+
+    /// Whether `confidant update` can replace this install in place.
+    fn self_updates(&self) -> bool {
+        matches!(self, InstallMethod::CargoDist { .. })
     }
 }
 
-/// Detect the install method from the running binary's path (#376). The
-/// path is injected so the detection is unit-testable; production passes
-/// `std::env::current_exe()`.
-fn detect_install_method(exe_path: &Path) -> InstallMethod {
+/// A cargo-dist install receipt, reduced to what detection and the
+/// wrong-copy guard need.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstallReceipt {
+    /// Where the receipt was found (for the wrong-copy message).
+    path: PathBuf,
+    /// The prefix the installer wrote to (`install_prefix` in the receipt).
+    install_prefix: PathBuf,
+}
+
+/// Result of install-method detection.
+#[derive(Debug, PartialEq, Eq)]
+struct InstallDetection {
+    method: InstallMethod,
+    /// Set when a cargo-dist receipt exists but its install prefix does not
+    /// contain the running binary: two copies on disk, so trusting the
+    /// receipt could replace the wrong one (#876). `update` refuses loudly;
+    /// every other caller falls back to the generic wording.
+    stray_receipt: Option<InstallReceipt>,
+}
+
+/// Candidate receipt directories, mirroring the cargo-dist installer's
+/// search: `$XDG_CONFIG_HOME` first, then the platform default
+/// (`%LOCALAPPDATA%` on Windows, `~/.config` elsewhere). Windows is not a
+/// supported target (#502), but detection stays in parity with the
+/// installer so a WSL2-adjacent native run still reads its own receipt.
+fn receipt_config_roots(
+    xdg_config_home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    home: Option<PathBuf>,
+    windows: bool,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(xdg) = xdg_config_home.filter(|p| !p.as_os_str().is_empty()) {
+        roots.push(xdg.join(DIST_APP_NAME));
+    }
+    if windows {
+        if let Some(local) = local_app_data.filter(|p| !p.as_os_str().is_empty()) {
+            roots.push(local.join(DIST_APP_NAME));
+        }
+    } else if let Some(home) = home.filter(|p| !p.as_os_str().is_empty()) {
+        roots.push(home.join(".config").join(DIST_APP_NAME));
+    }
+    roots
+}
+
+/// The first existing install receipt, in the same order the installer
+/// looks. `None` when no receipt exists (a `cargo install`, brew, or
+/// distro-package install).
+fn install_receipt_path() -> Option<PathBuf> {
+    // Integration-test hook: point detection at a known receipt (or at a
+    // path that does not exist) without touching the real config dir.
+    #[cfg(feature = "test-overrides")]
+    if let Ok(path) = std::env::var("CONFIDANT_TEST_RECEIPT_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    receipt_config_roots(
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        setup::home_dir().ok(),
+        cfg!(windows),
+    )
+    .into_iter()
+    .map(|root| root.join(format!("{DIST_APP_NAME}-receipt.json")))
+    .find(|path| path.is_file())
+}
+
+/// Parse a cargo-dist install receipt. A missing, unreadable, or malformed
+/// receipt is `None`: detection then falls back to the binary path, never to
+/// a guess about a partial file.
+fn read_install_receipt(path: &Path) -> Option<InstallReceipt> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let install_prefix = value.get("install_prefix")?.as_str()?;
+    if install_prefix.is_empty() {
+        return None;
+    }
+    Some(InstallReceipt {
+        path: path.to_path_buf(),
+        install_prefix: PathBuf::from(install_prefix),
+    })
+}
+
+/// Normalize a path for the receipt comparison: forward slashes, no trailing
+/// separator. Windows-style input stays comparable on every platform, the
+/// same trick the existing path-based detection uses.
+fn normalized_path(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if normalized.len() > 1 {
+        normalized.trim_end_matches('/').to_owned()
+    } else {
+        normalized
+    }
+}
+
+/// Whether the receipt's install prefix would have put the binary at
+/// `exe_path`. The receipt may name either the prefix root (`~/.cargo`) or
+/// its `bin` dir (`~/.cargo/bin`, cargo-dist wrote that shape for a while);
+/// both contain the running binary.
+fn receipt_contains_exe(install_prefix: &Path, exe_path: &Path) -> bool {
+    let prefix = normalized_path(install_prefix);
+    let exe = normalized_path(exe_path);
+    if prefix.is_empty() || exe.is_empty() {
+        return false;
+    }
+    exe == prefix || exe.starts_with(&format!("{prefix}/"))
+}
+
+/// Detect the install method from the running binary and any cargo-dist
+/// install receipt (#376, #876). The path is injected so detection is
+/// unit-testable; production passes `std::env::current_exe()`.
+fn detect_install_method(exe_path: &Path) -> InstallDetection {
+    let receipt = install_receipt_path().and_then(|path| read_install_receipt(&path));
+    detect_install_with_receipt(exe_path, receipt)
+}
+
+fn detect_install_with_receipt(
+    exe_path: &Path,
+    receipt: Option<InstallReceipt>,
+) -> InstallDetection {
+    if let Some(receipt) = receipt {
+        if receipt_contains_exe(&receipt.install_prefix, exe_path) {
+            return InstallDetection {
+                method: InstallMethod::CargoDist {
+                    install_prefix: receipt.install_prefix,
+                },
+                stray_receipt: None,
+            };
+        }
+        // Wrong-copy case (#876): the receipt describes a different copy
+        // (for example a one-liner install in `~/.local/bin` while this
+        // binary came from a package manager, or the reverse). Never trust
+        // it and never fall through to a path-based guess that could
+        // replace the wrong copy: report Unknown here, and let `update`
+        // turn it into a loud E_CONFLICT.
+        return InstallDetection {
+            method: InstallMethod::Unknown,
+            stray_receipt: Some(receipt),
+        };
+    }
+    InstallDetection {
+        method: detect_install_method_from_path(exe_path),
+        stray_receipt: None,
+    }
+}
+
+/// Path-only detection, used when no receipt is present.
+fn detect_install_method_from_path(exe_path: &Path) -> InstallMethod {
     // Normalize separators so Windows-style paths stay detectable on any
     // platform (unit tests run on Linux/macOS/Windows alike).
-    let normalized = exe_path.to_string_lossy().replace('\\', "/");
+    let normalized = normalized_path(exe_path);
+    // `cargo install` (and a cargo-dist install without a receipt) puts the
+    // binary in `<cargo-home>/bin`.
     if normalized.contains("/.cargo/bin/") {
         return InstallMethod::CargoInstall;
     }
+    // Homebrew: the Cellar for versioned kegs, or any homebrew prefix.
+    if normalized.contains("/Cellar/") || normalized.contains("/homebrew/") {
+        return InstallMethod::Brew;
+    }
     InstallMethod::Unknown
+}
+
+/// The update command to show in the `doctor`/`status` staleness nudge, or
+/// `None` to keep the generic `cargo install` fallback.
+fn staleness_update_hint() -> Option<&'static str> {
+    detect_install_method(&offer_exe_path())
+        .method
+        .update_command()
 }
 
 /// The binary path the update/check offers reason about. Under
@@ -3812,7 +3998,7 @@ fn offer_exe_path() -> PathBuf {
 /// install method must be known and replacing the running binary must be
 /// safe. `self_replace_safe` is injected for tests; production passes `true`
 /// (unix always allows overwriting the running binary).
-fn offerable_update(method: InstallMethod, self_replace_safe: bool) -> bool {
+fn offerable_update(method: &InstallMethod, self_replace_safe: bool) -> bool {
     method.run_spec().is_some() && self_replace_safe
 }
 
@@ -6419,9 +6605,16 @@ fn parse_release_version(tag: &str) -> Option<(u64, u64, u64)> {
 /// ahead and equal are `ok`, and undetermined (no tag, or an unparseable
 /// tag) is `unknown` (#709). With `offline`, the fetch was skipped by
 /// operator choice — a determined state, not an undetermined one — so
-/// the check reports `ok` "disabled".
-fn cli_staleness_check(latest: Option<String>, offline: bool) -> DoctorCheck {
+/// the check reports `ok` "disabled". `update_hint` is the per-method update
+/// command from [`InstallMethod::update_command`] (#876); `None` keeps the
+/// `cargo install` fallback that older installs already know.
+fn cli_staleness_check(
+    latest: Option<String>,
+    offline: bool,
+    update_hint: Option<&str>,
+) -> DoctorCheck {
     let local = env!("CARGO_PKG_VERSION");
+    let update_hint = update_hint.unwrap_or("cargo install confidant-cli");
     let (status, message) = if offline {
         ("ok", STALENESS_DISABLED.to_owned())
     } else {
@@ -6432,7 +6625,7 @@ fn cli_staleness_check(latest: Option<String>, offline: bool) -> DoctorCheck {
                     "warning",
                     format!(
                         "confidant-cli {local} is behind the latest release {tag}; \
-                         update with `cargo install confidant-cli`"
+                         update with `{update_hint}`"
                     ),
                 ),
                 (Some(local_v), Some(latest_v)) if local_v > latest_v => (
@@ -7942,7 +8135,11 @@ fn collect_doctor_checks(cli: &Cli, root: &Path) -> Vec<DoctorCheck> {
     {
         let offline = staleness_offline();
         let latest = if offline { None } else { latest_release_tag() };
-        checks.push(cli_staleness_check(latest, offline));
+        checks.push(cli_staleness_check(
+            latest,
+            offline,
+            staleness_update_hint(),
+        ));
         checks.push(skills_links_check());
         // #727: skill links only reach sessions that load a skill; the
         // system-of-record rule belongs in the agent's always-on file.
@@ -8237,7 +8434,10 @@ fn readiness_checks(cli: &Cli, vault: Option<&Path>) -> Vec<ReadinessCheck> {
             let offline = staleness_offline();
             let latest = if offline { None } else { latest_release_tag() };
             vec![
-                ReadinessCheck::from_doctor(cli_staleness_check(latest, offline), true),
+                ReadinessCheck::from_doctor(
+                    cli_staleness_check(latest, offline, staleness_update_hint()),
+                    true,
+                ),
                 ReadinessCheck::from_doctor(tui_version_check(), false),
                 ReadinessCheck {
                     id: "vault-discovery",
@@ -10094,11 +10294,28 @@ fn setup_next_steps(cli: &Cli, verbose: bool) -> anyhow::Result<()> {
 }
 
 fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Result<ExitCode> {
-    // Self-update via the cargo-dist updater is not yet wired: `update`
-    // reports the latest release, offers to run the matching upgrade
-    // command (#376), and re-links skills from this binary.
+    // `update` reports the latest release, offers to run the matching
+    // upgrade command (#376), self-replaces a cargo-dist install (#876),
+    // and re-links skills from this binary.
     // Honor CONFIDANT_OFFLINE=1 like `doctor` (no network at all).
     let offline = staleness_offline();
+    let exe = offer_exe_path();
+    let detection = detect_install_method(&exe);
+    // #876: a receipt on disk that names a different copy must never drive a
+    // self-replacement (the two-copies-on-PATH failure mode). Fail loudly
+    // before any network call instead of silently updating the wrong one.
+    if let Some(stray) = &detection.stray_receipt {
+        return Err(anyhow::Error::new(DomainError::conflict(format!(
+            "a cargo-dist install receipt at {} names {}, but this binary is {}; refusing to update either copy",
+            stray.path.display(),
+            stray.install_prefix.display(),
+            exe.display(),
+        )))
+        .with_fix(
+            "Run the copy the receipt names, or remove the stale receipt and reinstall with the one-liner",
+        ));
+    }
+    let method = detection.method;
     let latest = if offline { None } else { latest_release_tag() };
     let local = env!("CARGO_PKG_VERSION");
     // Behind-ness is computed once and shared by the human and JSON paths.
@@ -10108,9 +10325,22 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
             .zip(parse_release_version(tag))
             .map(|(l, r)| l < r)
     });
-    let method = detect_install_method(&offer_exe_path());
-    let upgrade_cmd =
-        "update the binary first (re-run the installer or `cargo install confidant-cli`), then re-run `confidant setup`.";
+    // The generic wording is the fallback for installs we cannot name.
+    let upgrade_cmd = match method.update_command() {
+        Some(cmd) => format!("update with `{cmd}`, then re-run `confidant setup`."),
+        None => "update the binary first (re-run the installer or `cargo install confidant-cli`), then re-run `confidant setup`.".to_owned(),
+    };
+    // Whether this install can be replaced in place, and whether this run
+    // would do it. `--json` is inspect-only (#376), so it never self-updates.
+    let self_update = if !method.self_updates() {
+        "unavailable"
+    } else if offline {
+        "disabled"
+    } else if behind == Some(true) {
+        "available"
+    } else {
+        "current"
+    };
     if cli.json {
         // The JSON path never prompts and never runs anything (#376); the
         // new fields are additive.
@@ -10136,6 +10366,10 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                     .update_command()
                     .map(|c| Value::String(c.to_owned()))
                     .unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "self_update".to_owned(),
+                Value::String(self_update.to_owned()),
             );
         }
         if behind == Some(true) {
@@ -10164,10 +10398,30 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
             Some(tag) => {
                 if behind == Some(true) {
                     // Never re-link from a behind binary: the installed
-                    // skills would be stale on arrival. Print the single
-                    // command that fits this install; in an interactive
-                    // terminal, offer to run it (default No). `--dry-run`
-                    // prints the command and never offers or runs it (#668).
+                    // skills would be stale on arrival.
+                    if let InstallMethod::CargoDist { install_prefix } = &method {
+                        // A cargo-dist install replaces itself (#876): the
+                        // operating system swap is the update, so no y/N
+                        // offer is needed. `--dry-run` only reports (#668).
+                        // Native Windows cannot overwrite a running exe, and
+                        // is unsupported anyway (#502): print the one-liner.
+                        if cli.dry_run {
+                            println!("confidant {local} is behind the latest release {tag}; would self-update in place, then re-run `confidant setup`.");
+                        } else if cfg!(windows) {
+                            println!("confidant {local} is behind the latest release {tag}; run `{DIST_INSTALLER_ONELINER}`, then re-run `confidant setup`.");
+                        } else {
+                            println!("confidant {local} is behind the latest release {tag}; updating in place…");
+                            let new_version = self_update_cargo_dist(install_prefix, tag)?;
+                            println!(
+                                "updated to {new_version}. Run `confidant setup` to re-link skills from the new binary."
+                            );
+                        }
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    // Print the single command that fits this install; in an
+                    // interactive terminal, offer to run it (default No).
+                    // `--dry-run` prints the command and never offers or
+                    // runs it (#668).
                     if let (Some(cmd), Some((program, args))) =
                         (method.update_command(), method.run_spec())
                     {
@@ -10175,7 +10429,7 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                             println!("confidant {local} is behind the latest release {tag}; would run `{cmd}`, then re-run `confidant setup`.");
                         } else {
                             println!("confidant {local} is behind the latest release {tag}; run `{cmd}`, then re-run `confidant setup`.");
-                            if offerable_update(method, true)
+                            if offerable_update(&method, true)
                                 && confirm_yn(&format!("run `{cmd}` now?"), cli.no_input, cli.json)?
                             {
                                 match run_offered_command(cmd, program, args) {
@@ -10214,6 +10468,257 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
         }
     }
     relink_after_update(agent, force, verbose, cli.dry_run)
+}
+
+/// A typed, expected update failure (ADR-7): exit 1 with a stable code, not
+/// `internal_error`. The fix names the one-liner, which always works.
+fn update_failed(detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(DomainError::new(ErrorKind::UpdateFailed, detail)).with_fix(
+        "Re-run the installer: curl --proto '=https' --tlsv1.2 -LsSf \
+         https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh",
+    )
+}
+
+/// Release-asset download base (everything before the tag). Integration
+/// tests point this at a local stub so no test touches GitHub.
+fn release_download_base() -> String {
+    #[cfg(feature = "test-overrides")]
+    if let Ok(base) = std::env::var("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL") {
+        return base;
+    }
+    "https://github.com/hirefrank/confidant/releases/download".to_owned()
+}
+
+/// The release archive for the platform this binary was built for, matching
+/// `dist-workspace.toml`'s targets. `None` on anything else: self-update
+/// refuses with a typed error whose fix is the one-liner, rather than
+/// guessing at an archive name.
+fn release_target_archive() -> Option<&'static str> {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("confidant-cli-x86_64-unknown-linux-gnu.tar.xz")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("confidant-cli-aarch64-apple-darwin.tar.xz")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("confidant-cli-x86_64-apple-darwin.tar.xz")
+    } else {
+        None
+    }
+}
+
+/// Lowercase hex SHA-256. `sha2` is already in the dependency graph (the
+/// vault's content hash uses it); this reuses it instead of pulling a
+/// checksum crate for one call.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Parse a cargo-dist `sha256.sum` into `(asset name, lowercase hex)`.
+/// Handles both `<hex> *<name>` (GNU binary marker) and `<hex>  <name>`;
+/// malformed lines are skipped, never trusted.
+fn parse_sha256_sum(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let hash = parts.next()?;
+            let name = parts.next()?;
+            if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
+            Some((
+                name.trim_start_matches('*').to_owned(),
+                hash.to_ascii_lowercase(),
+            ))
+        })
+        .collect()
+}
+
+/// The archive checksums a cargo-dist installer embeds
+/// (`_checksum_value="<hex>"`); every one is verified by the installer
+/// itself before it installs anything.
+fn installer_embedded_checksums(script: &str) -> Vec<String> {
+    const MARKER: &str = "_checksum_value=\"";
+    script
+        .match_indices(MARKER)
+        .filter_map(|(start, marker)| {
+            let rest = &script[start + marker.len()..];
+            let end = rest.find('"')?;
+            let value = &rest[..end];
+            (value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
+                .then(|| value.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+/// Verify the downloaded release installer before running it (#876).
+///
+/// cargo-dist 0.32 publishes `sha256.sum` with an entry per archive and per
+/// source tarball, but **no entry for the installer script itself** (checked
+/// against the v0.8.0 assets and the release's `dist-manifest.json`). So:
+///
+/// - If a future release does publish an installer line, verify the script's
+///   SHA-256 against it (the strongest check).
+/// - Otherwise require that every archive checksum the installer embeds is
+///   present in `sha256.sum`, and that this platform's archive is covered.
+///   The installer then re-verifies that archive before installing it, the
+///   same chain the published one-liner uses — but a script whose embedded
+///   hashes disagree with the release checksums is refused here, unrun.
+fn verify_installer(
+    tag: &str,
+    installer: &[u8],
+    sums: &[(String, String)],
+    archive: &str,
+) -> anyhow::Result<()> {
+    const INSTALLER_NAME: &str = "confidant-cli-installer.sh";
+    let installer_sha = sha256_hex(installer);
+    if let Some((_, expected)) = sums.iter().find(|(name, _)| name == INSTALLER_NAME) {
+        if !installer_sha.eq_ignore_ascii_case(expected) {
+            return Err(update_failed(format!(
+                "the release installer for {tag} does not match sha256.sum \
+                 (expected {expected}, got {installer_sha}); refusing to run it"
+            )));
+        }
+        return Ok(());
+    }
+
+    let Some((_, expected)) = sums.iter().find(|(name, _)| name == archive) else {
+        return Err(update_failed(format!(
+            "the release checksums for {tag} do not cover {archive}; refusing to run the installer"
+        )));
+    };
+    let script = String::from_utf8_lossy(installer);
+    let embedded = installer_embedded_checksums(&script);
+    if embedded.is_empty() {
+        return Err(update_failed(format!(
+            "the release installer for {tag} embeds no archive checksums; refusing to run it"
+        )));
+    }
+    let known: BTreeSet<&str> = sums.iter().map(|(_, hash)| hash.as_str()).collect();
+    if let Some(unknown) = embedded.iter().find(|hash| !known.contains(hash.as_str())) {
+        return Err(update_failed(format!(
+            "the release installer for {tag} embeds checksum {unknown}, which is not in \
+             sha256.sum; refusing to run it"
+        )));
+    }
+    if !embedded.iter().any(|hash| hash == expected) {
+        return Err(update_failed(format!(
+            "the release installer for {tag} does not embed the checksum for {archive}; \
+             refusing to run it"
+        )));
+    }
+    Ok(())
+}
+
+/// Download a release asset. Fails closed with an actionable code; the body
+/// is never echoed beyond the URL and the HTTP error.
+fn fetch_release_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(60)))
+        .build()
+        .into();
+    let mut response = agent
+        .get(url)
+        .header("User-Agent", "confidant-cli")
+        .header("Accept", "application/octet-stream")
+        .call()
+        .map_err(|err| update_failed(format!("could not download {url}: {err}")))?;
+    response
+        .body_mut()
+        .read_to_vec()
+        .map_err(|err| update_failed(format!("could not read {url}: {err}")))
+}
+
+/// Write the verified installer to a temp file and run it with the receipt's
+/// install prefix pinned, so it replaces this copy even when the caller's
+/// environment points elsewhere. The installer verifies the platform
+/// archive's checksum itself before installing it.
+fn run_release_installer(installer: &[u8], install_prefix: &Path) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().map_err(|err| {
+        update_failed(format!(
+            "could not create a temp dir for the installer: {err}"
+        ))
+    })?;
+    let script = dir.path().join("confidant-cli-installer.sh");
+    std::fs::write(&script, installer)
+        .map_err(|err| update_failed(format!("could not write the installer: {err}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).map_err(
+            |err| update_failed(format!("could not make the installer executable: {err}")),
+        )?;
+    }
+    // Integration-test hook: record the run instead of executing a real
+    // installer, and reuse the same failure switch as the #376 offer path.
+    // The suite never executes a downloaded installer: a test that forgot
+    // the recorder gets a clear failure instead of running a script.
+    #[cfg(feature = "test-overrides")]
+    {
+        let display = format!(
+            "sh {} (CONFIDANT_CLI_INSTALL_DIR={})",
+            script.display(),
+            install_prefix.display()
+        );
+        if let Ok(path) = std::env::var("CONFIDANT_TEST_COMMAND_RECORDER") {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            writeln!(f, "{display}")?;
+            if std::env::var("CONFIDANT_TEST_COMMAND_FAIL").is_ok() {
+                return Err(update_failed("simulated installer failure"));
+            }
+            return Ok(());
+        }
+        Err(update_failed(
+            "refusing to run an installer under test-overrides without a command recorder",
+        ))
+    }
+    #[cfg(not(feature = "test-overrides"))]
+    {
+        let status = std::process::Command::new("sh")
+            .arg(&script)
+            .env("CONFIDANT_CLI_INSTALL_DIR", install_prefix)
+            .env("CARGO_DIST_FORCE_INSTALL_DIR", install_prefix)
+            .status()
+            .map_err(|err| update_failed(format!("could not run the release installer: {err}")))?;
+        if !status.success() {
+            return Err(update_failed(format!(
+                "the release installer exited with status {status}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Replace a cargo-dist install in place (#876) without an updater
+/// framework: fetch the release's `sha256.sum` and installer, verify the
+/// installer against those checksums, then run it with the receipt prefix
+/// pinned. The installer verifies the platform archive before installing it,
+/// so the binary that lands is the one the release checksums cover.
+fn self_update_cargo_dist(install_prefix: &Path, tag: &str) -> anyhow::Result<String> {
+    let base = release_download_base();
+    let archive = release_target_archive().ok_or_else(|| {
+        update_failed(format!(
+            "no self-update archive is published for {}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+    })?;
+    let sums_body = fetch_release_bytes(&format!("{base}/{tag}/sha256.sum"))?;
+    let sums = parse_sha256_sum(&String::from_utf8_lossy(&sums_body));
+    let installer = fetch_release_bytes(&format!("{base}/{tag}/confidant-cli-installer.sh"))?;
+    verify_installer(tag, &installer, &sums, archive)?;
+    run_release_installer(&installer, install_prefix)?;
+    // The installer installed the release the tag names; report that tag
+    // without its `v` so it reads like `confidant --version`.
+    Ok(tag.trim_start_matches('v').to_owned())
 }
 
 /// Shared tail of `update`: re-link skills from this binary and report.
@@ -11431,13 +11936,13 @@ fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::{
-        confirm_yn, detect_install_method, git_version_check_from, looks_like_version_or_usage,
-        offerable_update, parse_ahead_behind, parse_git_remotes, parse_git_version,
-        parse_tui_version, reject_unsupported_prefix, sync_push_refspec, AheadBehind, Cli,
-        InstallMethod, JOURNEYS, MIN_GIT_VERSION,
+        confirm_yn, git_version_check_from, looks_like_version_or_usage, offerable_update,
+        parse_ahead_behind, parse_git_remotes, parse_git_version, parse_sha256_sum,
+        parse_tui_version, reject_unsupported_prefix, sha256_hex, sync_push_refspec,
+        verify_installer, AheadBehind, Cli, InstallMethod, JOURNEYS, MIN_GIT_VERSION,
     };
     use clap::CommandFactory;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// #854: only the first non-empty probe line is judged. A canned hit list
     /// can carry a version-shaped score like `0.87` (or the tool name) on a
@@ -11625,14 +12130,14 @@ origin\tssh://git@host.example/org/repo.git (push)
     #[test]
     fn cli_staleness_check_unknown_rules() {
         use super::cli_staleness_check;
-        let c = cli_staleness_check(None, false);
+        let c = cli_staleness_check(None, false, None);
         assert_eq!(c.status, "unknown");
         assert!(c.message.contains("staleness unknown"));
         // An unparseable tag is undetermined the same way a failed
         // fetch is: neither proves the install is current.
-        let c = cli_staleness_check(Some("not-a-version".to_owned()), false);
+        let c = cli_staleness_check(Some("not-a-version".to_owned()), false, None);
         assert_eq!(c.status, "unknown");
-        let c = cli_staleness_check(None, true);
+        let c = cli_staleness_check(None, true, None);
         assert_eq!(c.status, "ok");
         assert!(c.message.contains("disabled"));
     }
@@ -11680,31 +12185,187 @@ origin\tssh://git@host.example/org/repo.git (push)
 
     #[test]
     fn install_method_detection_from_exe_path() {
-        // `cargo install` (and the cargo-dist shell installer, which
-        // targets CARGO_HOME) lands in `<cargo-home>/bin`.
+        use super::detect_install_method_from_path;
+        // `cargo install` lands in `<cargo-home>/bin`.
         assert_eq!(
-            detect_install_method(Path::new("/home/ada/.cargo/bin/confidant")),
+            detect_install_method_from_path(Path::new("/home/ada/.cargo/bin/confidant")),
             InstallMethod::CargoInstall
         );
         // Windows separators stay detectable on every platform.
         assert_eq!(
-            detect_install_method(Path::new("C:\\Users\\ada\\.cargo\\bin\\confidant.exe")),
+            detect_install_method_from_path(Path::new(
+                "C:\\Users\\ada\\.cargo\\bin\\confidant.exe"
+            )),
             InstallMethod::CargoInstall
         );
-        // Homebrew and anything else: unknown, so `update` falls back to
-        // the generic wording and offers nothing to run.
+        // Homebrew: a versioned keg in the Cellar or a plain prefix bin.
         assert_eq!(
-            detect_install_method(Path::new("/opt/homebrew/bin/confidant")),
+            detect_install_method_from_path(Path::new("/opt/homebrew/bin/confidant")),
+            InstallMethod::Brew
+        );
+        assert_eq!(
+            detect_install_method_from_path(Path::new(
+                "/usr/local/Cellar/confidant/0.8.0/bin/confidant"
+            )),
+            InstallMethod::Brew
+        );
+        // Anything else is unknown, so `update` falls back to the generic
+        // wording and offers nothing to run.
+        assert_eq!(
+            detect_install_method_from_path(Path::new("/usr/local/bin/confidant")),
             InstallMethod::Unknown
         );
         assert_eq!(
-            detect_install_method(Path::new("/usr/local/bin/confidant")),
+            detect_install_method_from_path(Path::new("confidant")),
             InstallMethod::Unknown
+        );
+    }
+
+    fn receipt(path: &str, prefix: &str) -> super::InstallReceipt {
+        super::InstallReceipt {
+            path: PathBuf::from(path),
+            install_prefix: PathBuf::from(prefix),
+        }
+    }
+
+    #[test]
+    fn install_receipt_detection_covers_the_running_copy() {
+        use super::detect_install_with_receipt;
+        // The receipt names the `bin` dir (cargo-dist's CARGO_HOME shape).
+        let detection = detect_install_with_receipt(
+            Path::new("/home/ada/.cargo/bin/confidant"),
+            Some(receipt(
+                "/home/ada/.config/confidant-cli/confidant-cli-receipt.json",
+                "/home/ada/.cargo/bin",
+            )),
         );
         assert_eq!(
-            detect_install_method(Path::new("confidant")),
-            InstallMethod::Unknown
+            detection.method,
+            InstallMethod::CargoDist {
+                install_prefix: PathBuf::from("/home/ada/.cargo/bin")
+            }
         );
+        assert!(detection.stray_receipt.is_none());
+
+        // Or the prefix root (`~/.cargo`); both contain the binary.
+        let detection = detect_install_with_receipt(
+            Path::new("/home/ada/.cargo/bin/confidant"),
+            Some(receipt("/receipt.json", "/home/ada/.cargo")),
+        );
+        assert_eq!(
+            detection.method,
+            InstallMethod::CargoDist {
+                install_prefix: PathBuf::from("/home/ada/.cargo")
+            }
+        );
+
+        // A one-liner install into ~/.local/bin, with Windows separators in
+        // the receipt, stays detectable on any platform.
+        let detection = detect_install_with_receipt(
+            Path::new("C:\\Users\\ada\\.local\\bin\\confidant.exe"),
+            Some(receipt("C:\\receipt.json", "C:\\Users\\ada\\.local\\bin")),
+        );
+        assert!(matches!(detection.method, InstallMethod::CargoDist { .. }));
+    }
+
+    #[test]
+    fn install_receipt_for_a_different_copy_is_never_trusted() {
+        use super::detect_install_with_receipt;
+        // The receipt names ~/.local/bin, but this binary runs from
+        // ~/.cargo/bin: two copies, so the receipt is not CargoDist and
+        // `update` can refuse loudly instead of replacing the wrong one.
+        let detection = detect_install_with_receipt(
+            Path::new("/home/ada/.cargo/bin/confidant"),
+            Some(receipt("/receipt.json", "/home/ada/.local/bin")),
+        );
+        assert_eq!(detection.method, InstallMethod::Unknown);
+        assert_eq!(
+            detection.stray_receipt,
+            Some(receipt("/receipt.json", "/home/ada/.local/bin"))
+        );
+
+        // A prefix that is only a string prefix (not a path boundary) does
+        // not count either.
+        let detection = detect_install_with_receipt(
+            Path::new("/home/ada/.local/bin/confidant"),
+            Some(receipt("/receipt.json", "/home/ada/.local/b")),
+        );
+        assert_eq!(detection.method, InstallMethod::Unknown);
+        assert!(detection.stray_receipt.is_some());
+    }
+
+    #[test]
+    fn install_receipt_parsing_is_fail_closed() {
+        use super::read_install_receipt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipt.json");
+
+        // Absent: no receipt, no CargoDist guess.
+        assert!(read_install_receipt(&path).is_none());
+
+        // Malformed JSON: same.
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(read_install_receipt(&path).is_none());
+
+        // Well-formed JSON without an install_prefix: same.
+        std::fs::write(&path, r#"{"version":"0.8.0"}"#).unwrap();
+        assert!(read_install_receipt(&path).is_none());
+
+        // Empty install_prefix: same.
+        std::fs::write(&path, r#"{"install_prefix":""}"#).unwrap();
+        assert!(read_install_receipt(&path).is_none());
+
+        // The shape cargo-dist writes.
+        std::fs::write(
+            &path,
+            r#"{"install_prefix":"/home/ada/.cargo/bin","binaries":["confidant"],"source":{"release_type":"github","owner":"hirefrank","name":"confidant","app_name":"confidant-cli"},"version":"0.8.0","provider":{"source":"cargo-dist","version":"0.32.0"}}"#,
+        )
+        .unwrap();
+        let receipt = read_install_receipt(&path).expect("receipt parses");
+        assert_eq!(
+            receipt.install_prefix,
+            PathBuf::from("/home/ada/.cargo/bin")
+        );
+        assert_eq!(receipt.path, path);
+    }
+
+    #[test]
+    fn receipt_roots_follow_the_installer_search_order() {
+        use super::receipt_config_roots;
+        // Unix: XDG first, then ~/.config; LOCALAPPDATA is ignored.
+        let roots = receipt_config_roots(
+            Some(PathBuf::from("/xdg")),
+            Some(PathBuf::from("/local-app-data")),
+            Some(PathBuf::from("/home/ada")),
+            false,
+        );
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/xdg/confidant-cli"),
+                PathBuf::from("/home/ada/.config/confidant-cli"),
+            ]
+        );
+        // No XDG: only the home fallback.
+        let roots = receipt_config_roots(None, None, Some(PathBuf::from("/home/ada")), false);
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/home/ada/.config/confidant-cli")]
+        );
+        // Windows (unsupported as a target, but parity with the installer):
+        // LOCALAPPDATA replaces ~/.config.
+        let roots = receipt_config_roots(
+            None,
+            Some(PathBuf::from("C:\\Users\\ada\\AppData\\Local")),
+            Some(PathBuf::from("C:\\Users\\ada")),
+            true,
+        );
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("C:\\Users\\ada\\AppData\\Local").join("confidant-cli")]
+        );
+        // An empty variable is treated as unset.
+        assert!(receipt_config_roots(None, None, None, false).is_empty());
     }
 
     #[test]
@@ -11715,21 +12376,144 @@ origin\tssh://git@host.example/org/repo.git (push)
         let (program, args) = cargo.run_spec().unwrap();
         assert_eq!(program, "cargo");
         assert_eq!(args, &["install", "confidant-cli"]);
+        assert!(!cargo.self_updates());
+
+        let brew = InstallMethod::Brew;
+        assert_eq!(brew.as_str(), "brew");
+        assert_eq!(brew.update_command(), Some("brew upgrade confidant-cli"));
+        assert_eq!(brew.run_spec(), None);
+        assert!(!brew.self_updates());
+
+        let dist = InstallMethod::CargoDist {
+            install_prefix: PathBuf::from("/home/ada/.cargo/bin"),
+        };
+        assert_eq!(dist.as_str(), "cargo-dist");
+        let cmd = dist.update_command().unwrap();
+        assert!(cmd.contains("confidant-cli-installer.sh"), "{cmd}");
+        assert!(
+            cmd.contains("curl --proto '=https' --tlsv1.2 -LsSf"),
+            "{cmd}"
+        );
+        assert!(cmd.ends_with("| sh"), "{cmd}");
+        assert_eq!(dist.run_spec(), None);
+        assert!(dist.self_updates());
 
         let unknown = InstallMethod::Unknown;
         assert_eq!(unknown.as_str(), "unknown");
         assert_eq!(unknown.update_command(), None);
         assert_eq!(unknown.run_spec(), None);
+        assert!(!unknown.self_updates());
+    }
+
+    #[test]
+    fn sha256_hex_matches_a_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn release_checksums_parse_both_sum_styles() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let text = format!(
+            "{a} *confidant-cli-x86_64-unknown-linux-gnu.tar.xz\n\
+             {b}  source.tar.gz\n\
+             not a checksum line\n"
+        );
+        assert_eq!(
+            parse_sha256_sum(&text),
+            vec![
+                (
+                    "confidant-cli-x86_64-unknown-linux-gnu.tar.xz".to_owned(),
+                    a.clone()
+                ),
+                ("source.tar.gz".to_owned(), b),
+            ]
+        );
+        assert!(parse_sha256_sum("").is_empty());
+        assert!(parse_sha256_sum("zz *short").is_empty());
+    }
+
+    #[test]
+    fn installer_verification_prefers_a_published_installer_checksum() {
+        let installer = b"#!/bin/sh\n_checksum_value=\"not-hex\"\n";
+        let sums = vec![(
+            "confidant-cli-installer.sh".to_owned(),
+            sha256_hex(installer),
+        )];
+        assert!(verify_installer(
+            "v9.9.9",
+            installer,
+            &sums,
+            "confidant-cli-x86_64-unknown-linux-gnu.tar.xz"
+        )
+        .is_ok());
+        // A future release that publishes an installer line gets the
+        // strongest check: a mismatch refuses before the fallback.
+        let wrong = vec![("confidant-cli-installer.sh".to_owned(), "0".repeat(64))];
+        let err = verify_installer("v9.9.9", installer, &wrong, "x").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not match sha256.sum"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn installer_verification_cross_checks_embedded_archive_checksums() {
+        let archive = "confidant-cli-x86_64-unknown-linux-gnu.tar.xz";
+        let ours = "a".repeat(64);
+        let other = "b".repeat(64);
+        let sums = vec![
+            (archive.to_owned(), ours.clone()),
+            ("source.tar.gz".to_owned(), other.clone()),
+        ];
+        // Every embedded hash is published, and ours is covered: run.
+        let good = format!("_checksum_value=\"{ours}\"\n_checksum_value=\"{other}\"\n");
+        assert!(verify_installer("v9.9.9", good.as_bytes(), &sums, archive).is_ok());
+        // An embedded hash absent from sha256.sum: refuse.
+        let tampered = format!("_checksum_value=\"{}\"\n", "c".repeat(64));
+        let err = verify_installer("v9.9.9", tampered.as_bytes(), &sums, archive).unwrap_err();
+        assert!(format!("{err:#}").contains("not in sha256.sum"), "{err:#}");
+        // No embedded checksums at all: refuse.
+        let err = verify_installer("v9.9.9", b"#!/bin/sh\n", &sums, archive).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("embeds no archive checksums"),
+            "{err:#}"
+        );
+        // The platform archive is not listed: refuse.
+        let err = verify_installer(
+            "v9.9.9",
+            good.as_bytes(),
+            &sums,
+            "confidant-cli-other.tar.xz",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("do not cover"), "{err:#}");
     }
 
     #[test]
     fn offerable_update_needs_known_method_and_safe_replacement() {
-        assert!(offerable_update(InstallMethod::CargoInstall, true));
+        assert!(offerable_update(&InstallMethod::CargoInstall, true));
         // Unsafe replacement: print only.
-        assert!(!offerable_update(InstallMethod::CargoInstall, false));
+        assert!(!offerable_update(&InstallMethod::CargoInstall, false));
         // Unknown method: nothing to run.
-        assert!(!offerable_update(InstallMethod::Unknown, true));
-        assert!(!offerable_update(InstallMethod::Unknown, false));
+        assert!(!offerable_update(&InstallMethod::Unknown, true));
+        assert!(!offerable_update(&InstallMethod::Unknown, false));
+        // Brew and cargo-dist are never offered as a shell command: brew is
+        // guidance only, cargo-dist self-replaces.
+        assert!(!offerable_update(&InstallMethod::Brew, true));
+        assert!(!offerable_update(
+            &InstallMethod::CargoDist {
+                install_prefix: PathBuf::from("/home/ada/.cargo/bin")
+            },
+            true
+        ));
     }
 
     #[test]

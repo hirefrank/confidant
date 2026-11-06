@@ -29,6 +29,9 @@ confidant-core.workspace = true
 include_dir.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Verifies the release installer's embedded archive checksum (#876). Already
+# in the lockfile via confidant-core; no new crate.
+sha2.workspace = true
 # `pack add` fetches into a temp dir (#439); already licensed and in the
 # lockfile as a dev-dependency, promoted so the shipped command can use it.
 tempfile.workspace = true

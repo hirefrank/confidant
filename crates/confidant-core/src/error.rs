@@ -67,6 +67,11 @@ pub enum ErrorKind {
     /// unreadable. A miss against that partial set must never be reported as
     /// `NotFound` (#717).
     CannotSearch,
+    /// `confidant update` could not replace a cargo-dist install in place:
+    /// the release could not be fetched, the receipt could not be read, or
+    /// the release installer failed (#876). Expected and actionable, so it
+    /// carries a fix hint, never `internal_error`.
+    UpdateFailed,
     /// Unclassified failure. Reserved; never match on its message.
     Internal,
 }
@@ -91,6 +96,7 @@ impl ErrorKind {
             Self::PackInvalid => "E_PACK_INVALID",
             Self::AmbiguousPerson => "E_AMBIGUOUS_PERSON",
             Self::CannotSearch => "E_CANNOT_SEARCH",
+            Self::UpdateFailed => "E_UPDATE_FAILED",
             Self::Internal => "internal_error",
         }
     }
