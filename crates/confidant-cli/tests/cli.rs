@@ -5470,3 +5470,46 @@ fn pack_add_allow_unresolved_without_yes_stays_read_only() {
     assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
     assert!(!vault.path().join("packs").exists());
 }
+
+/// #739: `alias resolve` reads the typed `alias_history` entries and prefers
+/// a current value over a historical one held by a different cleared person.
+#[test]
+fn alias_resolve_prefers_current_typed_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.4\"\npacks = []\nvault_id = \"01M3TC5H00MPJG005VQC00000C\"\n",
+    )
+    .unwrap();
+    for (id, name, extra) in [
+        (
+            ADA,
+            "Ada Example",
+            "alias_history: [email|shared@example.test|historical|linkedin-export]\n",
+        ),
+        (
+            BEA,
+            "Bea Demo",
+            "alias_history: [email|shared@example.test|current|email-signature]\n",
+        ),
+    ] {
+        let d = dir.path().join(format!("people/{id}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("profile.md"),
+            format!("---\nid: {id}\ntype: person\nname: {name}\n{extra}---\n\nFake person.\n"),
+        )
+        .unwrap();
+    }
+
+    let current = run_json(
+        &["alias", "resolve", "email", "shared@example.test"],
+        dir.path(),
+    );
+    assert_eq!(current["person"]["id"], BEA, "{current}");
+
+    // The plain `aliases` array stays the untyped current values: typed
+    // history never leaks into it.
+    let bundle = run_json(&["context", BEA], dir.path());
+    assert_eq!(bundle["aliases"], serde_json::json!([]), "{bundle}");
+}

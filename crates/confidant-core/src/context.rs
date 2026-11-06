@@ -317,6 +317,38 @@ fn field_value_json(value: FieldValue) -> Value {
         ),
         FieldValue::Date(date) => Value::String(date.to_string()),
         FieldValue::Text(text) => Value::String(text),
+        // #739, #740: typed list entries keep one object per entry, with
+        // `source` omitted when the source did not record one.
+        FieldValue::AliasList(list) => Value::Array(
+            list.into_iter()
+                .map(|entry| {
+                    let mut value = serde_json::json!({
+                        "kind": entry.kind,
+                        "value": entry.value,
+                        "status": entry.status,
+                    });
+                    if let Some(source) = entry.source {
+                        value["source"] = Value::String(source);
+                    }
+                    value
+                })
+                .collect(),
+        ),
+        FieldValue::RoleHistory(list) => Value::Array(
+            list.into_iter()
+                .map(|entry| {
+                    let mut value = serde_json::json!({
+                        "period": entry.period,
+                        "role": entry.role,
+                        "company": entry.company,
+                    });
+                    if let Some(source) = entry.source {
+                        value["source"] = Value::String(source);
+                    }
+                    value
+                })
+                .collect(),
+        ),
     }
 }
 

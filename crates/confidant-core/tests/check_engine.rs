@@ -7904,6 +7904,129 @@ fn personal_0_4_bad_rich_touch_is_malformed() {
     }
 }
 
+/// #739, #740, #742: the three new person fields validate and reach the
+/// personal context view under their declared names.
+#[test]
+fn personal_0_4_relationship_fields_validate_and_reach_context() {
+    let dir = personal_04_vault(
+        "relationship: investor\n\
+         relationship_context: I'm an investor in her company\n\
+         role_history: [2019-2021|Product manager|Example Co|linkedin-export, 2021-|Founder|Example Studio]\n\
+         alias_history: [email|ada@example.test|current|email-signature, email|ada@old.example.test|historical|linkedin-export]\n",
+        "",
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        !codes(&json).contains(&"E_FRONTMATTER".to_owned()),
+        "the new person fields must validate: {json:?}"
+    );
+
+    let view = personal_view_0_4(dir.path());
+    assert_eq!(view["relationship"], "investor", "{view}");
+    assert_eq!(
+        view["relationship_context"], "I'm an investor in her company",
+        "{view}"
+    );
+    assert_eq!(
+        view["role_history"],
+        json!([
+            {"period": "2019-2021", "role": "Product manager", "company": "Example Co", "source": "linkedin-export"},
+            {"period": "2021-", "role": "Founder", "company": "Example Studio"},
+        ]),
+        "{view}"
+    );
+    assert_eq!(
+        view["alias_history"],
+        json!([
+            {"kind": "email", "value": "ada@example.test", "status": "current", "source": "email-signature"},
+            {"kind": "email", "value": "ada@old.example.test", "status": "historical", "source": "linkedin-export"},
+        ]),
+        "{view}"
+    );
+}
+
+/// #739, #740, #742: all three are profile content, so `--exclude-private`
+/// strips them and `no-ai` hides them with the rest of the profile.
+#[test]
+fn personal_0_4_relationship_fields_are_private() {
+    let dir = personal_04_vault(
+        "no-ai: false\n\
+         relationship_context: PRIVATE0STORY\n\
+         role_history: [2019-2021|PRIVATE0ROLE|Example Co|linkedin-export]\n\
+         alias_history: [email|private0@example.test|current|email-signature]\n",
+        "",
+    );
+    let mut view = personal_view_0_4(dir.path());
+    for field in ["relationship_context", "role_history", "alias_history"] {
+        assert!(view.get(field).is_some(), "{field} missing: {view}");
+        assert!(
+            PRIVATE_CONTEXT_FIELDS.contains(&field),
+            "{field} must be on the exclude-private list"
+        );
+    }
+    strip_private_fields(&mut view);
+    for field in ["relationship_context", "role_history", "alias_history"] {
+        assert!(view.get(field).is_none(), "{field} not stripped: {view}");
+    }
+    let dumped = serde_json::to_string(&view).unwrap();
+    for leak in ["PRIVATE0STORY", "PRIVATE0ROLE", "private0@example.test"] {
+        assert!(!dumped.contains(leak), "{leak} leaked in {dumped}");
+    }
+}
+
+#[test]
+fn personal_0_4_relationship_fields_hidden_for_no_ai_person() {
+    let dir = personal_04_vault(
+        "no-ai: true\n\
+         relationship_context: HIDDEN0STORY\n\
+         role_history: [2019-2021|HIDDEN0ROLE|Example Co|linkedin-export]\n\
+         alias_history: [email|hidden0@example.test|current]\n",
+        "",
+    );
+    let view = personal_view_0_4(dir.path());
+    let dumped = serde_json::to_string(&view).unwrap();
+    for leak in ["HIDDEN0STORY", "HIDDEN0ROLE", "hidden0@example.test"] {
+        assert!(!dumped.contains(leak), "{leak} leaked in {dumped}");
+    }
+    for field in ["relationship_context", "role_history", "alias_history"] {
+        assert!(view.get(field).is_none(), "{field} visible: {view}");
+    }
+}
+
+/// #739, #740: malformed structured entries are `E_FRONTMATTER` naming the
+/// key, never a silent drop.
+#[test]
+fn personal_0_4_bad_relationship_fields_are_frontmatter() {
+    for (field, value) in [
+        ("alias_history", "fax|ada@example.test|current"),
+        ("alias_history", "email|ada@example.test|live"),
+        ("alias_history", "email|ada@example.test"),
+        ("role_history", "2019|Product manager|Example Co"),
+        ("role_history", "2021-2019|Product manager|Example Co"),
+        ("role_history", "2019-2021|Product manager"),
+        ("relationship_context", "\"\""),
+    ] {
+        let dir = personal_04_vault(&format!("{field}: {value}\n"), "");
+        let json = report_json(dir.path(), None);
+        assert!(
+            codes(&json).contains(&"E_FRONTMATTER".to_owned()),
+            "{field}: {value} must be E_FRONTMATTER: {json:?}"
+        );
+        let finding = finding_by_code(&json, "E_FRONTMATTER");
+        assert!(
+            finding["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("'{field}'")),
+            "the finding must name the key: {json:?}"
+        );
+        assert!(
+            !serde_json::to_string(&json).unwrap().contains(value),
+            "the raw value must not echo: {json:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // personal@0.2 embedded declarative pack (#550, cutover #551)
 //

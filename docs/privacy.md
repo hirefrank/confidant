@@ -43,10 +43,13 @@ endpoints stay visible (see “Edges and orgs”).
   against, so an agent can still tell that the person is overdue or
   deliberately set to `never`. `find`, the allowlist, and the search corpus
   return none of that; contact values (emails, phones, handles) are profile
-  data and stay hidden with the rest of the profile. `cadence_basis` and
-  `cadence_note` are declared fields, so `no-ai` hides them with the rest of
-  the profile; under operator `--exclude-private` the one-word
-  `cadence_basis` stays and the free-text `cadence_note` is stripped.
+  data and stay hidden with the rest of the profile. `cadence_basis`,
+  `cadence_note`, `relationship_context`, `role_history`, and
+  `alias_history` are declared fields, so `no-ai` hides them with the rest
+  of the profile; under operator `--exclude-private` the one-word
+  `cadence_basis` stays and the rest are stripped. The plain
+  `context.aliases` array carries only the untyped current contact values
+  and never the typed alias history.
   Findings about such a person never carry their name or other PII to
   agents — the warning is suppressed or reduced to a code and a count.
 - **`no-ai: notes`** on a person keeps the person visible — name, birthday,

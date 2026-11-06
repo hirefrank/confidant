@@ -469,10 +469,11 @@ enum AliasAction {
     /// Resolve a `kind` + value alias to the canonical person (read-only).
     ///
     /// `kind` is email, phone, handle, or name; the value is matched
-    /// case-insensitively against the person's `personal@0.2` front-matter
-    /// `emails`/`phones`/`handles` (or the value half of a `links` entry),
-    /// or their display name for `name`. Honors `no-ai` like other reads:
-    /// a `no-ai: true` person is not surfaced.
+    /// case-insensitively against the person's `emails`/`phones`/`handles`
+    /// (or the value half of a `links` entry), or their display name for
+    /// `name`, plus the typed `alias_history` entries of that kind (#739).
+    /// Current values are preferred over historical ones. Honors `no-ai`
+    /// like other reads: a `no-ai: true` person is not surfaced.
     Resolve {
         /// Alias kind: email, phone, handle, or name.
         kind: String,
@@ -6272,10 +6273,12 @@ fn validate_alias_kind(kind: &str) -> anyhow::Result<()> {
 /// `confidant alias resolve <kind> <value>` (#537 phase 3b): resolve a
 /// `kind` + value alias to the canonical person. Read-only.
 ///
-/// Aliases are plain `personal@0.2` front-matter contact values, matched
-/// case-insensitively as whole strings against the cleared set. A
-/// `no-ai: true` person is indistinguishable from an unmatched alias. Two
-/// cleared people sharing a value fail closed with `E_AMBIGUOUS_PERSON`.
+/// Aliases are plain front-matter contact values (plus the typed
+/// `alias_history` entries, #739), matched case-insensitively as whole
+/// strings against the cleared set. Current values win over historical
+/// ones. A `no-ai: true` person is indistinguishable from an unmatched
+/// alias. Two cleared people sharing a current value fail closed with
+/// `E_AMBIGUOUS_PERSON`.
 fn cmd_alias_resolve(cli: &Cli, root: &Path, kind: &str, value: &str) -> anyhow::Result<ExitCode> {
     validate_alias_kind(kind)?;
     legacy_vault_gate(root).map_err(anyhow::Error::new)?;
