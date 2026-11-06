@@ -3,6 +3,8 @@
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/hirefrank/confidant/badge)](https://securityscorecards.dev/viewer/?uri=github.com/hirefrank/confidant)
 [![CII Best Practices](https://www.bestpractices.dev/projects/15504/badge)](https://www.bestpractices.dev/projects/15504)
 
+Project page: [hirefrank.com/confidant](https://hirefrank.com/confidant).
+
 **Confidant is relationship memory you own.** It remembers the people in
 your life — the friend you meant to call, a sibling's birthday, the mentor
 you last saw in March — in one private place your AI agents can read and
@@ -342,7 +344,10 @@ name, two-letter ID prefix, collection directory, main file,
 entity/person-like flags, `no_ai` policy, roster visibility, and
 required/optional fields. See
 [`spec/pack-manifest.md`](spec/pack-manifest.md) for the full table and the
-two-letter prefix rules.
+two-letter prefix rules. The built-in collections are
+`places/pl-<ULID>/place.md` and `things/th-<ULID>/thing.md`, alongside
+`people/`, `orgs/`, `deals/`, `interactions/`, `notes/`, `edges/`, and
+`ledger/YYYY/MM.cfd`.
 
 The repo's checked-in
 [`testdata/vaults/personal-0.4`](testdata/vaults/personal-0.4) is the
@@ -393,9 +398,13 @@ confidant check --json --no-input --vault testdata/vaults/place-0.3
 
 ## How your agents use it
 
-`confidant setup --agent auto` links the embedded skills. Agents use the
-CLI — or `confidant mcp`, a thin stdio wrapper over the same commands — and
-follow one workflow: propose, confirm, apply. Setup also writes the
+`confidant setup --agent auto` links the four embedded skills — `confidant`
+(standing interaction rules), `qmd-search` (optional semantic search),
+`pack-author` (build a local pack), and `report-a-problem` (file an issue
+without vault content) — and ends with an optional-layers checklist, so it
+offers QMD rather than installing it. Agents use the CLI — or `confidant
+mcp`, a thin stdio wrapper over the same commands — and follow one workflow:
+propose, confirm, apply. Setup also writes the
 system-of-record declaration into each detected agent's always-on
 instructions, so a session that never loads a skill still knows where
 relationship facts live and that they go through the CLI. Every command
@@ -435,13 +444,18 @@ replacement plus the retraction in one commit. Both are operator commands
 (never MCP tools) and require spec 0.4. `confidant record retire <id>` marks
 a record `retired: true`: it stays on disk but leaves agent reads, while
 `record list --for-operator` still shows it. Use `find --json` to copy a
-ledger hit's `ref`.
+ledger hit's `ref`; bulk `retract --verb/--match-date/--keep` clears a
+duplicate batch in one commit. The operator `context` path still lists
+superseded lines, badged; the agent path stays effective-only. Model and
+limits: [`docs/privacy.md`](docs/privacy.md#corrections-and-retirement-746).
 
 **Contact values** (emails, phones, handles, former names) are front-matter
 fields on the person, declared by the personal pack. `alias resolve <kind>
 <value>` matches them directly — trimmed, case-insensitive, whole-string —
-and canonicalizes through merges. Two different people sharing a value is
-`E_AMBIGUOUS_PERSON`, not a silent pick.
+and canonicalizes through merges. On spec 0.4 it also reads the typed
+`alias_history` entries and prefers a current value over a historical one.
+It is operator-only and honours `no-ai` like other reads. Two different
+people sharing a value is `E_AMBIGUOUS_PERSON`, not a silent pick.
 
 ## The TUI
 
@@ -570,7 +584,12 @@ reranking), shipped as an embedded skill, not a CLI dependency. The skill
 stages a copy of the cleared set under `<vault>/.confidant/` (gitignored,
 never committed) and verifies every hit through `confidant allowlist`, so a
 query-path bug degrades to missing results; without QMD it falls back to
-`confidant find` and says so. Design:
+`confidant find` and says so. BM25 is the default mode unless QMD preflight
+recommends otherwise; the LLM rerank stage is the expensive part, so a
+CPU-only host should use `--no-rerank` hybrid (or `--mode bm25`), and a stall
+at `Reranking N chunks` is reported with that fallback instead of being
+passed off as a successful search. `confidant doctor` warns when the index
+is behind vault HEAD or the last build skipped embeddings. Design:
 [`crates/confidant-cli/skills/qmd-search/docs/design.md`](crates/confidant-cli/skills/qmd-search/docs/design.md).
 
 ## Privacy
@@ -590,7 +609,9 @@ That makes the perimeter easy to state, and it is the whole privacy model:
   pushed there stays in history (deleting a file is not erasing it).
 - **`no-ai`.** A record or a person can be marked `no-ai`, which keeps its
   content out of `find`, `context`, the allowlist, MCP, and the search
-  corpus that agents read. A person's `context` bundle still serves derived
+  corpus that agents read. `no-ai: notes` is the narrower person form: the
+  person, birthday, and cadence stay visible while notes and interactions
+  default to hidden. A person's `context` bundle still serves derived
   ledger metadata; a `no-ai` place or thing returns no agent bundle at all.
   The flag itself is visible in the record's front matter.
 
@@ -618,16 +639,29 @@ rollup. Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 - [`docs/architecture.md`](docs/architecture.md) — privacy, threat model, ADRs, milestones.
 - [`docs/privacy.md`](docs/privacy.md) — allowlist, `no-ai`, pack scoping, edges; [`docs/threat-model-agents.md`](docs/threat-model-agents.md) — agent limits and gaps.
 - [`docs/sync.md`](docs/sync.md) — the explicit git boundary and timer; [`docs/tui.md`](docs/tui.md) — TUI detail; [`docs/agent-setup.md`](docs/agent-setup.md) — headless hosts and updates.
-- [`packs/`](packs/) — pack contracts; [`docs/search-benchmark.md`](docs/search-benchmark.md) — search numbers.
+- [`packs/`](packs/) — pack contracts; [`docs/touch-vs-interaction.md`](docs/touch-vs-interaction.md) — touch vs interaction; [`docs/search-benchmark.md`](docs/search-benchmark.md) — search numbers.
 
 ## Where we're going
 
-The roadmap is the open issues on GitHub. The current themes:
+The roadmap is the
+[milestone board](https://github.com/hirefrank/confidant/milestones).
+No issue is open right now; the themes the recent releases close out:
 
-- **Domain model** — spec 0.4 adds the built-in `personal@0.4` places/things, cadence-basis, and rich-touch schema; richer cross-pack domains remain ([#796](https://github.com/hirefrank/confidant/issues/796)).
-- **Agent ergonomics** — cheaper reads across MCP calls ([#543](https://github.com/hirefrank/confidant/issues/543)).
-- **TUI** — a new-person modal ([#621](https://github.com/hirefrank/confidant/issues/621)).
-- **First-run setup** — pack selection on `init --create` ([#639](https://github.com/hirefrank/confidant/issues/639)), a safer `init` on a non-empty directory ([#640](https://github.com/hirefrank/confidant/issues/640)).
+- **Personal schema** — `personal@0.4` is the built-in pack for 0.4: places
+  and things, cadence basis and mode notes, rich touches (`duration:`,
+  `mode:`), and the person-story fields (`relationship_context`,
+  `role_history`, `alias_history`, `profile_provenance`, `human_note`).
+- **Corrections** — `retract`, `correct`, and record `retire`/`unretire` fix
+  a mistake without rewriting the ledger; superseded lines and retired
+  records stay on disk and out of agent reads.
+- **Agent surface** — four embedded skills (`confidant`, `qmd-search`,
+  `pack-author`, `report-a-problem`), the fixed nine-tool `confidant mcp`
+  server, and the optional QMD search layer with a CPU-only fallback.
+- **Plaintext first-run** — 0.8 shipped plaintext-only, and `status` plus
+  the project page make the perimeter and the install state clear from the
+  first session.
+
+New work lands as an issue and a milestone; the board is where it shows up.
 
 ## Security status
 
