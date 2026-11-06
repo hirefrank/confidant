@@ -2,7 +2,8 @@
 //! (#510).
 //!
 //! `context`'s `packs` map carries one entry per enabled pack, keyed by the
-//! pack's `name@version` (`"personal@0.2"`). This module builds that entry
+//! pack's `name@version` (`"personal@0.2"` on 0.1–0.3, `"personal@0.4"` on
+//! 0.4). This module builds that entry
 //! for the built-in personal pack, served by the embedded declarative pack
 //! (#551).
 //!
@@ -46,6 +47,9 @@
 //! - `recent_touches`: the person's own `touch` ledger lines, newest first
 //!   (date descending, then kind), capped at ten. Entries are
 //!   `{"date": …, "kind": …}`; `kind` is omitted when the line carries none.
+//!   `duration_minutes` (an integer, from `duration:` per #741) and `mode`
+//!   (`one-on-one` / `group`, from `mode:`) are emitted only when the line
+//!   carries a valid value.
 //!
 //! Contact for `last_touch` / `overdue` counts any ledger verb the pack
 //! declares in its `cadence-overdue` rule's `event_verbs` (#799), plus an
@@ -117,10 +121,10 @@ use crate::vault::Vault;
 /// list: the built-in personal pack serves it through
 /// `ManifestPack::private_context_fields` (#551).
 ///
-/// `title`, `company`, `cadence`, and `snooze_until` are deliberately
-/// absent: they stay so an agent can still see the cadence state that drove a
-/// nudge. `address` is a place field (#745), included here so the same
-/// `--exclude-private` switch strips it from `entity.fields`.
+/// `title`, `company`, `cadence`, `cadence_basis`, and `snooze_until` are
+/// deliberately absent: they stay so an agent can still see the cadence state
+/// that drove a nudge. `address` is a place field (#745), included here so
+/// the same `--exclude-private` switch strips it from `entity.fields`.
 ///
 /// `relationship` is the 0.2 name (#509). `relationship_to_me` is kept in the
 /// list too: it is harmless (no view carries it after the #551 cutover) and
@@ -136,6 +140,10 @@ pub const PRIVATE_CONTEXT_FIELDS: &[&str] = &[
     "relationship",
     "relationship_to_me",
     "address",
+    // #750: the cadence mode note is free text and can name people and
+    // situations, so it follows the PII gate. `cadence_basis` stays: it is a
+    // one-word cadence state, not content.
+    "cadence_note",
 ];
 
 /// Declared fields a person outside the §12 cleared set still exposes: the
@@ -186,6 +194,12 @@ pub struct RecentTouch {
     pub date: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// #741: how long the touch lasted, when the line says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_minutes: Option<u32>,
+    /// #741: `one-on-one` or `group`, when the line says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// The personal pack's `context` view (`packs["personal@0.2"]`).
@@ -481,9 +495,16 @@ fn recent_touches(
         .map(|s| RecentTouch {
             date: s.entry.date.to_string(),
             kind: extract_touch_kind(&s.entry),
+            duration_minutes: crate::touch::extract_touch_duration(&s.entry),
+            mode: crate::touch::extract_touch_mode(&s.entry),
         })
         .collect();
-    touches.sort_by(|a, b| b.date.cmp(&a.date).then(a.kind.cmp(&b.kind)));
+    touches.sort_by(|a, b| {
+        b.date
+            .cmp(&a.date)
+            .then(a.kind.cmp(&b.kind))
+            .then(a.mode.cmp(&b.mode))
+    });
     touches.truncate(RECENT_TOUCHES_LIMIT);
     touches
 }

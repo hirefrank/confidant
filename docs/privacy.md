@@ -35,14 +35,18 @@ endpoints stay visible (see “Edges and orgs”).
   guarantee. `context` still serves the person's **derived, ledger-based
   metadata**: the personal pack's cadence and touch state (`cadence_days`,
   `cadence_never`, `last_touch`, `days_since_touch`, `overdue`,
-  `recent_touches`, and the declared `snooze_until`), the top-level
-  `touchpoints` list (dates and kinds of the `touch` lines), any enabled
+  `recent_touches`, and the declared `snooze_until`), the
+  top-level `touchpoints` list (dates, kinds, and the optional duration and
+  1:1/group mode of the `touch` lines), any enabled
   pack's derived balance metrics and recent entries (dates, durations,
   tags). These are structural, not content: a schedule and the dates it ran
   against, so an agent can still tell that the person is overdue or
   deliberately set to `never`. `find`, the allowlist, and the search corpus
   return none of that; contact values (emails, phones, handles) are profile
-  data and stay hidden with the rest of the profile.
+  data and stay hidden with the rest of the profile. `cadence_basis` and
+  `cadence_note` are declared fields, so `no-ai` hides them with the rest of
+  the profile; under operator `--exclude-private` the one-word
+  `cadence_basis` stays and the free-text `cadence_note` is stripped.
   Findings about such a person never carry their name or other PII to
   agents — the warning is suppressed or reduced to a code and a count.
 - **`no-ai: notes`** on a person keeps the person visible — name, birthday,

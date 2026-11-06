@@ -303,8 +303,9 @@ The TOML below is the frozen `personal@0.1` claims that the compiled pack
 shipped with until the #551 cutover. That pack and its in-crate manifest
 (`crates/confidant-core/pack-manifests/personal-0.1/manifest.toml`) are
 deleted; the current built-in is the `personal` pack, with
-`personal@0.3` at `packs/personal/manifest.toml` for 0.4 and the frozen
-`personal@0.2` bytes in `crates/confidant-core/pack-manifests/personal-0.2/`
+`personal@0.4` at `packs/personal/manifest.toml` for 0.4 and the frozen
+`personal@0.2` and `personal@0.3` bytes in
+`crates/confidant-core/pack-manifests/personal-0.2/` and `personal-0.3/`
 (§13.7). The example is kept because it is the clearest statement of the v1
 manifest shape.
 
@@ -1102,7 +1103,8 @@ built-in; exactly one version is active per vault, selected by the vault's
 `spec`, never by the `packs` list. The active version must list that spec in
 `requires_spec`; the inactive versions are inert. For the personal pack,
 specs 0.1–0.3 select `personal@0.2` (v2) and spec 0.4 selects
-`personal@0.3` (v3). A `personal@…` listing still does not choose a version.
+`personal@0.4` (v3); `personal@0.3` (v3) is frozen and no spec selects it.
+A `personal@…` listing still does not choose a version.
 The manifest's **origin** is what differs, and only the loader sets it (a
 manifest file cannot claim it):
 

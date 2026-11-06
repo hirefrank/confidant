@@ -31,7 +31,7 @@ Read before changing behaviour:
   implements it. The spec version and the CLI version are independent (ADR-1).
 - [`spec/findings.md`](spec/findings.md): stable `check` finding codes.
 - [`docs/architecture.md`](docs/architecture.md): privacy and threat model,
-  ADR-1 to ADR-21, milestones (section 8), and risk decisions (section 9b,
+  ADR-1 to ADR-22, milestones (section 8), and risk decisions (section 9b,
   binding).
 - [`testdata/packs/example-pack/`](testdata/packs/example-pack/): the neutral external-pack fixture used by tests, the QA smoke, and the benchmark generator.
 - [`testdata/packs/place-pack/`](testdata/packs/place-pack/) and
@@ -39,14 +39,16 @@ Read before changing behaviour:
   record-type fixture, its vendored pack pin, and its `check --json` golden.
   Fake data only; keep the demo vault on 0.2.
 - [`testdata/vaults/personal-0.4/`](testdata/vaults/personal-0.4/): the
-  checked-in 0.4 default fixture for `personal@0.3` places, things, edges,
-  context fields, and the no-ai place; its golden is
+  checked-in 0.4 default fixture for the built-in personal pack's places,
+  things, edges, context fields, and the no-ai place; its golden is
   [`testdata/golden/personal-0.4.json`](testdata/golden/personal-0.4.json).
-- [`packs/personal/0.3.md`](packs/personal/0.3.md) is the 0.4 personal
-  pack, which adds places and things (ADR-21); the frozen
-  [`packs/personal/0.2.md`](packs/personal/0.2.md) is the 0.1–0.3
-  person-only contract. `personal@0.2` is the active built-in on 0.1–0.3
-  and `personal@0.3` on 0.4.
+- [`packs/personal/0.4.md`](packs/personal/0.4.md) is the 0.4 personal
+  pack: places and things (ADR-21) plus cadence basis/mode note and rich
+  touches (ADR-22). The frozen
+  [`packs/personal/0.3.md`](packs/personal/0.3.md) and
+  [`packs/personal/0.2.md`](packs/personal/0.2.md) keep their claims.
+  `personal@0.2` is the active built-in on 0.1–0.3 and `personal@0.4` on
+  0.4; `personal@0.3` is frozen.
 - [`spec/pack-manifest.md`](spec/pack-manifest.md): the pack manifest
   format, including spec-selected built-in versions (§13.7). The manifest
   (`packs/<name>/manifest.toml`) is the single

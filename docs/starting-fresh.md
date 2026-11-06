@@ -160,7 +160,7 @@ override survives re-runs. The command:
 
 There is no key, phrase, or enrollment step, and it installs no pack. A
 new vault starts with `packs = []`, which is fine: the active personal pack
-is implicit and already enabled (§3.1) — `personal@0.3` on a 0.4 vault,
+is implicit and already enabled (§3.1) — `personal@0.4` on a 0.4 vault,
 `personal@0.2` on 0.1–0.3 — and `check` is clean without packs. Install a
 pack later with `confidant pack add <https-url> --yes`.
 
@@ -187,7 +187,7 @@ that is behind on a pull will still read its last-fetched copy.
 The personal pack is built into the binary and **implicit**: every vault has
 it, whether or not `packs` lists it. `packs = []` still enables it, and a
 `personal@…` entry is a no-op. The vault `spec` selects the version:
-`personal@0.3` on 0.4, the frozen `personal@0.2` on 0.1–0.3.
+`personal@0.4` on 0.4, the frozen `personal@0.2` on 0.1–0.3.
 
 On 0.4 that gives you the person schema — birthdays, relationship edges,
 keep-in-touch cadence, upcoming dates, and the `touch` ledger verb — plus
@@ -236,7 +236,7 @@ that declares record types must list `"0.3"` in `requires_spec`; a 0.2 vault
 rejects it with `E_PACK_VERSION`. Existing personal records stay where they
 are; there is no migration.
 
-Spec 0.4 is current. The built-in `personal@0.3` already declares `place`
+Spec 0.4 is current. The built-in `personal@0.4` already declares `place`
 and `thing`, so a 0.4 vault does not need an external pack for those.
 Vaults on 0.1–0.3 keep `personal@0.2`, which is **person-only** and declares
 no record types; places, things, and other domain entities there come from

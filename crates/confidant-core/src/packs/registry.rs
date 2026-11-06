@@ -68,7 +68,7 @@ impl PackRegistry {
 
     /// The packs available to a vault on `spec`: the compiled packs plus
     /// only the embedded built-in versions active for that spec (#745).
-    /// `personal@0.2` is implicit on 0.1–0.3; `personal@0.3` on 0.4.
+    /// `personal@0.2` is implicit on 0.1–0.3; `personal@0.4` on 0.4.
     pub fn compiled_for_spec(spec: SpecVersion) -> Self {
         let implicit: Vec<&'static dyn Pack> = embedded::active_for_spec(spec)
             .iter()

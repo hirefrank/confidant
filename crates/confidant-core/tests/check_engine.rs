@@ -215,7 +215,7 @@ fn place_03_fixture_hides_only_the_no_ai_edge_and_its_note() {
 }
 
 /// The checked-in spec 0.4 personal fixture (#745): the default
-/// `personal@0.3` types, their fields and edges, an `entity:` note, and a
+/// built-in personal types, their fields and edges, an `entity:` note, and a
 /// no-ai place. Fake data only.
 fn personal_04_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/personal-0.4")
@@ -7705,6 +7705,203 @@ fn personal_0_2_values_do_not_echo_in_findings() {
         codes(&json).contains(&"E_FRONTMATTER".to_owned()),
         "{json:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #750, #741: the personal@0.4 cadence semantics and rich touches
+// ---------------------------------------------------------------------------
+
+/// A one-person spec 0.4 vault: the built-in `personal@0.4` is implicit
+/// (`packs = []`). `as_of` is pinned so the cadence rule is deterministic.
+const PERSONAL_04_TOML: &str =
+    "spec = \"0.4\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n";
+
+/// The 0.4 fields exactly as the embedded manifest declares them, so a
+/// change to the pack cannot silently skip the view builder.
+fn fields_0_4() -> Vec<FieldDecl> {
+    packs_embedded::find(packs_embedded::PERSONAL_0_4)
+        .expect("personal@0.4 is embedded")
+        .manifest()
+        .fields
+        .clone()
+}
+
+/// A spec 0.4 vault with Ada Example carrying `extra_fields` and a ledger
+/// with `ledger` (fake data only).
+fn personal_04_vault(extra_fields: &str, ledger: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_04_TOML);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\n{extra_fields}---\n\nFake person.\n"
+        ),
+    );
+    if !ledger.is_empty() {
+        write(dir.path(), "ledger/2026/10.cfd", ledger);
+    }
+    dir
+}
+
+/// The core view builder's output for Ada against the embedded 0.4 fields.
+fn personal_view_0_4(root: &Path) -> Value {
+    let vault = load_vault(root).unwrap();
+    let id = confidant_core::id::RecordId::parse(ADA).unwrap();
+    let as_of = chrono::NaiveDate::parse_from_str("2026-10-08", "%Y-%m-%d").unwrap();
+    build_personal_view(
+        &vault,
+        &id,
+        &id,
+        as_of,
+        &fields_0_4(),
+        &["touch", "session"],
+    )
+    .expect("view serializes")
+}
+
+/// #750: the basis and mode note are valid person fields and reach the
+/// context view under their declared names; only `cadence` drives the rule.
+#[test]
+fn personal_0_4_cadence_basis_and_note_reach_context() {
+    let dir = personal_04_vault(
+        "cadence: 30d\ncadence_basis: observed\ncadence_note: frequent 1:1s through 2024\n",
+        "",
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        !codes(&json).contains(&"E_FRONTMATTER".to_owned()),
+        "the new cadence fields must validate: {json:?}"
+    );
+    // No contact on record and a 30-day cadence: still overdue, unchanged by
+    // the metadata.
+    assert!(
+        codes(&json).iter().any(|c| c == "W_CADENCE_OVERDUE"),
+        "{json:?}"
+    );
+
+    let view = personal_view_0_4(dir.path());
+    assert_eq!(view["cadence_days"], 30, "{view}");
+    assert_eq!(view["cadence_basis"], "observed", "{view}");
+    assert_eq!(view["cadence_note"], "frequent 1:1s through 2024", "{view}");
+}
+
+/// #750: `cadence: never` is "none, by design" — explicit, never overdue,
+/// and it keeps the intent visible on the context view.
+#[test]
+fn personal_0_4_never_by_design_is_explicit_and_not_overdue() {
+    let dir = personal_04_vault(
+        "cadence: never\ncadence_basis: intention\ncadence_note: investor updates only\n",
+        "",
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        !codes(&json).iter().any(|c| c == "W_CADENCE_OVERDUE"),
+        "never by design must not be overdue: {json:?}"
+    );
+    let view = personal_view_0_4(dir.path());
+    assert_eq!(view["cadence_never"], true, "{view}");
+    assert_eq!(view["overdue"], false, "{view}");
+    assert_eq!(view["cadence_basis"], "intention", "{view}");
+    assert!(view.get("cadence_days").is_none(), "{view}");
+}
+
+/// #750: the mode note is free text, so `--exclude-private` strips it; the
+/// one-word basis is cadence state and stays, like `cadence_days`.
+#[test]
+fn personal_0_4_cadence_note_is_private_and_basis_is_not() {
+    let dir = personal_04_vault(
+        "cadence: 30d\ncadence_basis: intention\ncadence_note: PRIVATE0NOTE\n",
+        "",
+    );
+    let mut view = personal_view_0_4(dir.path());
+    assert_eq!(view["cadence_note"], "PRIVATE0NOTE", "{view}");
+    strip_private_fields(&mut view);
+    assert!(view.get("cadence_note").is_none(), "{view}");
+    assert_eq!(view["cadence_basis"], "intention", "{view}");
+    assert!(
+        PRIVATE_CONTEXT_FIELDS.contains(&"cadence_note"),
+        "the mode note must be on the exclude-private list"
+    );
+    assert!(
+        !PRIVATE_CONTEXT_FIELDS.contains(&"cadence_basis"),
+        "the basis is cadence state, not PII"
+    );
+}
+
+/// #750: the mode note never reaches an agent for a `no-ai` person, while
+/// the derived cadence state (including the deliberate never) stays.
+#[test]
+fn personal_0_4_cadence_note_hidden_for_no_ai_person() {
+    let dir = personal_04_vault(
+        "no-ai: true\ncadence: never\ncadence_basis: intention\ncadence_note: HIDDEN0NOTE\n",
+        "",
+    );
+    let view = personal_view_0_4(dir.path());
+    assert_eq!(view["cadence_never"], true, "{view}");
+    assert!(view.get("cadence_basis").is_none(), "{view}");
+    assert!(view.get("cadence_note").is_none(), "{view}");
+    let dumped = serde_json::to_string(&view).unwrap();
+    assert!(!dumped.contains("HIDDEN0NOTE"), "{dumped}");
+}
+
+/// #741: a rich touch line is valid, and the duration and mode reach both
+/// the core `touchpoints` view and the pack's `recent_touches`.
+#[test]
+fn personal_0_4_rich_touch_reaches_context() {
+    let dir = personal_04_vault(
+        "cadence: 30d\ncadence_basis: observed\n",
+        &format!(
+            "2026-10-06 touch {ADA} meal duration:60m mode:one-on-one\n\
+             2026-10-05 touch {ADA} event duration:1h30m mode:group\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        !codes(&json).contains(&"E_TOUCH_MALFORMED".to_owned()),
+        "rich touches are valid: {json:?}"
+    );
+
+    let vault = load_vault(dir.path()).unwrap();
+    let id = confidant_core::id::RecordId::parse(ADA).unwrap();
+    let bundle = build_context(&vault, &id, true, &PackScope::All, false).unwrap();
+    // Core touchpoints are oldest first; the pack's recent_touches are newest
+    // first.
+    assert_eq!(
+        serde_json::to_value(&bundle.touchpoints).unwrap(),
+        json!([
+            {"date": "2026-10-05", "kind": "event", "duration_minutes": 90, "mode": "group"},
+            {"date": "2026-10-06", "kind": "meal", "duration_minutes": 60, "mode": "one-on-one"},
+        ])
+    );
+    let personal = &bundle.packs["personal@0.4"];
+    assert_eq!(
+        personal["recent_touches"],
+        json!([
+            {"date": "2026-10-06", "kind": "meal", "duration_minutes": 60, "mode": "one-on-one"},
+            {"date": "2026-10-05", "kind": "event", "duration_minutes": 90, "mode": "group"},
+        ])
+    );
+    assert_eq!(personal["last_touch"], "2026-10-06", "{personal}");
+}
+
+/// #741: a malformed `duration:` or `mode:` value is `E_TOUCH_MALFORMED`,
+/// not a silently ignored pair.
+#[test]
+fn personal_0_4_bad_rich_touch_is_malformed() {
+    for line in [
+        format!("2026-10-06 touch {ADA} meal duration:soon\n"),
+        format!("2026-10-06 touch {ADA} meal duration:0m\n"),
+        format!("2026-10-06 touch {ADA} meal mode:crowd\n"),
+        format!("2026-10-06 touch {ADA} meal duration:60m duration:30m\n"),
+    ] {
+        let dir = personal_04_vault("", &line);
+        let json = report_json(dir.path(), None);
+        assert!(
+            codes(&json).contains(&"E_TOUCH_MALFORMED".to_owned()),
+            "{line}: {json:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

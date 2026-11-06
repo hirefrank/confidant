@@ -1001,12 +1001,12 @@ fn check_verbs_and_refs(
                         Finding::new(
                             FindingCode::TouchMalformed,
                             Severity::Error,
-                            "touch line must be: DATE touch ID <call|text|email|meet|meal|event|gift|video|other> [note:N-ID] [src:…]".to_owned(),
+                            "touch line must be: DATE touch ID <call|text|email|meet|meal|event|gift|video|other> [note:N-ID] [src:…] [duration:<N>m] [mode:one-on-one|group]".to_owned(),
                         )
                         .at_file(&sourced.file)
                         .at_line(sourced.line)
                         .for_id(&e.id)
-                        .with_fix("Use one of call, text, email, meet, meal, event, gift, video, or other (plus optional note: and src:)"),
+                        .with_fix("Use one of call, text, email, meet, meal, event, gift, video, or other (plus optional note:, src:, duration:, and mode: pairs)"),
                     );
                 }
             } else {

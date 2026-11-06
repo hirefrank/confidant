@@ -651,7 +651,7 @@ fn disabled_vendored_pack_type_warns_orphan_and_fails_closed_for_agents() {
     );
 }
 
-// #745: the 0.4 built-in personal@0.3 declares place/thing and their edges.
+// #745: the 0.4 built-in personal pack declares place/thing and their edges.
 const PERSONAL_PLACE: &str = "pl-01M3TC5H00MPJG000000000021";
 const PERSONAL_THING: &str = "th-01M3TC5H00MPJG000000000022";
 const PERSONAL_EDGE: &str = "e-01M3TC5H00MPJG000000000023";
@@ -693,7 +693,7 @@ fn personal_04_vault() -> tempfile::TempDir {
 }
 
 #[test]
-fn personal_0_3_is_the_0_4_default_with_places_and_things() {
+fn personal_0_4_is_the_0_4_default_with_places_and_things() {
     let dir = personal_04_vault();
     let vault = load_vault(dir.path()).unwrap();
     let names: Vec<&str> = vault
@@ -702,7 +702,8 @@ fn personal_0_3_is_the_0_4_default_with_places_and_things() {
         .iter()
         .map(|pack| pack.name())
         .collect();
-    assert!(names.contains(&"personal@0.3"), "{names:?}");
+    assert!(names.contains(&"personal@0.4"), "{names:?}");
+    assert!(!names.contains(&"personal@0.3"), "{names:?}");
     assert!(!names.contains(&"personal@0.2"), "{names:?}");
 
     let report = report(dir.path());
@@ -722,7 +723,7 @@ fn personal_0_3_is_the_0_4_default_with_places_and_things() {
     let person = confidant_core::RecordId::parse(ADA).unwrap();
     let person_bundle = build_context(&vault, &person, true, &PackScope::All, false).unwrap();
     assert!(
-        person_bundle.packs.contains_key("personal@0.3"),
+        person_bundle.packs.contains_key("personal@0.4"),
         "{:?}",
         person_bundle.packs
     );
@@ -767,6 +768,7 @@ fn personal_0_2_stays_the_default_for_spec_0_3() {
         .collect();
     assert!(names.contains(&"personal@0.2"), "{names:?}");
     assert!(!names.contains(&"personal@0.3"), "{names:?}");
+    assert!(!names.contains(&"personal@0.4"), "{names:?}");
 }
 
 fn personal_04_fixture() -> PathBuf {

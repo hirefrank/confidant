@@ -3723,6 +3723,53 @@ fn log_touch_video_appears_in_context() {
 }
 
 #[test]
+fn log_touch_duration_and_mode_appear_in_context() {
+    // #741: duration normalizes to minutes and mode rides the line, so both
+    // read back through `context`.
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+
+    let (ok, added) = run_json(&log_touch_args(
+        "meal",
+        &vroot,
+        &["--duration", "1h30m", "--mode", "one-on-one"],
+    ));
+    assert!(ok, "{added}");
+    let line = added["lines"][0].as_str().unwrap();
+    assert!(line.contains("duration:90m"), "{line}");
+    assert!(line.contains("mode:one-on-one"), "{line}");
+
+    let (ok, ctx) = run_json(&["context", PERSON, "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{ctx}");
+    assert_eq!(ctx["touchpoints"][0]["duration_minutes"], 90, "{ctx}");
+    assert_eq!(ctx["touchpoints"][0]["mode"], "one-on-one", "{ctx}");
+    assert_eq!(
+        ctx["packs"]["personal@0.2"]["recent_touches"][0]["duration_minutes"], 90,
+        "{ctx}"
+    );
+}
+
+#[test]
+fn log_touch_bad_duration_and_mode_are_usage_errors() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+
+    for extra in [
+        vec!["--duration", "soon"],
+        vec!["--duration", "0m"],
+        vec!["--mode", "crowd"],
+    ] {
+        let (ok, v) = run_json(&log_touch_args("meal", &vroot, &extra));
+        assert!(!ok, "{extra:?}: {v}");
+        assert_eq!(v["error"]["code"], "usage_error", "{extra:?}: {v}");
+    }
+}
+
+#[test]
 fn log_touch_bad_kind_is_usage_error() {
     let dir = make_vault();
     let root = dir.path();
@@ -3966,6 +4013,47 @@ fn log_touch_request_id_conflict_beats_semantic_refusal() {
     assert!(!ok, "{v}");
     assert_eq!(v["error"]["code"], "E_IDEMPOTENCY_CONFLICT");
     assert_eq!(commits(root), before, "a conflict writes nothing");
+}
+
+/// #741: a rich touch keeps request-id idempotency — an exact retry replays,
+/// and changing the duration under the same id is a conflict — while a plain
+/// touch keeps the historical canonical shape.
+#[test]
+fn log_touch_rich_request_id_replays_and_conflicts() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+
+    const RID: &str = "01J9Z3K4QF00000000000000RD";
+    let rich = |duration: &'static str| {
+        log_touch_args(
+            "meal",
+            &vroot,
+            &[
+                "--duration",
+                duration,
+                "--mode",
+                "group",
+                "--request-id",
+                RID,
+            ],
+        )
+    };
+    let (ok, v) = run_json(&rich("60m"));
+    assert!(ok, "{v}");
+    let commit = v["commit"].as_str().unwrap().to_owned();
+    let after_first = commits(root);
+
+    let (ok, v) = run_json(&rich("60m"));
+    assert!(ok, "{v}");
+    assert_eq!(v["idempotent"], true, "{v}");
+    assert_eq!(v["commit"], commit, "{v}");
+    assert_eq!(commits(root), after_first, "the replay committed again");
+
+    let (ok, v) = run_json(&rich("30m"));
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_IDEMPOTENCY_CONFLICT", "{v}");
 }
 
 // ---------------------------------------------------------------------------

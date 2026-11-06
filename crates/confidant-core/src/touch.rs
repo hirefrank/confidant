@@ -7,7 +7,7 @@
 //! `confidant log touch` validates against the same constant.
 
 use crate::id::RecordId;
-use crate::ledger::{Arg, LedgerEntry};
+use crate::ledger::{parse_duration_minutes, Arg, LedgerEntry};
 use chrono::NaiveDate;
 
 /// Closed list of touchpoint kinds for `touch` (#182, #227 Q1; the 0.1 set
@@ -18,9 +18,27 @@ pub const TOUCH_KINDS: &[&str] = &[
     "call", "text", "email", "meet", "meal", "event", "gift", "video", "other",
 ];
 
+/// The pair naming how long a touch lasted: `duration:60m` (#741). The value
+/// uses the shared duration grammar (`60m`, `1h`, `1h30m`) and normalizes to
+/// minutes.
+pub const TOUCH_DURATION_PAIR: &str = "duration";
+
+/// The pair naming the touch's social mode: `mode:one-on-one` or
+/// `mode:group` (#741). A birthday game night and a coffee catch-up no longer
+/// read identically to a days-since-touch ranking.
+pub const TOUCH_MODE_PAIR: &str = "mode";
+
+/// Closed list of `mode:` values (#741): a 1:1 or a gathering.
+pub const TOUCH_MODES: &[&str] = &["one-on-one", "group"];
+
 /// Whether `kind` is one of [`TOUCH_KINDS`].
 pub fn is_valid_touch_kind(kind: &str) -> bool {
     TOUCH_KINDS.contains(&kind)
+}
+
+/// Whether `mode` is one of [`TOUCH_MODES`].
+pub fn is_valid_touch_mode(mode: &str) -> bool {
+    TOUCH_MODES.contains(&mode)
 }
 
 /// Extract the touchpoint kind from either a positional `KIND` token
@@ -43,10 +61,35 @@ pub fn extract_touch_kind(entry: &LedgerEntry) -> Option<String> {
     None
 }
 
+/// Extract the touchpoint duration in minutes from a `duration:` pair
+/// (#741). `60m`, `1h`, and `1h30m` are the same duration syntax sessions
+/// use, normalized to minutes. `None` when the pair is absent or invalid;
+/// `check` reports the invalid case as `E_TOUCH_MALFORMED`, so a `context`
+/// read never half-admits a malformed value.
+pub fn extract_touch_duration(entry: &LedgerEntry) -> Option<u32> {
+    entry
+        .pair(TOUCH_DURATION_PAIR)
+        .and_then(parse_duration_minutes)
+        .filter(|minutes| *minutes > 0)
+}
+
+/// Extract the touchpoint mode from a `mode:` pair (#741): `one-on-one` or
+/// `group`. `None` when absent or outside [`TOUCH_MODES`] (`check` reports
+/// the latter as `E_TOUCH_MALFORMED`).
+pub fn extract_touch_mode(entry: &LedgerEntry) -> Option<String> {
+    entry
+        .pair(TOUCH_MODE_PAIR)
+        .filter(|mode| is_valid_touch_mode(mode))
+        .map(str::to_owned)
+}
+
 /// Identity of a `touch` line for semantic idempotency (#747): the person,
 /// the date, and the kind. `note:` and `src:` pairs are deliberately not
 /// part of the identity — a backfill that re-adds the same contact with a
-/// fresh note or provenance is still the same touchpoint. Returns `None`
+/// fresh note or provenance is still the same touchpoint. `duration:` and
+/// `mode:` are not part of it either (#741): two reports of the same
+/// person, date, and kind are the same touchpoint whatever detail each
+/// carries. Returns `None`
 /// for non-`touch` lines and for `touch` lines with no (valid) kind: a
 /// kind-less mirrored touchpoint cannot be shown identical to another, so
 /// `check` leaves those alone and `log touch` (which always carries a
@@ -63,41 +106,58 @@ pub fn touch_identity(entry: &LedgerEntry) -> Option<(RecordId, NaiveDate, Strin
 /// Accepts either:
 /// - `DATE touch P-ID` (mirrored touchpoint with no kind)
 /// - `DATE touch P-ID kind:<KIND>` (mirrored touchpoint with kind)
-/// - `DATE touch P-ID <KIND> [note:N-ID] [src:…]` (`log touch` syntax)
+/// - `DATE touch P-ID <KIND> [note:N-ID] [src:…] [duration:<N>m] [mode:…]`
+///   (`log touch` syntax). The `kind:` form also accepts the same pairs.
 ///
-/// `<KIND>` is one of [`TOUCH_KINDS`]. On non-mirrored inputs this agrees
-/// with the shape core used to ask `is_personal_touch_shape` about, so the
-/// disabled-pack branch of `check` can use it as the pack-shape check behind
-/// `W_PACK_ORPHAN`.
+/// `<KIND>` is one of [`TOUCH_KINDS`]; `duration:` must parse as a positive
+/// minute count; `mode:` is one of [`TOUCH_MODES`]. On non-mirrored inputs
+/// this agrees with the shape core used to ask `is_personal_touch_shape`
+/// about, so the disabled-pack branch of `check` can use it as the
+/// pack-shape check behind `W_PACK_ORPHAN`.
 pub fn validate_touch_args(args: &[Arg]) -> bool {
-    match args {
-        [] => true,
-        [arg] => match arg.pair() {
-            Some(("kind", k)) => is_valid_touch_kind(k),
-            None => arg.as_token().is_some_and(is_valid_touch_kind),
-            _ => false,
-        },
-        _ => parse_touch_args(args).is_some(),
-    }
+    args.is_empty() || parse_touch_args(args).is_some()
 }
 
-/// The `log touch` grammar: a leading positional kind plus optional
-/// `note:` and `src:` pairs (no duplicates). Returns the kind on success.
+/// The `touch` grammar: a leading positional kind or `kind:` pair plus
+/// optional `note:`, `src:`, `duration:`, and `mode:` pairs (no duplicates).
+/// Returns the kind on success.
 fn parse_touch_args(args: &[Arg]) -> Option<&str> {
-    let first = args.first()?.as_token()?;
-    if !is_valid_touch_kind(first) {
-        return None;
-    }
+    let (first, rest) = args.split_first()?;
+    let (kind, rest) = match first.pair() {
+        Some(("kind", kind)) if is_valid_touch_kind(kind) => (kind, rest),
+        Some(_) => return None,
+        None => {
+            let token = first.as_token()?;
+            if !is_valid_touch_kind(token) {
+                return None;
+            }
+            (token, rest)
+        }
+    };
     let mut seen_note = false;
     let mut seen_src = false;
-    for arg in &args[1..] {
+    let mut seen_duration = false;
+    let mut seen_mode = false;
+    for arg in rest {
         match arg.pair() {
             Some(("note", _)) if !seen_note => seen_note = true,
             Some(("src", _)) if !seen_src => seen_src = true,
+            Some((TOUCH_DURATION_PAIR, value)) if !seen_duration => {
+                if parse_duration_minutes(value).is_none_or(|minutes| minutes == 0) {
+                    return None;
+                }
+                seen_duration = true;
+            }
+            Some((TOUCH_MODE_PAIR, value)) if !seen_mode => {
+                if !is_valid_touch_mode(value) {
+                    return None;
+                }
+                seen_mode = true;
+            }
             _ => return None,
         }
     }
-    Some(first)
+    Some(kind)
 }
 
 #[cfg(test)]
@@ -190,6 +250,64 @@ mod tests {
     }
 
     #[test]
+    fn touch_args_accept_duration_and_mode() {
+        // #741: the rich pairs ride on either kind form, in any order.
+        assert!(validate_touch_args(&[
+            token("meal"),
+            pair("duration", "60m"),
+            pair("mode", "one-on-one"),
+        ]));
+        assert!(validate_touch_args(&[
+            token("meal"),
+            pair("mode", "group"),
+            pair("duration", "1h30m"),
+        ]));
+        assert!(validate_touch_args(&[
+            pair("kind", "event"),
+            pair("duration", "2h"),
+            pair("src", "calendar/t-1"),
+        ]));
+        // Duplicates and out-of-grammar values are malformed.
+        for args in [
+            vec![
+                token("meal"),
+                pair("duration", "60m"),
+                pair("duration", "30m"),
+            ],
+            vec![token("meal"), pair("mode", "group"), pair("mode", "group")],
+            vec![token("meal"), pair("duration", "0m")],
+            vec![token("meal"), pair("duration", "soon")],
+            vec![token("meal"), pair("mode", "crowd")],
+        ] {
+            assert!(!validate_touch_args(&args), "{args:?}");
+        }
+        // A kind-less line cannot carry the pairs: they describe a touchpoint.
+        assert!(!validate_touch_args(&[pair("mode", "group")]));
+    }
+
+    #[test]
+    fn touch_duration_and_mode_are_extracted() {
+        let rich = entry(vec![
+            token("meal"),
+            pair("duration", "1h30m"),
+            pair("mode", "group"),
+        ]);
+        assert_eq!(extract_touch_duration(&rich), Some(90));
+        assert_eq!(extract_touch_mode(&rich).as_deref(), Some("group"));
+        let plain = entry(vec![token("call")]);
+        assert_eq!(extract_touch_duration(&plain), None);
+        assert_eq!(extract_touch_mode(&plain), None);
+        // Invalid values are not half-admitted.
+        let malformed = entry(vec![
+            token("call"),
+            pair("duration", "soon"),
+            pair("mode", "crowd"),
+        ]);
+        assert_eq!(extract_touch_duration(&malformed), None);
+        assert_eq!(extract_touch_mode(&malformed), None);
+    }
+
+    #[test]
     fn touch_kind_prefers_pair_over_positional() {
         let e = entry(vec![token("text"), pair("kind", "call")]);
         assert_eq!(extract_touch_kind(&e).as_deref(), Some("call"));
@@ -220,6 +338,14 @@ mod tests {
         assert_eq!(touch_identity(&base), touch_identity(&noted));
         let mirrored = entry(vec![pair("kind", "meet")]);
         assert_eq!(touch_identity(&base), touch_identity(&mirrored));
+        // #741: duration and mode describe the touch, they do not make it a
+        // different touchpoint for idempotency.
+        let rich = entry(vec![
+            token("meet"),
+            pair("duration", "60m"),
+            pair("mode", "one-on-one"),
+        ]);
+        assert_eq!(touch_identity(&base), touch_identity(&rich));
         let other_kind = entry(vec![token("call")]);
         assert_ne!(touch_identity(&base), touch_identity(&other_kind));
         // Kind-less mirrored line: no identity.

@@ -171,11 +171,18 @@ pub struct NoteView {
 
 /// One mirrored touchpoint for the person: a ledger `touch` line carrying
 /// only a date and the participant's own id, plus a kind when a pack needs
-/// one (#179). No other participant ids, no primary id, no interaction id.
+/// one (#179), and the optional `duration_minutes` / `mode` richness pairs
+/// from #741 (omitted when absent or invalid). No other participant ids, no
+/// primary id, no interaction id.
 #[derive(Clone, Debug, Serialize)]
 pub struct TouchpointView {
     pub date: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_minutes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// Operator path only (#838): this line is superseded by a valid
     /// retraction. Absent on the agent path (where superseded lines are not
     /// emitted at all) and on live lines, so agent JSON is unchanged.
@@ -219,7 +226,7 @@ pub struct PersonContext {
     /// canonicalization, and pack scope.
     pub edges: Vec<EdgeView>,
     /// Pack state grouped by pack name (`"personal@0.2"` in 0.1–0.3,
-    /// `"personal@0.3"` in 0.4). Each pack decides its own view shape via
+    /// `"personal@0.4"` in 0.4). Each pack decides its own view shape via
     /// `Pack::context_view`. Empty for an org: pack views are person-keyed.
     pub packs: BTreeMap<String, serde_json::Value>,
     /// The person's contact values (`emails`, `phones`, `handles`), shown
@@ -604,6 +611,10 @@ pub fn build_context(
                     .iter()
                     .find(|p| p.verbs().contains(&s.entry.verb.as_str()))
                     .and_then(|p| p.verb_kind(&s.entry.verb, &s.entry)),
+                // #741: richness pairs come from the core touch grammar, so
+                // they do not depend on which pack claims the verb.
+                duration_minutes: crate::touch::extract_touch_duration(&s.entry),
+                mode: crate::touch::extract_touch_mode(&s.entry),
                 superseded: for_operator && vault.is_voided(s),
             })
             .collect();
@@ -611,6 +622,7 @@ pub fn build_context(
             a.date
                 .cmp(&b.date)
                 .then(a.kind.cmp(&b.kind))
+                .then(a.mode.cmp(&b.mode))
                 .then(a.superseded.cmp(&b.superseded))
         });
     }
@@ -1592,7 +1604,7 @@ mod tests {
             bea_bundle.touchpoints
         );
         assert_eq!(bea_bundle.touchpoints[0].kind.as_deref(), Some("meet"));
-        let personal = &bea_bundle.packs["personal@0.3"];
+        let personal = &bea_bundle.packs["personal@0.4"];
         assert_eq!(personal["recent_touches"].as_array().unwrap().len(), 1);
         assert_eq!(personal["recent_touches"][0]["kind"], "meet");
         // Pack state stays effective-only on both paths: the operator sees
@@ -1610,7 +1622,7 @@ mod tests {
             bea_operator.touchpoints
         );
         assert_eq!(
-            bea_operator.packs["personal@0.3"]["recent_touches"]
+            bea_operator.packs["personal@0.4"]["recent_touches"]
                 .as_array()
                 .unwrap()
                 .len(),

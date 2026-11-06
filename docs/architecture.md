@@ -523,7 +523,8 @@ snapshots.
 - `context.entity.fields` exposes a non-person-like pack entity's declared
   fields. `--exclude-private` strips `address`, `tags`, and `links`; an
   uncleared place or thing returns no agent bundle at all.
-- `context.packs` follows the active version (`personal@0.3` in 0.4);
+- `context.packs` follows the active version (`personal@0.3` in 0.4 when
+  this ADR landed; ADR-22 selects `personal@0.4`);
   `--packs personal@0.2` remains a no-op alias. `org` and `deal` stay core;
   `thing.kind` excludes `organization`.
 - The demo vault stays on 0.2; `testdata/vaults/personal-0.4/` is the new
@@ -552,10 +553,79 @@ uncleared place or thing yields no agent bundle, and `address` is stripped
 from private context. The new fixture and golden cover the types, edges,
 fields, and privacy. TUI work, name resolution, per-visit history, the
 org/deal migration, and cross-pack type references remain follow-ups.
+ADR-22 extends this ADR with `personal@0.4`, which keeps every claim here.
+
+### ADR-22. `personal@0.4` adds cadence semantics and rich touches (#750, #741).
+
+**Door:** One-way (a vault that writes `cadence_basis`, `cadence_note`, or
+`duration:` / `mode:` commits to their names and meanings).
+
+**Context.** Two gaps surfaced in live enrichment. A cadence said only a
+number of days: it did not say whether that number described an observed
+rhythm or an intention, and it had no place to record that the relationship
+changed shape (frequent 1:1s became investor updates), so a stale window
+manufactured guilt. Separately, a ledger touch was only a date and a kind:
+a 60-minute session had to ride in a note, and a birthday game night read
+exactly like a 1:1 coffee to any days-since-touch ranking. `cadence: never`
+already existed (#589) as the explicit never-nudge, but the product framed
+it as "never overdue" rather than "none, by design", so the distinction
+from an unset cadence was easy to miss.
+
+**Decision.**
+
+- Spec 0.4 is extended in place; there is no 0.5. `personal@0.4` becomes
+  the spec-selected built-in for 0.4. `personal@0.3` is frozen: it stays
+  compiled for fixtures and history, but no spec selects it. 0.1–0.3 keep
+  `personal@0.2`. The selection is still by vault `spec`, and a
+  `personal@…` listing is still a no-op (`spec/pack-manifest.md` §13.7).
+- Two optional person fields, both `non-empty-string`, are added beside
+  `cadence`: `cadence_basis` (`observed` or `intention`, documented and
+  enforced by the capture guidance, like place/thing `kind`, so a new
+  honest value needs no spec change) and `cadence_note` (the mode the
+  cadence was set for and why it changed).
+- `cadence: never` is restated as the explicit **"none, by design"** state,
+  distinct from unset. `W_CADENCE_OVERDUE` still never fires for it, and
+  `context` still marks it with `cadence_never: true`. The basis and note
+  never change the day count; only `cadence` drives the rule.
+- `touch` gains two optional core pairs: `duration:<N>m` (the session
+  duration syntax, at least one minute) and `mode:one-on-one|group`. They
+  are core grammar, not pack fields, so a disabled personal pack still
+  parses and reports them the same way. They do not change
+  `W_CADENCE_OVERDUE`, and they are not part of the #747 idempotency
+  identity (person, date, kind), so a re-report of the same contact with
+  fresh detail is still the same touchpoint.
+- `context` shows `duration_minutes` and `mode` on core `touchpoints` and on
+  the personal view's `recent_touches`; `cadence_basis` appears under its
+  declared name. `cadence_note` is free text and joins the
+  `--exclude-private` list; it is also denied to agents by the `no-ai`
+  deny-by-default rule, while the derived cadence state stays.
+- `confidant log touch` gains `--duration` and `--mode` and normalizes the
+  duration to minutes; the MCP `log_touch` tool exposes the same options.
+- No new verbs, finding codes, metrics, record types, edge kinds, or
+  `[checks]` keys. The demo vault stays on 0.2 and is untouched.
+
+**Alternatives considered.** (a) A `cadence_mode` enum instead of a free
+note: cannot say *why*, which is the part that prevents a stale window.
+(b) A closed `one-of` grammar for the basis: a second grammar just for two
+values, when `kind` already set the open-vocabulary precedent. (c) A
+participant count instead of a 1:1/group flag: more to fill in, and the
+ranking question is binary. (d) Make duration part of the duplicate
+identity: a re-report with a corrected duration would read as a second
+contact. (e) A new spec 0.5: the fields are additive and every 0.4 vault
+stays valid.
+
+**Consequences.** Existing 0.4 vaults keep working and gain the new
+options; their pinned `personal@…` listing still resolves to the active
+built-in. `context` grows keys only when the data is present, so every
+existing bundle is unchanged. `cadence_basis`/`cadence_note` are pack
+fields, so an external pack cannot claim them and a non-personal vault
+ignores them. The frozen 0.3 pack stays in the binary and its contract in
+`packs/personal/0.3.md`. Follow-ups: a drifting-radar routine that reads
+the basis (#726) and TUI capture for the rich pairs.
 
 ## 8. v0 scope and milestones
 
-1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18) and edge-level `no-ai` (ADR-19), 0.4 corrections and record retirement (ADR-20), and 0.4's `personal@0.3` default with places and things (ADR-21); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
+1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18) and edge-level `no-ai` (ADR-19), 0.4 corrections and record retirement (ADR-20), 0.4's `personal@0.3` default with places and things (ADR-21), and `personal@0.4` cadence semantics and rich touches (ADR-22); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
 2. **Vault safety and sync.** `confidant doctor` (git repo and identity, transport, spec, `check`, staleness, skills links), `confidant sync` as the explicit git boundary, and the §12 `no-ai` allowlist. Done when a fresh clone on a clean machine reads and writes the vault with no extra setup.
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
 4. **Import skills.** Agent skills that pull events and transcripts from outside systems into the vault, with dry runs and safe retries.

@@ -1,4 +1,4 @@
-# Pack manifest for personal@0.3 (spec/pack-manifest.md).
+# Pack manifest for personal@0.4 (spec/pack-manifest.md).
 #
 # This is the built-in declarative pack (#550). Its bytes live inside the
 # binary and are loaded through the same manifest-v3 / declarative path
@@ -8,9 +8,10 @@
 # keyed on the bytes' origin, never the pack name, so a vault directory
 # `packs/personal@…` still fails `E_PACK_INVALID` (#504 R8).
 #
-# Root `packs/personal/` is the 0.3 source; the frozen 0.2 bytes live in
-# `crates/confidant-core/pack-manifests/personal-0.2/`. A drift test pins
-# the root 0.3 files to their embedded copies.
+# Root `packs/personal/` is the 0.4 source; the frozen 0.2 and 0.3 bytes
+# live in `crates/confidant-core/pack-manifests/personal-0.2/` and
+# `personal-0.3/`. A drift test pins the root 0.4 files to their embedded
+# copies.
 
 manifest_version = 3
 
@@ -29,10 +30,10 @@ finding_codes = [
 
 [pack]
 name = "personal"
-version = "0.3"
+version = "0.4"
 skill = "SKILL.md"
-# 0.3 is required because this manifest declares record types; 0.4 is the
-# vault spec that selects this built-in version.
+# 0.3 is required because this manifest declares record types (a 0.3
+# capability); 0.4 is the vault spec that selects this built-in version.
 requires_spec = ["0.3", "0.4"]
 
 [[record_types]]
@@ -106,6 +107,22 @@ grammar = "non-empty-string"
 [[fields]]
 name = "cadence"
 grammar = "cadence"
+
+# #750: why the cadence is what it is. `observed` is a rhythm derived from
+# touch history; `intention` is the rhythm the operator wants. The
+# vocabulary is documented and enforced by the capture skill, not by a
+# closed grammar (the same call as place/thing `kind`), so a future value
+# does not need a spec change.
+[[fields]]
+name = "cadence_basis"
+grammar = "non-empty-string"
+
+# #750: the mode note. When the relationship's shape changes (frequent 1:1s
+# to occasional updates), record why the cadence moved with it. Free text;
+# private context, because it can name people and situations.
+[[fields]]
+name = "cadence_note"
+grammar = "non-empty-string"
 
 [[fields]]
 name = "snooze_until"
