@@ -44,6 +44,32 @@ already work. `confidant doctor` reports the layer's state
 only a name on PATH (a stub or test shim) is not trusted; the checks probe
 `qmd --version`.
 
+## Upkeep: you own index freshness
+
+The corpus and embeddings are **derived state**. Keeping them fresh is your
+duty as the agent, not something the CLI does for you, and not something to
+leave until the operator remembers to ask.
+
+- After **any vault-changing event in the session** — a
+  `confidant sync --pull` that brought new commits, or any write you applied
+  (`log`, `note`, `record`, `retract`, ...) — re-run
+  `bin/qmd-index.py --vault <vault> --embed` before you report the work done.
+- Then **verify with one query** a term you know is in the new or edited
+  content (`bin/qmd-query.py --vault <vault> "<term>"`). A rebuild that
+  cannot answer it is not done.
+- Do the same after a correction or retirement: the old snippet is no longer
+  cleared, and only a rebuild removes it from the corpus.
+- If the rebuild fails (qmd broken, models unavailable, disk low), say so
+  plainly. Do not report semantic search as ready.
+- Do not wait for the operator to ask. "No one told me to re-index" is the
+  failure this rule exists to prevent.
+
+`confidant doctor` is the safety net: its `qmd-search` line warns when the
+index is N commits behind the vault HEAD, or when the last build skipped
+`--embed` (`qmd-index.py` records the HEAD and that flag in
+`<vault>/.confidant/qmd-build.json`). Treat a doctor warning as a missed
+upkeep step and fix the index before relying on ranked results.
+
 ## Trust and safety (read first)
 
 - **Trusted devices only.** The index holds plaintext chunks and embeddings.

@@ -480,4 +480,9 @@ downloads on first embed, a plaintext corpus of cleared records under
 `<vault>/.confidant/` (gitignored, never synced), and a rebuild after
 content changes. Without qmd, the skill falls back to `confidant find` and
 says so. `doctor`'s `qmd-search` line reports absent, not-working, corpus,
-and embeddings states; a stub named `qmd` on `PATH` is not trusted.
+and embeddings states; a stub named `qmd` on `PATH` is not trusted. Since
+#725 it also reports freshness: `qmd-index.py` records the vault HEAD it
+built from (and whether `--embed` ran) in
+`<vault>/.confidant/qmd-build.json`, and `doctor` warns when the index is N
+commits behind or was last built without `--embed` (a missing or unreadable
+record is `unknown`, never a silent `ok`).

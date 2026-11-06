@@ -398,6 +398,38 @@ class QmdIndexStagingTest(unittest.TestCase):
         self.assertIn(".confidant/", str(caught.exception.code))
         self.assertFalse((self.vault / ".confidant" / "qmd-corpus").exists())
 
+    def test_records_the_built_head_and_time(self):
+        # #725: doctor compares this record with the live HEAD.
+        subprocess.run(
+            ["git", "-c", "user.name=Confidant Test",
+             "-c", "user.email=test@example.com",
+             "commit", "--allow-empty", "-qm", "fixture"],
+            cwd=self.vault, check=True)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.vault,
+            capture_output=True, text=True, check=True).stdout.strip()
+        self.index.record_build_head(str(self.vault), embedded=True)
+        marker = self.vault / ".confidant" / "qmd-build.json"
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertEqual(payload["commit"], head)
+        self.assertTrue(payload["embedded"])
+        self.assertRegex(payload["built_at"],
+                         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        if os.name == "posix":
+            self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                (self.vault / ".confidant").stat().st_mode & 0o777, 0o700)
+
+    def test_build_record_without_a_commit_is_null_not_invented(self):
+        # A vault with no commit yet must not claim a HEAD.
+        self.index.record_build_head(str(self.vault))
+        payload = json.loads(
+            (self.vault / ".confidant" / "qmd-build.json")
+            .read_text(encoding="utf-8"))
+        self.assertIsNone(payload["commit"])
+        self.assertFalse(payload["embedded"])
+        self.assertIn("built_at", payload)
+
 
 class CorpusLineIndexTest(unittest.TestCase):
     """#795: one edited ledger line must not drop every later mapping."""
