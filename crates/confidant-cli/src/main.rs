@@ -2764,7 +2764,7 @@ fn cmd_pack_unlist(cli: &Cli, root: &Path, plan: UnlistPlan<'_>) -> anyhow::Resu
             pack_fetch::escape_line(name)
         );
         println!(
-            "to keep using it instead, re-list the vendored pack with `confidant pack add --from-dir <pack> --yes`"
+            "to keep using it instead, re-list the vendored pack with `confidant pack add --from-dir <pack> --allow-unresolved --yes`"
         );
     }
     if let Some(hint) = hint {
@@ -6689,25 +6689,43 @@ fn probe_binary_text(bin: &Path, arg: &str) -> Option<String> {
 }
 
 /// True when probe output looks like a version/usage banner rather than a
-/// canned query result. `qmd` in the text, or a `major.minor`-style token,
-/// is enough; anything else (a fixed result payload) is not trusted.
+/// canned query result. Only the first non-empty line is judged: a canned
+/// hit list can contain a version-shaped score like `0.87` (or the tool name
+/// in its body), and any later line must not rescue it. On that line, `qmd`
+/// in the text, or a `major.minor`-style token, is enough.
 fn looks_like_version_or_usage(output: &str) -> bool {
-    output.lines().any(|line| {
-        let line = line.trim();
-        line.to_ascii_lowercase().contains("qmd")
-            || line.split_whitespace().any(|token| {
-                let mut parts = token.split('.');
-                parts.next().is_some_and(|first| {
-                    !first.is_empty() && first.chars().all(|c| c.is_ascii_digit())
-                }) && parts.next().is_some_and(|second| {
+    let Some(line) = first_nonempty_line(output) else {
+        return false;
+    };
+    line.to_ascii_lowercase().contains("qmd")
+        || line.split_whitespace().any(|token| {
+            let mut parts = token.split('.');
+            parts
+                .next()
+                .is_some_and(|first| !first.is_empty() && first.chars().all(|c| c.is_ascii_digit()))
+                && parts.next().is_some_and(|second| {
                     !second.is_empty() && second.chars().all(|c| c.is_ascii_digit())
                 })
-            })
-    })
+        })
+}
+
+/// The first line with content, trimmed; `None` for blank output.
+fn first_nonempty_line(output: &str) -> Option<&str> {
+    output.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 /// Detect a *working* qmd (#715), not just a name on PATH.
+///
+/// Cached for the life of the process: `setup` and `status` ask more than
+/// once, and a hanging shim costs the full 2s probe each time otherwise. The
+/// CLI is one-shot, so a cache can never go stale across commands.
 fn qmd_state() -> QmdState {
+    static CACHED: std::sync::OnceLock<QmdState> = std::sync::OnceLock::new();
+    CACHED.get_or_init(probe_qmd_state).clone()
+}
+
+/// The uncached probe behind [`qmd_state`].
+fn probe_qmd_state() -> QmdState {
     let Some(path) = find_on_path("qmd") else {
         return QmdState::Missing;
     };
@@ -6719,7 +6737,7 @@ fn qmd_state() -> QmdState {
     match banner {
         Some(text) => QmdState::Working {
             path,
-            version: text.lines().next().unwrap_or_default().trim().to_owned(),
+            version: first_nonempty_line(&text).unwrap_or_default().to_owned(),
         },
         None => QmdState::NotWorking { path },
     }
@@ -11413,13 +11431,33 @@ fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::{
-        confirm_yn, detect_install_method, git_version_check_from, offerable_update,
-        parse_ahead_behind, parse_git_remotes, parse_git_version, parse_tui_version,
-        reject_unsupported_prefix, sync_push_refspec, AheadBehind, Cli, InstallMethod, JOURNEYS,
-        MIN_GIT_VERSION,
+        confirm_yn, detect_install_method, git_version_check_from, looks_like_version_or_usage,
+        offerable_update, parse_ahead_behind, parse_git_remotes, parse_git_version,
+        parse_tui_version, reject_unsupported_prefix, sync_push_refspec, AheadBehind, Cli,
+        InstallMethod, JOURNEYS, MIN_GIT_VERSION,
     };
     use clap::CommandFactory;
     use std::path::Path;
+
+    /// #854: only the first non-empty probe line is judged. A canned hit list
+    /// can carry a version-shaped score like `0.87` (or the tool name) on a
+    /// later line, and that must not make a shim look like an installed qmd.
+    #[test]
+    fn qmd_probe_trusts_only_the_first_nonempty_line() {
+        assert!(looks_like_version_or_usage("qmd 1.0.0"));
+        assert!(looks_like_version_or_usage("\n\n  qmd 1.0.0\nusage..."));
+        assert!(looks_like_version_or_usage("1.2.3"));
+        assert!(looks_like_version_or_usage("Usage: qmd [options]"));
+        assert!(!looks_like_version_or_usage(""));
+        assert!(!looks_like_version_or_usage("  \n\t\n"));
+        assert!(
+            !looks_like_version_or_usage(
+                "Robin Example — canned search hit\nscore 0.87\nqmd 1.0.0"
+            ),
+            "a later score or tool name must not rescue canned hits"
+        );
+        assert!(!looks_like_version_or_usage("search results:\nqmd 1.0.0\n"));
+    }
 
     /// #721: every visible command sits in exactly one journey, so the
     /// grouped human help can never silently drop a command (hidden

@@ -177,7 +177,9 @@ pub struct NoteView {
 #[derive(Clone, Debug, Serialize)]
 pub struct TouchpointView {
     pub date: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always serialized, `null` when the line carries no kind: the agent
+    /// contract has always shown `"kind": null` for kind-less touches, so
+    /// omitting it would change ADR-7 JSON shape for unchanged vaults.
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_minutes: Option<u32>,
@@ -1005,6 +1007,12 @@ mod tests {
         assert_eq!(bea_ctx.touchpoints.len(), 2);
         assert_eq!(bea_ctx.touchpoints[0].date, "2026-10-06");
         assert_eq!(bea_ctx.touchpoints[0].kind, None);
+        // ADR-7 shape: a kind-less touch keeps its `kind` key as null; only
+        // the newer richness pairs are omitted when absent.
+        assert_eq!(
+            serde_json::to_value(&bea_ctx.touchpoints[0]).unwrap(),
+            serde_json::json!({"date": "2026-10-06", "kind": null})
+        );
         assert_eq!(bea_ctx.touchpoints[1].date, "2026-10-07");
         assert_eq!(bea_ctx.touchpoints[1].kind.as_deref(), Some("call"));
         // Ada sees only her own touchpoint, not Bea's.

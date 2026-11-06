@@ -48,9 +48,11 @@ line), and a rerun clears it.
 
 Each successful build records the vault HEAD it was built from (commit,
 UTC time, and whether `--embed` ran) in `<vault>/.confidant/qmd-build.json`
-(#725). `confidant doctor` compares that record with the live HEAD and warns
-"search index is N commits behind", so a missed manual rebuild is visible
-instead of silent.
+(#725). The HEAD is sampled before the corpus is staged and before `--embed`
+runs, so a commit made during a long first embed is not recorded as already
+indexed; the marker is written only after the build succeeds. The `doctor`
+command compares that record with the live HEAD and warns "search index is N
+commits behind", so a missed manual rebuild is visible instead of silent.
 """
 import argparse
 import json
@@ -232,9 +234,12 @@ def vault_head(vault):
     return commit if p.returncode == 0 and commit else None
 
 
-def record_build_head(vault, embedded=False):
+def record_build_head(vault, commit, embedded=False):
     """Record the vault HEAD this corpus was built from (#725).
 
+    `commit` is the HEAD sampled by the caller *before* staging and embedding,
+    not the HEAD at write time: commits made during a long first embed are not
+    in the corpus, so recording the later HEAD would claim they were indexed.
     `confidant doctor` reads `<vault>/.confidant/qmd-build.json` and compares
     its commit with the live HEAD, so a missed rebuild shows up as "search
     index is N commits behind" instead of silently stale results. `embedded`
@@ -245,7 +250,7 @@ def record_build_head(vault, embedded=False):
     """
     path = os.path.join(vault, BUILD_MARKER_REL)
     payload = {
-        "commit": vault_head(vault),
+        "commit": commit,
         "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "embedded": bool(embedded),
     }
@@ -388,6 +393,10 @@ def main():
     args = ap.parse_args()
 
     vault = resolve_vault(args.vault)
+    # #725: sample the HEAD the corpus will reflect *before* staging and
+    # before a potentially long `--embed`. Sampling at record time would
+    # record commits made during the embed as already indexed.
+    built_head = vault_head(vault)
     ensure_store_dirs(vault)
     migrate_default_store()
 
@@ -411,8 +420,9 @@ def main():
         run_qmd(["embed"], env)
     # #725: record the HEAD this corpus was built from so `doctor` can warn
     # when the index is behind. Only after staging + registration + embed
-    # succeeded: a failed embed must not look fresh.
-    record_build_head(vault, embedded=args.embed)
+    # succeeded: a failed embed must not look fresh. The sampled HEAD is from
+    # before staging/embed, so work done during the build stays "behind".
+    record_build_head(vault, built_head, embedded=args.embed)
     print("done. query with: bin/qmd-query.py --vault "
           + vault + ' "your question"')
 
