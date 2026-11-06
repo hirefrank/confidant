@@ -84,6 +84,7 @@ jobs:
                    crates/confidant-core/pack-manifests/personal-0.4/SKILL.md \
                    crates/confidant-cli/pack-skills/personal/SKILL.md \
                    crates/confidant-cli/skills/qmd-search/SKILL.md \
+                   site/public/index.html \
                    Cargo.toml .github/workflows/ci.yml; do
             if is_docs "$f"; then
               echo "docs-detector self-test: $f should NOT count as docs" >&2
@@ -180,6 +181,13 @@ jobs:
         os: [ubuntu-24.04, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Static page, static version: nothing derives the landing page's pill
+      # from Cargo.toml, so a release that bumps the workspace alone leaves
+      # the live page stale. Cheap and dependency-free, so it runs before the
+      # Rust toolchain is installed and fails fast on a stale pill.
+      - name: landing page version pill
+        if: needs.changes.outputs.docs_only != 'true'
+        run: python3 .github/scripts/check-site-version.py
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         if: needs.changes.outputs.docs_only != 'true'
         with:

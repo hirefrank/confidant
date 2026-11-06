@@ -33,6 +33,11 @@ lockstep.
 
 - Bump versions as above; run `cargo check` to update `Cargo.lock` and
   commit both.
+- Bump the version pill in `site/public/index.html` to match the new
+  version (`<span class="pill">vX.Y.Z · Apache-2.0</span>`). CI's
+  `.github/scripts/check-site-version.py` fails when the pill and
+  `[workspace.package] version` disagree, and touching `site/**` is what
+  makes the Workers Builds deploy ship an updated landing page.
 - Move `[Unreleased]` in `CHANGELOG.md` to `[X.Y.Z] - YYYY-MM-DD` with
   the entries. Keep the `Keep a Changelog` format and fix the compare
   links at the bottom (`[Unreleased]`, `[X.Y.Z]`).
@@ -66,6 +71,10 @@ and skip crates.io.
 - crates.io: `confidant-core`, then `confidant-tui`, then
   `confidant-cli` appear at the new version (trusted publishing via
   OIDC; there is no `CARGO_REGISTRY_TOKEN` — do not add one).
+- Landing page: confirm https://hirefrank.com/confidant/ shows the new
+  version pill. Workers Builds redeploys `site/**` on push to `main`, so
+  the release prep PR must have touched `site/public/index.html`; a
+  release that bumps `Cargo.toml` alone leaves the live page stale.
 
 ## Why this order
 

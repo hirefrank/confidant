@@ -1,8 +1,30 @@
+// Deploys: Cloudflare dashboard Builds integration (Workers & Pages →
+// confidant-landing → Settings → Builds) watches this repo, root `site`,
+// watch paths `site/**`. Push to main to ship; avoid manual `wrangler deploy`
+// from stale checkouts. The landing page's version pill is bumped in the
+// release prep PR so a release push touches `site/**` and redeploys the page
+// (CI's check-site-version.py keeps the pill honest).
+//
+// Branch builds: Workers Builds runs the Preview command for every
+// non-production branch. Wrangler refuses that command unless the config has
+// a `previews` block, so without it every PR build fails while main stays
+// green. This Worker has no preview-specific settings (assets and
+// compatibility stay top level), so the block is empty.
 {
   "name": "confidant-landing",
   "main": "src/index.js",
   "compatibility_date": "2026-10-06",
-  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
+  "account_id": "6034f1c5d23e5503f6573740480cf0d6",
+  "workers_dev": true,
+  "preview_urls": true,
   "previews": {},
-  "observability": { "enabled": false }
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
+  // Production routes (most-specific wins, so these coexist with the main
+  // hirefrank.com site). The Worker already strips the `/confidant` prefix.
+  "routes": [
+    { "pattern": "hirefrank.com/confidant*", "zone_name": "hirefrank.com" },
+    { "pattern": "www.hirefrank.com/confidant*", "zone_name": "hirefrank.com" }
+  ],
+  "dev": { "ip": "0.0.0.0", "port": 45456 },
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
 }
