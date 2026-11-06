@@ -191,6 +191,38 @@ impl Record {
         let v = self.field("no-ai")?;
         Some(NoAi::parse(v).unwrap_or(NoAi::True))
     }
+
+    /// Every record ID this record's front matter references (#838): the
+    /// canonical `person` / `org` / `deal` / `entity` keys (including ASCII
+    /// case variants), an edge's `a` / `b` endpoints, and an interaction's
+    /// `with:` participants. Malformed values are skipped — `check` reports
+    /// them — so this is exactly the set a write may gate against a retired
+    /// target. Sorted and deduped; the record's own id is not included.
+    pub fn reference_ids(&self) -> Vec<RecordId> {
+        let mut ids = Vec::new();
+        for (key, raw) in &self.fields {
+            if canonical_ref_key(key).is_some() {
+                if let FrontmatterRef::Id(id) = parse_ref_id(raw) {
+                    ids.push(id);
+                }
+            }
+        }
+        if self.kind == RecordKind::Edge {
+            for key in ["a", "b"] {
+                if let Some(FrontmatterRef::Id(id)) = self.field(key).map(parse_ref_id) {
+                    ids.push(id);
+                }
+            }
+        }
+        if self.kind == RecordKind::Interaction {
+            if let Some(list) = self.field("with").and_then(parse_with_list) {
+                ids.extend(list);
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    }
 }
 
 /// Tri-state `no-ai` value (spec §4; 0.1 and 0.2 core types; 0.3 adds pack
@@ -1412,5 +1444,42 @@ mod tests {
         let edge = "---\nid: e-01M3TC5H00MPJG000000000000\ntype: edge\na: p-01M3TC5H00MPJG000000000000\nb: p-01M3TC5H00MPJG000H24000001\nkind: married\nretired: true\n---\n";
         assert!(super::parse_record_with_schema(edge, "x.md", &v04).is_ok());
         assert!(super::parse_record_with_schema(edge, "x.md", &v03).is_err());
+    }
+
+    #[test]
+    fn reference_ids_covers_refs_with_lists_and_edge_endpoints() {
+        let person = crate::id::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        let other = crate::id::RecordId::parse("p-01M3TC5H00MPJG000H24000001").unwrap();
+        let org = crate::id::RecordId::parse("o-01M3TC5H00MPJG001248000002").unwrap();
+
+        let interaction = super::parse_record(
+            "---\nid: i-01M3TC5H00MPJG003333000003\ntype: interaction\n\
+             Person: p-01M3TC5H00MPJG000000000000\nwith: [p-01M3TC5H00MPJG000H24000001]\n\
+             date: 2026-10-13\n---\n",
+            "x.md",
+        )
+        .unwrap();
+        assert_eq!(
+            interaction.reference_ids(),
+            vec![person.clone(), other.clone()]
+        );
+
+        let edge = super::parse_record(
+            "---\nid: e-01M3TC5H00MPJG004444000004\ntype: edge\n\
+             a: p-01M3TC5H00MPJG000000000000\nb: o-01M3TC5H00MPJG001248000002\n\
+             kind: works_at\n---\n",
+            "x.md",
+        )
+        .unwrap();
+        assert_eq!(edge.reference_ids(), vec![person, org]);
+
+        // Malformed values are `check`'s business, not this set's.
+        let broken = super::parse_record(
+            "---\nid: n-01M3TC5H00MPJG005555000005\ntype: note\n\
+             person: not-an-id\ndate: 2026-10-13\n---\n",
+            "x.md",
+        )
+        .unwrap();
+        assert!(broken.reference_ids().is_empty());
     }
 }

@@ -4086,6 +4086,13 @@ fn find_refs(root: &Path, query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Write a scratch record file and return its path for `--file`.
+fn record_file(dir: &Path, name: &str, contents: &str) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, contents).unwrap();
+    path.display().to_string()
+}
+
 #[test]
 fn retract_dry_run_apply_request_id_and_find_output() {
     let dir = make_corrections_vault();
@@ -4444,6 +4451,324 @@ fn record_retire_hides_agent_reads_and_operator_sees_the_badge() {
     ]);
     assert!(ok, "{hidden}");
     assert!(hidden["matches"].as_array().unwrap().is_empty(), "{hidden}");
+}
+
+/// #838: a new front-matter reference to a retired record is refused on both
+/// write paths.
+#[test]
+fn record_add_refuses_new_references_to_a_retired_record() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let live = "p-01J9Z3K4QF0000000000000012";
+    add_person(root, live, "Live Example", "");
+    let (ok, out) = run_json(&["record", "retire", CP_PERSON, "--json", "--vault", &vroot]);
+    assert!(ok, "{out}");
+    let before = commits(root);
+    let scratch = tempfile::tempdir().unwrap();
+
+    // A direct `person:` reference.
+    let ixn = "i-01J9Z3K4QF0000000000000020";
+    let file = record_file(
+        scratch.path(),
+        "interaction.md",
+        &format!(
+            "---\nid: {ixn}\ntype: interaction\nperson: {CP_PERSON}\n\
+             name: \"Retired meetup\"\ndate: 2026-10-13\n---\n\nFake body.\n"
+        ),
+    );
+    let (ok, err) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &file,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{err}");
+    assert_eq!(err["error"]["code"], "E_INVALID", "{err}");
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(message.contains(CP_PERSON), "{message}");
+    assert!(message.contains("retired"), "{message}");
+    assert!(err["error"]["fix"].as_str().unwrap().contains("unretire"));
+    assert_eq!(
+        commits(root),
+        before,
+        "a refused record add commits nothing"
+    );
+    assert!(!root
+        .join(format!("interactions/{ixn}/interaction.md"))
+        .exists());
+
+    // A `with:` participant on an interaction whose primary is live.
+    let with_ixn = "i-01J9Z3K4QF0000000000000021";
+    let with_file = record_file(
+        scratch.path(),
+        "with.md",
+        &format!(
+            "---\nid: {with_ixn}\ntype: interaction\nperson: {live}\n\
+             with: [{CP_PERSON}]\nname: \"Retired participant\"\ndate: 2026-10-13\n---\n\nFake body.\n"
+        ),
+    );
+    let (ok, err) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &with_file,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{err}");
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(CP_PERSON));
+
+    // An edge endpoint.
+    let edge = "e-01J9Z3K4QF0000000000000022";
+    let edge_file = record_file(
+        scratch.path(),
+        "edge.md",
+        &format!("---\nid: {edge}\ntype: edge\na: {live}\nb: {CP_PERSON}\nkind: colleague\n---\n"),
+    );
+    let (ok, err) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &edge_file,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{err}");
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(CP_PERSON));
+    assert_eq!(commits(root), before);
+    // No mirrored touchpoint was appended either (the gate runs before the
+    // write, so `with:` cannot smuggle a retired reference into the ledger).
+    let october = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+    assert!(!october.contains("2026-10-13"), "{october}");
+
+    // Control: a live reference is not over-blocked.
+    let live_ixn = "i-01J9Z3K4QF0000000000000023";
+    let live_file = record_file(
+        scratch.path(),
+        "live.md",
+        &format!(
+            "---\nid: {live_ixn}\ntype: interaction\nperson: {live}\n\
+             name: \"Live meetup\"\ndate: 2026-10-13\n---\n\nFake body.\n"
+        ),
+    );
+    let (ok, out) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &live_file,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(commits(root), before + 1);
+}
+
+/// #838: an existing reference is grandfathered on edit, a newly added one is
+/// refused.
+#[test]
+fn record_edit_refuses_a_new_retired_reference_but_keeps_an_existing_one() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let ixn = "i-01J9Z3K4QF0000000000000024";
+    let original = record_file(
+        scratch.path(),
+        "interaction.md",
+        &format!(
+            "---\nid: {ixn}\ntype: interaction\nperson: {CP_PERSON}\n\
+             name: \"Old meetup\"\ndate: 2026-10-13\n---\n\nFake body.\n"
+        ),
+    );
+    let (ok, out) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &original,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{out}");
+    let (ok, out) = run_json(&["record", "retire", CP_PERSON, "--json", "--vault", &vroot]);
+    assert!(ok, "{out}");
+    let before = commits(root);
+
+    // Keeping the now-retired `person:` is allowed: the reference was
+    // already in the stored file.
+    let kept = record_file(
+        scratch.path(),
+        "kept.md",
+        &format!(
+            "---\nid: {ixn}\ntype: interaction\nperson: {CP_PERSON}\n\
+             name: \"Renamed meetup\"\ndate: 2026-10-13\n---\n\nFake body, edited.\n"
+        ),
+    );
+    let (ok, out) = run_json(&[
+        "record",
+        "edit",
+        ixn,
+        "--file",
+        &kept,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(commits(root), before + 1);
+
+    // A *second* retired target cannot be introduced as a new `with:`
+    // participant.
+    let retired2 = "p-01J9Z3K4QF0000000000000013";
+    add_person(root, retired2, "Second Retired", "");
+    let (ok, out) = run_json(&["record", "retire", retired2, "--json", "--vault", &vroot]);
+    assert!(ok, "{out}");
+    let before = commits(root);
+    let with_added = record_file(
+        scratch.path(),
+        "with.md",
+        &format!(
+            "---\nid: {ixn}\ntype: interaction\nperson: {CP_PERSON}\n\
+             with: [{retired2}]\nname: \"Renamed meetup\"\ndate: 2026-10-13\n---\n\nFake body, edited.\n"
+        ),
+    );
+    let (ok, err) = run_json(&[
+        "record",
+        "edit",
+        ixn,
+        "--file",
+        &with_added,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{err}");
+    assert_eq!(err["error"]["code"], "E_INVALID", "{err}");
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(message.contains(retired2), "{message}");
+    assert!(message.contains("retired"), "{message}");
+    assert_eq!(commits(root), before, "a refused edit commits nothing");
+}
+
+/// #838: retirement is an ordinary check-gated write, not a repairing one:
+/// a record with an error cannot be retired until the finding is fixed.
+#[test]
+fn record_retire_is_check_gated_on_record_findings() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let broken = "n-01J9Z3K4QF0000000000000019";
+    let note_path = root.join(format!("people/{CP_PERSON}/notes/{broken}.md"));
+    std::fs::write(
+        &note_path,
+        format!(
+            "---\nid: {broken}\ntype: note\n\
+             person: p-01J9Z3K4QF9999999999999999\ndate: 2026-10-05\n---\n\nFake broken note.\n"
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "broken note fixture"]);
+    let before = commits(root);
+    let original = std::fs::read_to_string(&note_path).unwrap();
+
+    let (ok, report) = run_json(&[
+        "record",
+        "retire",
+        broken,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{report}");
+    assert_eq!(report["ok"], false, "{report}");
+    assert!(
+        report["summary"]["errors"].as_u64().unwrap() > 0,
+        "{report}"
+    );
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "E_DANGLING_REF"),
+        "{report}"
+    );
+    assert_eq!(commits(root), before, "the gate blocked the write");
+    assert_eq!(
+        std::fs::read_to_string(&note_path).unwrap(),
+        original,
+        "retirement is not a repairing write"
+    );
+    assert!(
+        !original.contains("retired: true"),
+        "the record must stay live until fixed"
+    );
+}
+
+/// #838: the operator `context` path lists superseded lines with a badge; the
+/// agent path returns the effective view and never carries the field.
+#[test]
+fn context_operator_lists_superseded_touchpoints() {
+    let vault = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/corrections-0.4");
+    let vroot = vault.display().to_string();
+    let ada = "p-01M3TC5H00MPJG000000000000";
+
+    let (ok, agent) = run_json(&["context", ada, "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{agent}");
+    let agent_touchpoints = agent["touchpoints"].as_array().unwrap();
+    assert_eq!(agent_touchpoints.len(), 1, "{agent}");
+    assert!(
+        agent_touchpoints[0].get("superseded").is_none(),
+        "the agent path must not carry the operator badge: {agent}"
+    );
+
+    let (ok, operator) = run_json(&[
+        "context",
+        ada,
+        "--for-operator",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{operator}");
+    assert_eq!(operator["for_operator"], true, "{operator}");
+    let operator_touchpoints = operator["touchpoints"].as_array().unwrap();
+    assert_eq!(operator_touchpoints.len(), 2, "{operator}");
+    assert!(
+        operator_touchpoints[0].get("superseded").is_none(),
+        "live lines stay unbadged: {operator}"
+    );
+    assert_eq!(
+        operator_touchpoints[1]["superseded"], true,
+        "the voided duplicate must be shown and badged: {operator}"
+    );
+    assert!(
+        !agent.to_string().contains("superseded"),
+        "no superseded marker leaks to the agent path: {agent}"
+    );
 }
 
 #[test]
