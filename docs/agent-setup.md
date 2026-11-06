@@ -247,7 +247,7 @@ last-fetched copy.
 
 | Command | What |
 |---|---|
-| `confidant setup [--agent auto\|all\|a,b] [--force] [--copy] [--no-instructions] [-v]` | Materialize embedded skills, link into agent skill dirs, install the system-of-record rule, print the completion brief |
+| `confidant setup [--agent auto\|all\|a,b] [--force] [--copy] [--no-instructions] [-v]` | Materialize embedded skills, link into agent skill dirs, install the system-of-record rule, print the completion brief, both integration surfaces, and the optional-layers checklist |
 | `confidant update [--agent …] [--force] [-v]` | Report latest release, re-link skills from this binary |
 | `confidant doctor` | Vault health + CLI staleness + skills link health + system-of-record rule + `git-remote` + `local-commits`, with a summary |
 | `confidant status` | One-screen readiness rollup and the completion brief; exits 1 when a required check is not `ok` |
@@ -307,6 +307,13 @@ orders live; the work discipline; and 3–5 routines grounded in the vault's
 actual contents. `confidant status` reprints that brief with the readiness
 rollup.
 
+The last block is the optional-layers checklist (#715): vault present,
+skills linked, `qmd` installed, corpus built, embeddings present. Each row
+carries its state and a one-line tradeoff, and nothing there is required —
+`setup` reports, the operator decides. An absent or unknown layer is named
+as such, never left as a silent `ok`; a `qmd` on `PATH` only counts when it
+answers `--version` (a stub or test shim does not).
+
 The rollup covers CLI/TUI versions, vault discovery and writability, skill
 links, the system-of-record rule, git repository/identity/remote/ahead-
 behind state, the QMD corpus, and binary staleness. Every line is `ok`,
@@ -317,6 +324,28 @@ vault spec, skill links, and the system-of-record rule. Absent optional
 layers (TUI, QMD) and optional warnings (remote advice, ahead/behind) do
 not block readiness. `confidant status --json` returns the same data under
 `readiness` and `brief`.
+
+## Skills and the MCP server
+
+Confidant has two agent-integration surfaces, and `setup` names both in its
+completion output:
+
+- **Skills** (installed by `confidant setup`): workflow guidance and
+  guardrails — read routing, propose → confirm → apply, the `no-ai`
+  boundary — executed by shelling out to the CLI. They work in any host that
+  can run a shell, and they carry the `pack-author` workflow.
+- **MCP server** (`confidant mcp`): a thin stdio JSON-RPC wrapper over the
+  same CLI commands, for MCP-native hosts that would rather have tools than
+  a shell. It exposes a fixed tool whitelist (`check`, `doctor`, `find`,
+  `context`, the write verbs, `schema`, `pack_skill`), applies the same
+  `no-ai` allowlist and pack ceiling, and is never a second implementation
+  (ADR-7). Pack management is operator-only and not exposed over MCP.
+
+Use skills when the host has no native MCP support or when the written
+workflow matters; use MCP when the host speaks MCP and a shell is awkward.
+Using both is fine — the skills remain useful documentation next to an MCP
+connection. `setup --json` reports the same fact under `integrations`
+(`skills.dir`/`skills.agents` and `mcp.command`).
 
 ## Local packs
 
@@ -443,6 +472,12 @@ this loop:
 ## Optional search backend (qmd)
 
 Plain `confidant find` needs nothing. The `qmd-search` skill is optional and
-needs the `qmd` binary (`npm install -g @tobilu/qmd`). `confidant setup -v`
-mentions this once; normal setup output stays quiet about it. Without qmd,
-the skill falls back to `confidant find` and says so.
+needs a working `qmd` binary (`npm install -g @tobilu/qmd`, Node 20+);
+`setup` ends with this layer in its optional-layers checklist, and
+`confidant setup -v` adds the install note. The skill's own preamble gives
+the tradeoffs before you opt in: a second toolchain, multi-GB GGUF model
+downloads on first embed, a plaintext corpus of cleared records under
+`<vault>/.confidant/` (gitignored, never synced), and a rebuild after
+content changes. Without qmd, the skill falls back to `confidant find` and
+says so. `doctor`'s `qmd-search` line reports absent, not-working, corpus,
+and embeddings states; a stub named `qmd` on `PATH` is not trusted.

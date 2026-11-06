@@ -102,12 +102,18 @@ fn doctor_qmd_missing_from_path_is_ok() {
 }
 
 /// Fake `qmd` whose `status` output reports `$QMD_FAKE_VECTORS embedded`.
+/// It answers `--version` like a real CLI (#715): a name on PATH alone is
+/// not trusted.
 #[cfg(unix)]
 fn write_fake_qmd(dir: &Path) {
     let script = dir.join("qmd");
     std::fs::write(
         &script,
         "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ] || [ \"$1\" = \"--help\" ]; then\n\
+         echo \"qmd 9.9.9-fake\"\n\
+         exit 0\n\
+         fi\n\
          if [ \"$1\" = \"status\" ]; then\n\
          echo \"Vectors: ${QMD_FAKE_VECTORS:-0} embedded\"\n\
          fi\n",
@@ -217,7 +223,15 @@ fn doctor_qmd_status_failure_does_not_point_at_embed() {
     let dir = tempfile::tempdir().unwrap();
     // Fake qmd whose `status` fails: the message must point at `qmd status`
     // for diagnosis, not at `qmd embed` (which would not fix a broken status).
-    std::fs::write(dir.path().join("qmd"), "#!/bin/sh\nexit 1\n").unwrap();
+    // It still answers `--version`, so the #715 presence probe passes and the
+    // status probe is what fails.
+    std::fs::write(
+        dir.path().join("qmd"),
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then echo \"qmd 9.9.9-fake\"; exit 0; fi\n\
+         exit 1\n",
+    )
+    .unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
         dir.path().join("qmd"),
@@ -237,4 +251,39 @@ fn doctor_qmd_status_failure_does_not_point_at_embed() {
     let msg = c["message"].as_str().unwrap();
     assert!(msg.contains("qmd status"), "{msg}");
     assert!(!msg.contains("qmd embed"), "{msg}");
+}
+
+/// #715: the field machine had a test shim named `qmd` that returned canned
+/// query results. A name-only check trusted it; the presence probe must not.
+#[cfg(unix)]
+#[test]
+fn doctor_qmd_stub_on_path_is_not_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("qmd"),
+        "#!/bin/sh\n\
+         echo \"Robin Example — canned search hit\"\n\
+         exit 0\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.path().join("qmd"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let vault_dir = tempfile::tempdir().unwrap();
+    let vault = vault_dir.path().join("vault");
+    common::copy_dir(&demo(), &vault);
+    std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
+
+    let v = run_doctor(&vault, &path_with_fake_qmd(dir.path()), &[]);
+    let c = check(&v, "qmd-search").expect("qmd-search check missing");
+    // Not a silent ok (#715): a present-but-broken qmd is a warning.
+    assert_eq!(c["status"], "warning", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("did not report a version"), "{msg}");
+    assert!(msg.contains("confidant find"), "{msg}");
+    let fix = c["fix"].as_str().expect("fix field missing");
+    assert!(fix.contains("npm install -g @tobilu/qmd"), "{fix}");
 }
