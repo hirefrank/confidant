@@ -1,6 +1,6 @@
 ---
 name: "confidant"
-description: "Standing rules for every Confidant interaction: plain English before internal vocabulary, every operator decision as a structured choice with a marked recommendation and rationale, propose → confirm → apply, status stated as outcomes, routing to setup, pack-author, qmd-search, or report-a-problem, setup's closing jumping-off point with the discipline that keeps opportunities surfacing later, and the inferred sync posture that keeps multiple writers safe. Load this before any other Confidant skill."
+description: "Standing rules for every Confidant interaction: plain English before internal vocabulary, every operator decision as a structured choice with a marked recommendation and rationale, propose → confirm → apply, status stated as outcomes, routing to setup, pack-author, qmd-search, or report-a-problem, setup's closing jumping-off point with the discipline that keeps opportunities surfacing later, the inferred sync posture that keeps multiple writers safe, and the operator's own bar for completeness, capture, and cadence. Load this before any other Confidant skill."
 ---
 
 # Working with the operator
@@ -204,11 +204,10 @@ Discipline:
   continuous conversation rather than repeated cold pitches.
 - **Keep drift language neutral.** Whether a quiet relationship is
   "overdue" depends on the operator's own posture: someone may have
-  deliberately set no cadence and want silence. Until an explicit posture
-  exists (the bar/cadence layer), say "no touch in nine months" and let
-  them decide; do not call it late, do not assign a threshold, and do not
-  hard-code a cadence number. When the operator's posture is available,
-  read it and use theirs.
+  deliberately set no cadence and want silence. Say "no touch in nine
+  months" and let them decide; do not call it late, do not assign a
+  threshold, and do not hard-code a cadence number. The bar (section 8) is
+  where their posture comes from — use theirs once it is set.
 - **A suggestion is still a structured choice** (rule 2), with a marked
   recommendation and its rationale — and no `no-ai` record is ever named
   as the reason for one.
@@ -312,6 +311,98 @@ the install topology. So:
 - do not change the CLI here: this skill is guidance, and the report change
   is a separate product decision.
 
+## 8. The bar: their rules, in their words
+
+There is no universal rule for what a relationship note should contain, who
+deserves a page, or when a quiet relationship deserves attention. Those are
+the operator's rules. Elicit them during setup with three questions about
+moments they already care about, reflect them back, and keep them.
+
+Like section 7, this is "get the facts, then state the rule" — the difference
+is that the rule is theirs, so you ask rather than infer.
+
+### Ask three moments, not a schema
+
+Ask one at a time, in their words, as a structured choice (rule 2): a few
+candidate answers drawn from what you already know, plus "Something else".
+Never ask about fields; ask about moments.
+
+| Moment | Ask | What the answer sets |
+|---|---|---|
+| Before an important meeting | "Tomorrow you meet someone important. What do you wish you knew about them before you walk in?" | What a page must contain for them — their completeness checklist |
+| After meeting someone new | "You just met someone at a conference. What would make you glad, a year from now, that you wrote it down tonight?" | Their capture bar: who qualifies, and how much is enough |
+| When someone drifts | "A name you haven't spoken to in a year surfaces. Do you want to be nudged, or is silence fine?" | Their cadence posture, and whether "overdue" is a helpful idea at all |
+
+Candidate answers are prompts, not a taxonomy:
+
+- **Before a meeting** — how you met; what you last talked about; what they
+  care about now; who you both know; one personal detail; their role and
+  company.
+- **After meeting someone new** — a one-line context and next step; what
+  they are working on; what you promised to follow up on; just a name and
+  role; only people you expect to see again.
+- **When someone drifts** — nudge me; show me quietly without prompting;
+  silence is fine; it depends on the person.
+
+For the second moment, make sure you hear both halves: **who qualifies**
+(a meeting is enough; only people you will see again; only people you
+choose) and **how much is enough** (just a name and role; a line of context;
+what you promised). If their first answer covers only one, ask the other as
+a follow-up choice.
+
+If they choose silence on the third moment, the drifting radar is not a
+routine to offer later (section 6), and you never call a relationship
+overdue.
+
+Let "Something else" win, and keep the operator's own sentence. Do not
+translate their answer into schema terms or round it to the nearest option.
+
+### Reflect it back
+
+Before closing setup, and in the completion report, say it back in one
+breath:
+
+> So: a page is complete for you when it has how you met, what you last
+> talked about, and one thing they care about. You count someone as worth a
+> page when you would want to remember them in a year — a meeting qualifies.
+> Drifting means silence is fine until there is a reason to reach out; no
+> nudges.
+
+Then ask "Did I get that right?" and let them correct the wording. Their
+sentence is the rule; your summary is only a mirror.
+
+### Keep it, with its date
+
+Store the bar in your persistent operator memory — the same place as the
+jumping-off menu state (section 6): each answer in their words, the date it
+was set, and every later revision with its date. The personal pack's skill
+text states the general capture policy; the bar is this operator's
+instantiation of it, so where they differ, the operator's bar wins. Never
+override it with a default.
+
+Do not write the bar into the vault unless the operator asks: it is agent
+memory, not a record.
+
+### When behaviour disagrees, ask — do not correct
+
+Watch for the operator acting against their own bar: asking to add one-off
+contacts after setting a high capture bar; declining every drift nudge after
+asking to be nudged; always deleting the "how we met" line they called
+essential. Treat that as evidence the bar may have changed, not as a
+mistake. Ask once, with a recommendation: "You said X; lately we have been
+doing Y. Has your bar changed, or should I hold to X?" Then update or keep
+it, and say which. Never switch their bar silently, and never lecture them
+with it.
+
+### It is allowed to change
+
+When they say "my bar changed", run the same three moments again (or just
+the one that changed), record the new date and answers, and follow the new
+bar from then on. Leave existing pages as they are; retro-editing them is a
+separate proposal, not part of a bar change. No product change is needed:
+capture and enrichment are your behaviour, and the bar is the rule you
+follow.
+
 ## Routing
 
 Name the capability in plain English and say why you are switching; do not
@@ -331,7 +422,12 @@ Handoff notes:
   routines from this operator's actual vault and sources — and the same
   discipline keeps later opportunities surfacing, one at a time. It also
   infers and states the sync posture from section 7, because the operator
-  should not have to know to ask how the copies stay in step.
+  should not have to know to ask how the copies stay in step, and elicits
+  the bar in section 8 so capture and cadence follow their rules.
+- **The bar** (section 8): keep the operator's own answers, in their words
+  and with dates, in your persistent operator memory; reflect them back and
+  re-ask when their behaviour disagrees. Never substitute a default or
+  retro-edit existing pages as part of a bar change.
 - **Sync**: execute the posture on events, not a timer (section 7). Fetch
   before writes and before reads that matter when there is more than one
   writer; push as part of the batch confirmation; stop loudly on
