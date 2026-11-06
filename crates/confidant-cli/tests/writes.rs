@@ -4157,6 +4157,34 @@ fn record_edit_is_idempotent_for_a_repeated_request_id() {
     assert_eq!(commits(root), after_first, "the replay committed again");
 }
 
+/// #751: the profile body is the agent-maintained summary, so an
+/// agent-written paragraph's dated marker lives in the body. A `record edit`
+/// replaces the whole file, and the writer keeps the marker (and the
+/// operator's `human_note` field) exactly when the replacement carries them.
+#[test]
+fn record_edit_keeps_profile_authorship_markers() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let inputs = tempfile::tempdir().unwrap();
+    let edited = inputs.path().join("edited.md");
+    let body = "Enrichment, 2026-10: Met at Example Conf; two meetings since.\n";
+    let record = person_record_md(PERSON, "Ada Example", body).replace(
+        "name: Ada Example\n",
+        "name: Ada Example\nhuman_note: The part I remember.\n",
+    );
+    std::fs::write(&edited, record).unwrap();
+
+    let (ok, v) = run_json(&edit_args(PERSON, edited.to_str().unwrap(), &vroot, &[]));
+    assert!(ok, "{v}");
+    let on_disk =
+        std::fs::read_to_string(root.join(format!("people/{PERSON}/profile.md"))).unwrap();
+    assert!(on_disk.contains("Enrichment, 2026-10:"), "{on_disk}");
+    // The canonical writer may quote the scalar; the value survives.
+    assert!(on_disk.contains("human_note:"), "{on_disk}");
+    assert!(on_disk.contains("The part I remember."), "{on_disk}");
+}
+
 #[test]
 fn record_show_requires_the_for_edit_flag() {
     let dir = make_vault();

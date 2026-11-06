@@ -104,6 +104,14 @@ grammar = "labeled-list"
 name = "alias_history"
 grammar = "alias-list"
 
+# #738: where each enriched profile fact came from and when, one entry per
+# `KEY|SOURCE|YYYY-MM`. A repeated KEY with a newer date supersedes the older
+# entry for context reads. PII-adjacent: stripped with the fields it
+# describes.
+[[fields]]
+name = "profile_provenance"
+grammar = "provenance-list"
+
 [[fields]]
 name = "tags"
 grammar = "list"
@@ -126,6 +134,13 @@ grammar = "non-empty-string"
 # --exclude-private like the other profile fields.
 [[fields]]
 name = "relationship_context"
+grammar = "non-empty-string"
+
+# #751: the operator's own words about the person. Agents never edit this
+# field; enrichment works on the profile body instead. Free text; private
+# context.
+[[fields]]
+name = "human_note"
 grammar = "non-empty-string"
 
 [[fields]]

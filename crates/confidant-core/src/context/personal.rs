@@ -23,6 +23,7 @@
 //! | `labeled-list` | `[{"label": …, "value": …}, …]` |
 //! | `alias-list` | `[{"kind": …, "value": …, "status": …, "source"?: …}, …]` |
 //! | `role-history` | `[{"period": …, "role": …, "company": …, "source"?: …}, …]` |
+//! | `provenance-list` | `{"KEY": {"source": …, "date": "YYYY-MM"}, …}` (newest entry per key) |
 //! | `date` | the raw `YYYY-MM-DD` string |
 //! | `cadence` | not emitted raw; drives `cadence_days` and `cadence_never` instead |
 //!
@@ -108,7 +109,7 @@ use crate::ledger::parse_strict_date;
 use crate::packs::grammars::{
     parse_field_grammar, Cadence, FieldValue, GRAMMAR_ALIAS_LIST, GRAMMAR_CADENCE, GRAMMAR_DATE,
     GRAMMAR_DATES_LIST, GRAMMAR_LABELED_LIST, GRAMMAR_LIST, GRAMMAR_NON_EMPTY_STRING,
-    GRAMMAR_RECURRING_DATE, GRAMMAR_ROLE_HISTORY,
+    GRAMMAR_PROVENANCE_LIST, GRAMMAR_RECURRING_DATE, GRAMMAR_ROLE_HISTORY,
 };
 use crate::packs::manifest::FieldDecl;
 use crate::record::{parse_with_list, RecordKind};
@@ -128,9 +129,9 @@ use crate::vault::Vault;
 /// deliberately absent: they stay so an agent can still see the cadence state
 /// that drove a nudge. `address` is a place field (#745), included here so
 /// the same `--exclude-private` switch strips it from `entity.fields`.
-/// `role_history`, `alias_history`, and `relationship_context` are profile
-/// content (#739, #740, #742), so they join the PII list beside the older
-/// contact fields.
+/// `role_history`, `alias_history`, `relationship_context`, `human_note`,
+/// and `profile_provenance` are profile content (#739, #740, #742, #751,
+/// #738), so they join the PII list beside the older contact fields.
 ///
 /// `relationship` is the 0.2 name (#509). `relationship_to_me` is kept in the
 /// list too: it is harmless (no view carries it after the #551 cutover) and
@@ -155,6 +156,10 @@ pub const PRIVATE_CONTEXT_FIELDS: &[&str] = &[
     "alias_history",
     "role_history",
     "relationship_context",
+    // #751, #738: the operator's own words and the provenance of the profile
+    // facts are profile content.
+    "human_note",
+    "profile_provenance",
 ];
 
 /// Declared fields a person outside the §12 cleared set still exposes: the
@@ -207,6 +212,13 @@ pub struct AliasHistoryView {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+/// One fact's effective provenance (`profile_provenance`, #738).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvenanceView {
+    pub source: String,
+    pub date: String,
 }
 
 /// One `role-history` entry (`role_history`, #740).
@@ -403,6 +415,32 @@ pub fn build_personal_view(
                             })
                             .collect();
                         view.fields.insert(field.name.clone(), value_of(list));
+                    }
+                }
+            }
+            GRAMMAR_PROVENANCE_LIST => {
+                if let FieldValue::ProvenanceList(list) = value {
+                    // #738: a newer-dated entry for the same fact wins. The
+                    // grammar rejects two entries with the same key and date,
+                    // so the winner is deterministic. Older entries stay on
+                    // disk as history but are not the effective answer.
+                    let mut latest: BTreeMap<String, ProvenanceView> = BTreeMap::new();
+                    for entry in list {
+                        let newer = latest
+                            .get(&entry.key)
+                            .is_none_or(|current| entry.date > current.date);
+                        if newer {
+                            latest.insert(
+                                entry.key,
+                                ProvenanceView {
+                                    source: entry.source,
+                                    date: entry.date,
+                                },
+                            );
+                        }
+                    }
+                    if !latest.is_empty() {
+                        view.fields.insert(field.name.clone(), value_of(latest));
                     }
                 }
             }

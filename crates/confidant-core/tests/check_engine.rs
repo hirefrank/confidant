@@ -8027,6 +8027,118 @@ fn personal_0_4_bad_relationship_fields_are_frontmatter() {
     }
 }
 
+/// #738, #751: `profile_provenance` and `human_note` validate and reach the
+/// context view; provenance resolves to the newest entry per fact.
+#[test]
+fn personal_0_4_provenance_and_human_note_reach_context() {
+    let dir = personal_04_vault(
+        "human_note: The kitchen-table pitch is the part I remember.\n\
+         profile_provenance: [title|linkedin-export|2025-01, title|operator|2026-03, company|linkedin-export|2026-03, profile|linkedin-export|2026-03, human_note|operator|2026-10]\n",
+        "",
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        !codes(&json).contains(&"E_FRONTMATTER".to_owned()),
+        "the new fields must validate: {json:?}"
+    );
+
+    let view = personal_view_0_4(dir.path());
+    assert_eq!(
+        view["human_note"], "The kitchen-table pitch is the part I remember.",
+        "{view}"
+    );
+    // The newer `title` entry wins; older entries stay on disk as history.
+    assert_eq!(
+        view["profile_provenance"],
+        json!({
+            "title": {"source": "operator", "date": "2026-03"},
+            "company": {"source": "linkedin-export", "date": "2026-03"},
+            "profile": {"source": "linkedin-export", "date": "2026-03"},
+            "human_note": {"source": "operator", "date": "2026-10"},
+        }),
+        "{view}"
+    );
+}
+
+/// #738, #751: both fields are profile content, so `--exclude-private` strips
+/// them and `no-ai` hides them.
+#[test]
+fn personal_0_4_provenance_and_human_note_are_private() {
+    let dir = personal_04_vault(
+        "no-ai: false\n\
+         human_note: PRIVATE0HUMAN\n\
+         profile_provenance: [title|private0-source|2026-03]\n",
+        "",
+    );
+    let mut view = personal_view_0_4(dir.path());
+    for field in ["human_note", "profile_provenance"] {
+        assert!(view.get(field).is_some(), "{field} missing: {view}");
+        assert!(
+            PRIVATE_CONTEXT_FIELDS.contains(&field),
+            "{field} must be on the exclude-private list"
+        );
+    }
+    strip_private_fields(&mut view);
+    for field in ["human_note", "profile_provenance"] {
+        assert!(view.get(field).is_none(), "{field} not stripped: {view}");
+    }
+    let dumped = serde_json::to_string(&view).unwrap();
+    for leak in ["PRIVATE0HUMAN", "private0-source"] {
+        assert!(!dumped.contains(leak), "{leak} leaked in {dumped}");
+    }
+}
+
+#[test]
+fn personal_0_4_provenance_and_human_note_hidden_for_no_ai_person() {
+    let dir = personal_04_vault(
+        "no-ai: true\n\
+         human_note: HIDDEN0HUMAN\n\
+         profile_provenance: [title|hidden0-source|2026-03]\n",
+        "",
+    );
+    let view = personal_view_0_4(dir.path());
+    let dumped = serde_json::to_string(&view).unwrap();
+    for leak in ["HIDDEN0HUMAN", "hidden0-source"] {
+        assert!(!dumped.contains(leak), "{leak} leaked in {dumped}");
+    }
+    for field in ["human_note", "profile_provenance"] {
+        assert!(view.get(field).is_none(), "{field} visible: {view}");
+    }
+}
+
+/// #738: malformed provenance is `E_FRONTMATTER` naming the key and never
+/// echoing the raw value.
+#[test]
+fn personal_0_4_bad_provenance_is_frontmatter() {
+    for value in [
+        "title|linkedin-export",
+        "title|linkedin-export|2026-03|extra",
+        "Title|linkedin-export|2026-03",
+        "title||2026-03",
+        "title|linkedin-export|2026-13",
+        "[title|linkedin-export|2026-03, title|operator|2026-03]",
+    ] {
+        let dir = personal_04_vault(&format!("profile_provenance: {value}\n"), "");
+        let json = report_json(dir.path(), None);
+        assert!(
+            codes(&json).contains(&"E_FRONTMATTER".to_owned()),
+            "{value} must be E_FRONTMATTER: {json:?}"
+        );
+        let finding = finding_by_code(&json, "E_FRONTMATTER");
+        assert!(
+            finding["message"]
+                .as_str()
+                .unwrap()
+                .contains("'profile_provenance'"),
+            "the finding must name the key: {json:?}"
+        );
+        assert!(
+            !serde_json::to_string(&json).unwrap().contains(value),
+            "the raw value must not echo: {json:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // personal@0.2 embedded declarative pack (#550, cutover #551)
 //

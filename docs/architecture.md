@@ -668,11 +668,54 @@ optional and absent by default. `context` grows keys only when data is
 present. A malformed entry is `E_FRONTMATTER` and never silently dropped.
 `alias resolve` gains a current-first preference but keeps its no-ai and
 ambiguity behavior. Follow-ups: capture/enrichment skills that ask for and
-append the fields, and a TUI editor for them.
+append the fields, and a TUI editor for them. ADR-24 adds provenance and
+authorship to the same pack version.
+
+### ADR-24. `personal@0.4` adds profile provenance and authorship (#738, #751).
+
+**Door:** One-way (a vault that writes the field names and entry syntax
+commits to them).
+
+**Context.** Enriched facts could not say where they came from or when, so a
+stale import could silently outlive fresher knowledge (#738). The profile
+body mixed agent-written import prose with the operator's own paragraphs,
+and nothing distinguished them: git authorship is always the operator and
+`record edit` replaces the whole file (#751).
+
+**Decision.** Additive on `personal@0.4`; no new pack or spec version.
+
+- `profile_provenance` is one map-style field with a new `provenance-list`
+  grammar: `KEY|SOURCE|YYYY-MM` entries. `KEY` names the fact (`profile` for
+  the body, or a declared field); a repeated key is a newer chapter and the
+  newest date is the effective entry in `context`. Two entries for the same
+  key and date are `E_FRONTMATTER`, so "newest wins" is never a tie. The
+  grammar validates key shape, not membership, so adding a field later needs
+  no grammar change.
+- `human_note` is a plain `non-empty-string` for the operator's own words.
+  Agents never edit it — enforced by the personal pack's capture guidance,
+  not code.
+- Agent-written body paragraphs lead with a dated marker
+  (`Enrichment, 2026-10: …`); unmarked paragraphs are human and preserved
+  verbatim. The marker lives in the body, so it survives `record edit`.
+- Both fields are profile content: `--exclude-private` strips them and
+  `no-ai` hides them.
+
+**Alternatives considered.** (a) Per-field `_src` sibling fields: many
+parallel keys, and a new field silently has no provenance. (b) A second
+sidecar structure per fact type: duplicates the map. (c) Edit attribution in
+commits: git authorship is fixed to the operator, so it cannot tell an agent
+paragraph from a human one. (d) A body-only convention for both issues: no
+structured provenance to query or age.
+
+**Consequences.** Existing 0.4 vaults stay valid; both fields are optional.
+`context` shows the effective provenance map and the operator's note, and
+strips both under `--exclude-private`. Malformed entries are
+`E_FRONTMATTER`. Follow-ups: the C-stack meta skill can echo the authorship
+rule, and enrichment skills should write provenance on every update.
 
 ## 8. v0 scope and milestones
 
-1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18) and edge-level `no-ai` (ADR-19), 0.4 corrections and record retirement (ADR-20), 0.4's `personal@0.3` default with places and things (ADR-21), `personal@0.4` cadence semantics and rich touches (ADR-22), and its person-story fields (ADR-23); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
+1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18) and edge-level `no-ai` (ADR-19), 0.4 corrections and record retirement (ADR-20), 0.4's `personal@0.3` default with places and things (ADR-21), `personal@0.4` cadence semantics and rich touches (ADR-22), its person-story fields (ADR-23), and profile provenance and authorship (ADR-24); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
 2. **Vault safety and sync.** `confidant doctor` (git repo and identity, transport, spec, `check`, staleness, skills links), `confidant sync` as the explicit git boundary, and the §12 `no-ai` allowlist. Done when a fresh clone on a clean machine reads and writes the vault with no extra setup.
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
 4. **Import skills.** Agent skills that pull events and transcripts from outside systems into the vault, with dry runs and safe retries.

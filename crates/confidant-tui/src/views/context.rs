@@ -221,6 +221,19 @@ fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
         "profile ",
         Span::raw(first_line(p.profile.as_deref()).to_owned()),
     ));
+    // #751: the profile body above is the agent-maintained summary; the
+    // operator's own words live in the personal pack view as `human_note`.
+    // Absent on the agent path when private data is stripped, so nothing
+    // renders there.
+    let human_note = ctx
+        .packs
+        .iter()
+        .find(|(name, _)| name.split('@').next() == Some("personal"))
+        .and_then(|(_, view)| view.get("human_note"))
+        .and_then(|value| value.as_str());
+    if let Some(note) = human_note {
+        lines.push(row("human ", Span::raw(first_line(Some(note)).to_owned())));
+    }
 
     lines.push(Line::from(Span::styled(
         format!("notes ({})", ctx.notes.len()),
@@ -309,6 +322,39 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// #751: the card shows the agent-maintained profile and the operator's
+    /// own words side by side, and the operator line is absent when the pack
+    /// view carries no cleared `human_note`.
+    #[test]
+    fn context_renders_human_note_beside_the_profile() {
+        let ctx: Context = serde_json::from_str(
+            r#"{
+                "person": {"id": "p-1", "name": "Ada Example", "no_ai": false,
+                           "profile": "Enrichment, 2026-10: Met at Example Conf."},
+                "packs": {"personal@0.4": {"human_note": "The kitchen-table pitch."}},
+                "aliases": [], "scope": []
+            }"#,
+        )
+        .unwrap();
+        let text = rendered(&ctx);
+        assert!(text.contains("Enrichment, 2026-10:"), "{text}");
+        assert!(text.contains("The kitchen-table pitch."), "{text}");
+
+        let stripped: Context = serde_json::from_str(
+            r#"{
+                "person": {"id": "p-1", "name": "Ada Example", "no_ai": false,
+                           "profile": "Enrichment, 2026-10: Met at Example Conf."},
+                "packs": {"personal@0.4": {}},
+                "aliases": [], "scope": []
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            !rendered(&stripped).contains("kitchen-table"),
+            "{stripped:?}"
+        );
     }
 
     #[test]

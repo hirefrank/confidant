@@ -23,6 +23,10 @@ you're working on or care about, and the moments that connect them.**
   `relationship_context` (the one-line story), `role_history` (the
   role/company timeline), and `alias_history` (typed aliases with a
   current/historical marker and a source).
+- Enriched facts carry provenance (`profile_provenance`: key, source, and
+  month; the newest entry per fact wins), and the profile body separates
+  agent-written paragraphs from the operator's own words
+  (`human_note`).
 - `place` (`pl`, `places/`) and `thing` (`th`, `things/`) are pack-declared
   entities with required `name` and `kind`, optional `address`/`tags`/`links`,
   and their own edges. They are not person-like: no aliases, cadence, or
@@ -95,6 +99,8 @@ stay in the ledger.
 | `relationship_context` | non-empty string | The one-line story of how you know them ("I'm an investor in her company"). Distinct from the category; private context. |
 | `role_history` | `PERIOD\|ROLE\|COMPANY[\|SOURCE]` list | The role/company timeline. `title`/`company` stay the current values. Private context. |
 | `alias_history` | `KIND\|VALUE\|STATUS[\|SOURCE]` list | Typed aliases with kind, current/historical, and source. The plain contact lists stay the current values. Private context. |
+| `profile_provenance` | `KEY\|SOURCE\|DATE` list | Where each enriched profile fact came from and when (`YYYY-MM`). The newest entry per key wins. Private context. |
+| `human_note` | non-empty string | The operator's own words about the person. Agents never edit it. Private context. |
 | `cadence` | `<N>d` or `never` | Keep-in-touch interval; `N` is `1..=3650`. `never` is the explicit "none, by design": never overdue, distinct from unset. |
 | `cadence_basis` | non-empty string | Why this cadence: `observed` (a rhythm derived from touch history) or `intention` (the rhythm the operator wants). Open vocabulary. |
 | `cadence_note` | non-empty string | The mode the cadence was set for, and why it changed. Free text; private context. |
@@ -160,6 +166,39 @@ live value. `alias resolve` matches both the plain values and the typed
 entries by kind and **prefers current over historical**, so an old address
 never shadows the live one. A malformed entry is `E_FRONTMATTER` and
 matches nothing.
+
+### Profile provenance (#738)
+
+Every enriched fact should be able to say where it came from and when:
+
+```
+profile_provenance: [title|linkedin-export|2026-03, company|linkedin-export|2026-03, profile|linkedin-export|2026-03]
+```
+
+Entries are `KEY|SOURCE|DATE`: the fact (`profile` for the body, or a field
+name), the source label (`linkedin-export`, `operator`, …), and `YYYY-MM`.
+A repeated key records a newer chapter; **the newest date wins** in
+`context`, so a stale import never shadows fresher enrichment. Keep one
+entry per fact per month (two entries for the same key and date are
+`E_FRONTMATTER`), and update the entry whenever you update the fact. The
+grammar validates key shape, not that the key names a known fact; a typo is
+inert, so copy the field names exactly.
+
+### Profile authorship (#751)
+
+The profile body is **yours to maintain**; it is not the operator's diary.
+Write every agent-authored paragraph with a dated marker:
+
+```
+Enrichment, 2026-10: Met at Example Conf; two events together since.
+```
+
+The marker stays in the body, so it survives `record edit` replacing the
+file. A paragraph without a marker is the operator's (or legacy import) text:
+**preserve it verbatim**; do not rewrite, reorder, or delete it. The
+operator's own words belong in `human_note`, which you never edit. When you
+rewrite the summary, also update the `profile` entry in
+`profile_provenance` with your source and the current month.
 
 ### Cadence semantics (#750)
 
@@ -410,12 +449,13 @@ can act on it. This is a nudge, not a task, and it never blocks a write.
   There is no `no_ai: notes` mode for them. An uncleared place or thing
   returns no agent `context` bundle at all, not an empty one. The operator
   path still sees it with the badge.
-- **Address, the cadence note, and the person story are private.**
-  `context --exclude-private` strips `address`, `tags`, `links`,
-  `cadence_note`, `relationship_context`, `role_history`, and
-  `alias_history`; `kind`, `cadence_basis`, and the derived cadence state
-  stay. The same fields are hidden from agents by `no-ai` (deny-by-default),
-  and they never appear in the plain `context.aliases` array.
+- **Address, the cadence note, the person story, and provenance are
+  private.** `context --exclude-private` strips `address`, `tags`, `links`,
+  `cadence_note`, `relationship_context`, `role_history`, `alias_history`,
+  `human_note`, and `profile_provenance`; `kind`, `cadence_basis`, and the
+  derived cadence state stay. The same fields are hidden from agents by
+  `no-ai` (deny-by-default), and they never appear in the plain
+  `context.aliases` array.
 - **Scope pack reads.** `--packs personal@0.4` limits reads to core and
   personal-owned items in a 0.4 vault; `personal@0.3` and `personal@0.2`
   remain no-op aliases.
