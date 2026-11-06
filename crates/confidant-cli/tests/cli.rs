@@ -3127,6 +3127,64 @@ fn pack_add_hint_leads_with_the_listing_for_ledger_data() {
     assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
 }
 
+/// #770 audit: `pack remove --yes --dry-run` runs the apply preflights and the
+/// shared write gates, then previews and writes nothing.
+#[cfg(unix)]
+#[test]
+fn pack_remove_dry_run_uses_the_apply_gates_and_writes_nothing() {
+    let vault = git_vault();
+    install_example_pack(vault.path());
+    std::fs::write(
+        vault.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
+    )
+    .unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "install pack",
+        ],
+    );
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--dry-run", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout {}\nstderr {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true, "{v}");
+    assert_eq!(v["checks"]["pre"], "passed", "{v}");
+    let changes = v["changes"].as_array().unwrap();
+    for path in ["confidant.toml", "confidant.lock"] {
+        assert!(
+            changes.iter().any(|change| change["path"] == path),
+            "{path} missing from the preview: {v}"
+        );
+    }
+    // Nothing was applied: no commit, clean tree, pack still vendored and
+    // still listed.
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    assert!(vault.path().join("packs/example-pack@0.1").is_dir());
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("example-pack@0.1"), "{cfg}");
+}
+
 /// #694 review: the remove hint must stay silent when the blocked write was
 /// a pre-check failure on an unrelated vault, not data from this pack.
 #[cfg(unix)]

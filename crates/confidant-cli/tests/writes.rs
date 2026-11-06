@@ -721,6 +721,22 @@ fn import_refuses_a_dirty_target_month_file() {
 
     let file = scratch.path().join("import.cfd");
     std::fs::write(&file, format!("2026-10-06 use {PERSON} 45m full\n")).unwrap();
+    // #770: the dry run refuses the dirty target exactly like apply, so a
+    // preview cannot report ok for a write apply blocks.
+    let (ok, dry) = run_json(&[
+        "import",
+        "--file",
+        &file.display().to_string(),
+        "--dry-run",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{dry}");
+    assert_eq!(dry["error"]["code"], "E_CONFLICT", "{dry}");
+    assert_eq!(commits(root), before_commits, "dry run committed nothing");
+
     let (ok, v) = run_json(&[
         "import",
         "--file",
@@ -755,6 +771,43 @@ fn import_refuses_a_dirty_target_month_file() {
     assert!(std::fs::read_to_string(&ledger)
         .unwrap()
         .contains("45m full"));
+}
+
+/// #770: `log touch` appends to the month file, so its dry run must refuse a
+/// dirty target exactly like apply (the guard lives in the write pipeline,
+/// not per command).
+#[test]
+fn log_touch_dry_run_refuses_a_dirty_month_file() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let ledger = root.join("ledger/2026/10.cfd");
+    let mut dirty = std::fs::read_to_string(&ledger).unwrap();
+    dirty.push_str(&format!("2026-10-05 touch {PERSON} meal\n"));
+    std::fs::write(&ledger, &dirty).unwrap();
+    let before = commits(root);
+    for flag in [Some("--dry-run"), None] {
+        let mut args = vec![
+            "log",
+            "touch",
+            PERSON,
+            "meal",
+            "--date",
+            "2026-10-13",
+            "--json",
+            "--no-input",
+            "--vault",
+            &vroot,
+        ];
+        if let Some(flag) = flag {
+            args.push(flag);
+        }
+        let (ok, err) = run_json(&args);
+        assert!(!ok, "{err}");
+        assert_eq!(err["error"]["code"], "E_CONFLICT", "{err}");
+    }
+    assert_eq!(commits(root), before, "neither path committed");
+    assert_eq!(std::fs::read_to_string(&ledger).unwrap(), dirty);
 }
 
 // ---------------------------------------------------------------------------
@@ -1901,6 +1954,50 @@ fn record_add_primary_only_mirrors_one_touch() {
     let root = dir.path();
     let vroot = vault_arg(root);
     let before = commits(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("interaction.md");
+    std::fs::write(
+        &file,
+        format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Lunch\ndate: 2026-10-06\nperson: {PERSON}\n---\n\nFake lunch.\n"
+        ),
+    )
+    .unwrap();
+    let file_arg = file.display().to_string();
+    // #770: the dry run previews the record and its mirrored touchpoint and
+    // writes neither; the apply then lands exactly that logical change.
+    let (ok, dry) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &file_arg,
+        "--dry-run",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{dry}");
+    assert_eq!(dry["checks"]["pre"], "passed", "{dry}");
+    assert_eq!(dry["checks"]["post"], "skipped", "{dry}");
+    let changes = dry["changes"].as_array().unwrap();
+    assert!(
+        changes
+            .iter()
+            .any(|c| c["path"] == format!("interactions/{IXN}/interaction.md")),
+        "{dry}"
+    );
+    assert!(
+        changes.iter().any(|c| c["path"] == "ledger/2026/10.cfd"
+            && c["content"] == format!("2026-10-06 touch {PERSON}")),
+        "the mirrored touchpoint must be previewed too: {dry}"
+    );
+    assert_eq!(commits(root), before, "dry run committed nothing");
+    assert_eq!(git_status(root), "", "dry run wrote nothing");
+    assert!(!root
+        .join(format!("interactions/{IXN}/interaction.md"))
+        .exists());
+
     let (ok, v) = add_interaction(
         &vroot,
         &format!(
@@ -1957,6 +2054,54 @@ fn record_add_primary_and_participants_mirror_each_once() {
             format!("2026-10-06 touch {PERSON2}"),
         ]
     );
+}
+
+/// #770: a dry run of `record add` mirrors the apply path's target gates.
+/// The interaction write appends a mirrored touchpoint, so a dirty month file
+/// is refused before the preview — exactly as apply refuses it.
+#[test]
+fn record_add_interaction_dry_run_refuses_a_dirty_month_file() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let ledger = root.join("ledger/2026/10.cfd");
+    let mut dirty = std::fs::read_to_string(&ledger).unwrap();
+    dirty.push_str(&format!("2026-10-05 touch {PERSON} meal\n"));
+    std::fs::write(&ledger, &dirty).unwrap();
+    let before = commits(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("interaction.md");
+    std::fs::write(
+        &file,
+        format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Lunch\ndate: 2026-10-06\nperson: {PERSON}\n---\n\nFake lunch.\n"
+        ),
+    )
+    .unwrap();
+    let file_arg = file.display().to_string();
+    for flag in [Some("--dry-run"), None] {
+        let mut args = vec![
+            "record",
+            "add",
+            "--file",
+            file_arg.as_str(),
+            "--json",
+            "--no-input",
+            "--vault",
+            &vroot,
+        ];
+        if let Some(flag) = flag {
+            args.push(flag);
+        }
+        let (ok, err) = run_json(&args);
+        assert!(!ok, "{err}");
+        assert_eq!(err["error"]["code"], "E_CONFLICT", "{err}");
+    }
+    assert_eq!(commits(root), before, "neither path committed");
+    assert!(!root
+        .join(format!("interactions/{IXN}/interaction.md"))
+        .exists());
+    assert_eq!(std::fs::read_to_string(&ledger).unwrap(), dirty);
 }
 
 /// #505: logging an interaction clears a `cadence-overdue` warning — the
@@ -4727,6 +4872,43 @@ fn record_retire_is_check_gated_on_record_findings() {
     );
 }
 
+/// #770: a record with committed merge-conflict markers is refused by apply;
+/// a dry run reads the same bytes and must refuse it too.
+#[test]
+fn record_retire_dry_run_refuses_a_conflicted_record() {
+    let dir = make_corrections_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let profile = root.join(format!("people/{CP_PERSON}/profile.md"));
+    let conflicted = format!(
+        "---\nid: {CP_PERSON}\ntype: person\nname: \"Correction Person\"\n---\n\n\
+         <<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n"
+    );
+    std::fs::write(&profile, &conflicted).unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "conflicted fixture"]);
+    let before = commits(root);
+    for flag in [Some("--dry-run"), None] {
+        let mut args = vec![
+            "record",
+            "retire",
+            CP_PERSON,
+            "--json",
+            "--no-input",
+            "--vault",
+            &vroot,
+        ];
+        if let Some(flag) = flag {
+            args.push(flag);
+        }
+        let (ok, err) = run_json(&args);
+        assert!(!ok, "{err}");
+        assert_eq!(err["error"]["code"], "E_CONFLICT", "{err}");
+    }
+    assert_eq!(commits(root), before, "neither path committed");
+    assert_eq!(std::fs::read_to_string(&profile).unwrap(), conflicted);
+}
+
 /// #838: the operator `context` path lists superseded lines with a badge; the
 /// agent path returns the effective view and never carries the field.
 #[test]
@@ -4825,6 +5007,26 @@ fn retract_refuses_a_dirty_month_file() {
         std::fs::read_to_string(&draft_path).unwrap_or_else(|_| "; local draft\n".to_owned());
     draft.push_str("; uncommitted\n");
     std::fs::write(draft_path, draft).unwrap();
+    let before = commits(root);
+    // #770: dry run and apply agree on the dirty-target refusal.
+    let (ok, dry) = run_json(&[
+        "retract",
+        CP_PERSON,
+        "--line",
+        &target,
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--dry-run",
+        "--json",
+        "--vault",
+        &vault_arg(root),
+    ]);
+    assert!(!ok, "{dry}");
+    assert_eq!(dry["error"]["code"], "E_CONFLICT", "{dry}");
+    assert_eq!(commits(root), before, "dry run committed nothing");
+
     let (ok, err) = run_json(&[
         "retract",
         CP_PERSON,
@@ -4840,4 +5042,5 @@ fn retract_refuses_a_dirty_month_file() {
     ]);
     assert!(!ok, "{err}");
     assert_eq!(err["error"]["code"], "E_CONFLICT", "{err}");
+    assert_eq!(commits(root), before, "nothing committed");
 }

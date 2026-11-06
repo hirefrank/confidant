@@ -6,17 +6,23 @@
 //! 2. If `--request-id` was given, look for a previous commit carrying its
 //!    domain-separated hash. Same canonical content → idempotent no-op.
 //!    Different content → [`ErrorKind::IdempotencyConflict`].
-//! 3. `check` runs before the change and fails fast on an already-broken
+//! 3. Read-only target gates: an append target with uncommitted changes is
+//!    refused (the commit would include them, #611), a target containing
+//!    merge-conflict markers fails closed with [`ErrorKind::Conflict`], and
+//!    a git identity must exist for the eventual commit. A dry run runs
+//!    these too (#770).
+//! 4. `check` runs before the change and fails fast on an already-broken
 //!    vault (skipped for a repairing write). A dry run runs this same
 //!    read-only pre-check.
-//! 4. `--dry-run` shows the LOGICAL change (ledger lines / file content) and
+//! 5. `--dry-run` shows the LOGICAL change (ledger lines / file content) and
 //!    stops. It cannot run the post-write check without writing, so its
-//!    outcome says explicitly which checks ran ([`DryRunChecks`]).
-//! 5. Files are applied atomically ([`crate::paths::write_replace`]); any file
-//!    containing merge-conflict markers fails closed with [`ErrorKind::Conflict`].
-//! 6. `check` runs after the change; a failing check rolls the files back and
+//!    outcome says explicitly which checks ran ([`DryRunChecks`]). Steps 1-4
+//!    have already run, so a preview that passes means apply would pass the
+//!    same gates.
+//! 6. Files are applied atomically ([`crate::paths::write_replace`]).
+//! 7. `check` runs after the change; a failing check rolls the files back and
 //!    blocks the commit.
-//! 7. One `git add` + `git commit`. The message and trailers carry ONLY opaque
+//! 8. One `git add` + `git commit`. The message and trailers carry ONLY opaque
 //!    IDs, verbs, and hashes. Free-text reasons/intent are never in the
 //!    commit message.
 //!
@@ -114,9 +120,12 @@ impl DryRunCheck {
 ///
 /// Apply runs a read-only pre-check before writing and a post-check after.
 /// A dry run runs the same pre-check, so an already-broken vault blocks the
-/// preview exactly as it blocks the apply. It cannot run the post-check
-/// without applying the change, and a dry run never writes. Reporting both
-/// statuses keeps that gap explicit instead of implying full validation.
+/// preview exactly as it blocks the apply. It also runs the pipeline's
+/// read-only target gates (a git repository with a configured identity, an
+/// append target with uncommitted changes, a conflicted target). It cannot
+/// run the post-check without applying the change, and a dry run never
+/// writes. Reporting both statuses keeps that one gap explicit instead of
+/// implying full validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DryRunChecks {
     /// The pre-write check. `Skipped` for a repairing write, whose apply
@@ -417,9 +426,9 @@ pub fn apply_write_repairing(
     apply_write_inner(root, pending, opts, true)
 }
 
-/// Apply the step-5 change list in order. A failure here is an unexpected I/O
+/// Apply the step-8 change list in order. A failure here is an unexpected I/O
 /// error (disk full, a permission change, a path replaced by a directory since
-/// the pre-check): the caller restores the step-4 snapshots and returns this
+/// the pre-check): the caller restores the step-6 snapshots and returns this
 /// error unchanged (#614).
 fn apply_changes(root: &Path, changes: &[FileChange]) -> anyhow::Result<()> {
     for (index, change) in changes.iter().enumerate() {
@@ -476,7 +485,7 @@ fn apply_changes(root: &Path, changes: &[FileChange]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Restore the step-4 snapshots and remove the directories this write created
+/// Restore the step-6 snapshots and remove the directories this write created
 /// (innermost first, only when now empty), for a write that must not stand: a
 /// mid-apply failure (#614) or a failing post-check (#604). Best effort — the
 /// caller already has an error or a check report to surface.
@@ -516,6 +525,74 @@ fn set_apply_failure(index: Option<usize>) {
 #[cfg(test)]
 fn apply_failure_due(index: usize) -> bool {
     FAIL_APPLY_AT.with(|cell| cell.get()) == Some(index)
+}
+
+/// #770: refuse an append into a file with uncommitted changes.
+///
+/// The write commits the whole file (`git add -- <path>`), so an unrelated
+/// pending edit would be swept into this write's commit. This is a read-only
+/// git query, so a dry run runs it too: a preview that passed where apply
+/// refuses would be validating less than apply (#611).
+fn refuse_dirty_append_targets(
+    root: &Path,
+    changes: &[FileChange],
+    no_input: bool,
+) -> anyhow::Result<()> {
+    for change in changes {
+        let FileChange::AppendLines { path, .. } = change else {
+            continue;
+        };
+        if !crate::paths::exists(root, path)? {
+            continue;
+        }
+        let rel = path.to_string_lossy();
+        let status = git(root, &["status", "--porcelain", "--", &rel], no_input)?;
+        if !status.trim().is_empty() {
+            return Err(anyhow::Error::new(
+                DomainError::new(
+                    ErrorKind::Conflict,
+                    format!(
+                        "{} has uncommitted changes; appending would commit them too",
+                        path.display()
+                    ),
+                )
+                .with_fix("Commit, stash, or discard your changes to that file, then retry"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// #770: refuse a target that already contains merge-conflict markers.
+///
+/// Apply fails closed on them (#604). A dry run reads the same bytes and
+/// writes nothing, so it must fail closed too instead of previewing a write
+/// the apply will refuse.
+fn refuse_conflicted_targets(root: &Path, changes: &[FileChange]) -> anyhow::Result<()> {
+    for change in changes {
+        let rel = change.path();
+        // No-follow read (#440); a non-file target is reported by the apply
+        // itself, not guessed at here.
+        let Ok(bytes) = crate::paths::read_bytes(root, rel) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if crate::record::has_conflict_markers(text) {
+            return Err(anyhow::Error::new(
+                DomainError::new(
+                    ErrorKind::Conflict,
+                    format!(
+                        "{} has unresolved merge conflicts; writes are blocked",
+                        rel.display()
+                    ),
+                )
+                .with_fix("Resolve the conflict markers (git mergetool), then retry"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn apply_write_inner(
@@ -567,7 +644,31 @@ fn apply_write_inner(
         }
     }
 
-    // 2. Pre-check: fail fast on an already-broken vault. This runs for a
+    // 2. Read-only target gates, shared by dry run and apply (#770). A target
+    // that apply would refuse must refuse the preview too: an append into a
+    // file with uncommitted changes would sweep them into this commit
+    // (#611), and apply fails closed on merge-conflict markers (#604).
+    refuse_dirty_append_targets(root, &pending.changes, opts.no_input)?;
+    refuse_conflicted_targets(root, &pending.changes)?;
+    // The commit needs a git identity. A dry run never commits, but it must
+    // not report ok for a write that apply fails at the commit step; these
+    // are read-only `git config` lookups. Proactive so a missing identity is
+    // a clean E_INVALID, not git's stderr wrapped as internal_error.
+    for key in ["user.name", "user.email"] {
+        let val = git(root, &["config", "--get", key], opts.no_input)
+            .map(|v| v.trim().to_owned())
+            .unwrap_or_default();
+        if val.is_empty() {
+            return Err(anyhow::Error::new(
+                DomainError::invalid(format!(
+                    "git {key} is not configured; commits need an identity"
+                ))
+                .with_fix("Set it with `git config user.name \"...\"` and `git config user.email \"...\"`"),
+            ));
+        }
+    }
+
+    // 3. Pre-check: fail fast on an already-broken vault. This runs for a
     // dry run too (#770): a preview that passed where apply's pre-check
     // blocks would be validating less than apply. A repairing write skips
     // this gate because it exists to fix the reported problem; the
@@ -578,7 +679,7 @@ fn apply_write_inner(
         return Ok(WriteOutcome::CheckBlocked { report: pre });
     }
 
-    // 3. Dry run: show the logical change, touch nothing. The post-write
+    // 4. Dry run: show the logical change, touch nothing. The post-write
     // check needs the applied tree, and a dry run never writes, so the
     // outcome reports it skipped rather than implying full validation.
     if opts.dry_run {
@@ -621,9 +722,10 @@ fn apply_write_inner(
         });
     }
 
-    // 3b. Nothing to do: every change already matches the file on disk.
-    // This has to be its own outcome: step 7 cannot commit an empty changeset,
-    // and `git commit` on nothing staged fails with an empty message.
+    // 5. Nothing to do: every change already matches the file on disk.
+    // This has to be its own outcome: step 10 cannot commit an empty
+    // changeset, and `git commit` on nothing staged fails with an empty
+    // message.
     let unchanged = pending.changes.iter().all(|change| match change {
         FileChange::WriteFile { path, contents } => {
             crate::paths::read_to_string(root, path).is_ok_and(|on_disk| on_disk == *contents)
@@ -639,10 +741,10 @@ fn apply_write_inner(
         return Ok(WriteOutcome::Unchanged);
     }
 
-    // 4. Fail closed on conflict markers; snapshot for rollback. Along the
-    // way, record which files this changeset actually rewrites (#425): the
-    // `files` list names only real rewrites, so the JSON `files` and the
-    // commit diff (`git show --stat`) agree.
+    // 6. Snapshot each target for rollback. Along the way, record which
+    // files this changeset actually rewrites (#425): the `files` list names
+    // only real rewrites, so the JSON `files` and the commit diff
+    // (`git show --stat`) agree.
     let mut snapshots: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
     for change in &pending.changes {
@@ -650,22 +752,6 @@ fn apply_write_inner(
         // No-follow read: a planted symlink or FIFO at `rel` must not be
         // traversed or allowed to block the write (#440).
         let existing = crate::paths::read_bytes(root, rel).ok();
-        if let Some(bytes) = &existing {
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                if crate::record::has_conflict_markers(text) {
-                    return Err(anyhow::Error::new(
-                        DomainError::new(
-                            ErrorKind::Conflict,
-                            format!(
-                                "{} has unresolved merge conflicts; writes are blocked",
-                                rel.display()
-                            ),
-                        )
-                        .with_fix("Resolve the conflict markers (git mergetool), then retry"),
-                    ));
-                }
-            }
-        }
         let rewrites = match change {
             FileChange::WriteFile { contents, .. } => {
                 existing.as_deref() != Some(contents.as_bytes())
@@ -673,7 +759,7 @@ fn apply_write_inner(
             FileChange::WriteBytes { contents, .. } => {
                 existing.as_deref() != Some(contents.as_slice())
             }
-            // An append always changes its file (same rule as step 3b).
+            // An append always changes its file (same rule as step 5).
             FileChange::AppendLines { .. } => true,
             // Deleting an absent file changes nothing.
             FileChange::DeleteFile { .. } => existing.is_some(),
@@ -684,7 +770,7 @@ fn apply_write_inner(
         snapshots.push((rel.to_path_buf(), existing));
     }
 
-    // 4b. Directories this write may have to create, recorded before the apply
+    // 7. Directories this write may have to create, recorded before the apply
     // (shallow to deep) so a rolled-back write can remove only what it created
     // (#604). Scoped to ancestors that do not exist *now*: a directory that is
     // already there is never a candidate, and removal below is empty-only, so
@@ -702,9 +788,9 @@ fn apply_write_inner(
         }
     }
 
-    // 5. Apply atomically. An unexpected I/O error partway (disk full, a
+    // 8. Apply atomically. An unexpected I/O error partway (disk full, a
     // permission change, a path replaced by a directory since the pre-check)
-    // must not leave a partially applied tree: restore the step-4 snapshots
+    // must not leave a partially applied tree: restore the step-6 snapshots
     // and drop the directories this write created, then return the error
     // unchanged (#614). Modelled refusals are pre-validated above (#587,
     // #604); this is the backstop for the ones that are not.
@@ -713,7 +799,7 @@ fn apply_write_inner(
         return Err(err);
     }
 
-    // 6. Post-check: roll the files back if the write broke the vault.
+    // 9. Post-check: roll the files back if the write broke the vault.
     let vault2 = load_vault(root).map_err(anyhow::Error::new)?;
     let post = check_vault(&vault2, &CheckOptions::default());
     if !post.ok {
@@ -721,22 +807,8 @@ fn apply_write_inner(
         return Ok(WriteOutcome::CheckBlocked { report: post });
     }
 
-    // 7. One commit. Message and trailers: opaque IDs, verbs, hashes only.
-    // Proactive identity check so a missing git identity is a clean
-    // E_INVALID, not git's stderr wrapped as internal_error.
-    for key in ["user.name", "user.email"] {
-        let val = git(root, &["config", "--get", key], opts.no_input)
-            .map(|v| v.trim().to_owned())
-            .unwrap_or_default();
-        if val.is_empty() {
-            return Err(anyhow::Error::new(
-                DomainError::invalid(format!(
-                    "git {key} is not configured; commits need an identity"
-                ))
-                .with_fix("Set it with `git config user.name \"...\"` and `git config user.email \"...\"`"),
-            ));
-        }
-    }
+    // 10. One commit. Message and trailers: opaque IDs, verbs, hashes only.
+    // The identity gate ran with the read-only gates above (#770).
     let mut message = pending.summary.clone();
     if let Some((id_hash, req_hash)) = &digests {
         message.push_str(&format!(
@@ -1052,6 +1124,205 @@ mod tests {
                 .unwrap()
                 .trim(),
             "1"
+        );
+    }
+
+    /// A minimal check-clean, committed vault with one person and a ledger.
+    fn clean_vault() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("confidant.toml"),
+            "spec = \"0.1\"\npacks = []\nvault_id = \"01M3TC5H00MPJG000000000000\"\n",
+        )
+        .expect("write config");
+        let person = root.join("people/p-01M3TC5H00MPJG000000000000");
+        std::fs::create_dir_all(&person).expect("person dir");
+        std::fs::write(
+            person.join("profile.md"),
+            "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nname: \"Test Person\"\n---\n\nFake.\n",
+        )
+        .expect("profile");
+        std::fs::create_dir_all(root.join("ledger/2026")).expect("ledger dir");
+        std::fs::write(
+            root.join("ledger/2026/10.cfd"),
+            "2026-10-01 touch p-01M3TC5H00MPJG000000000000 call\n",
+        )
+        .expect("ledger");
+        git(root, &["init", "-q", "-b", "main"], false).expect("init");
+        git(root, &["config", "user.name", "Test"], false).expect("name");
+        git(
+            root,
+            &["config", "user.email", "test@example.invalid"],
+            false,
+        )
+        .expect("email");
+        git(root, &["add", "-A"], false).expect("add");
+        git(root, &["commit", "-qm", "init"], false).expect("commit");
+        dir
+    }
+
+    fn append_pending(path: &str, line: &str) -> PendingWrite {
+        PendingWrite {
+            changes: vec![FileChange::AppendLines {
+                path: PathBuf::from(path),
+                lines: vec![line.to_owned()],
+            }],
+            summary: "test: append".to_owned(),
+            canonical_request: "test: append".to_owned(),
+        }
+    }
+
+    /// #770: an append into a file with uncommitted changes is refused, and a
+    /// dry run refuses it exactly like apply. Before this, the dirty-target
+    /// guard was command-level and skipped under `--dry-run`.
+    #[test]
+    fn dry_run_and_apply_refuse_a_dirty_append_target_alike() {
+        let dir = clean_vault();
+        let root = dir.path();
+        let ledger = root.join("ledger/2026/10.cfd");
+        let mut dirty = std::fs::read_to_string(&ledger).expect("read ledger");
+        dirty.push_str("2026-10-02 touch p-01M3TC5H00MPJG000000000000 meet\n");
+        std::fs::write(&ledger, &dirty).expect("dirty ledger");
+        let dirty_status = git(root, &["status", "--porcelain"], false).expect("status");
+        assert!(!dirty_status.trim().is_empty());
+
+        let line = "2026-10-13 touch p-01M3TC5H00MPJG000000000000 call";
+        let dry = apply_write(
+            root,
+            append_pending("ledger/2026/10.cfd", line),
+            &WriteOptions {
+                dry_run: true,
+                ..WriteOptions::default()
+            },
+        )
+        .expect_err("a dry run must refuse a dirty append target");
+        let applied = apply_write(
+            root,
+            append_pending("ledger/2026/10.cfd", line),
+            &WriteOptions::default(),
+        )
+        .expect_err("apply must refuse a dirty append target");
+
+        for err in [&dry, &applied] {
+            assert_eq!(
+                DomainError::of(err).map(DomainError::code),
+                Some("E_CONFLICT"),
+                "{err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains("uncommitted changes"),
+                "{err:#}"
+            );
+        }
+        // Neither path wrote: the file is exactly the operator's dirty text
+        // and the commit count is unchanged.
+        assert_eq!(std::fs::read_to_string(&ledger).expect("read"), dirty);
+        assert_eq!(
+            git(root, &["status", "--porcelain"], false).unwrap(),
+            dirty_status
+        );
+        assert_eq!(
+            git(root, &["rev-list", "--count", "HEAD"], false)
+                .unwrap()
+                .trim(),
+            "1"
+        );
+    }
+
+    /// #770: the commit's git identity is a read-only precondition, so a dry
+    /// run refuses a missing identity exactly like apply — and the check now
+    /// runs before the apply, so a missing identity no longer leaves written
+    /// files behind.
+    #[test]
+    fn dry_run_and_apply_refuse_a_missing_git_identity_alike() {
+        let dir = clean_vault();
+        let root = dir.path();
+        // A local empty value wins over any global identity.
+        git(root, &["config", "user.name", ""], false).expect("blank name");
+        let ledger = root.join("ledger/2026/10.cfd");
+        let original = std::fs::read_to_string(&ledger).expect("read ledger");
+
+        for dry_run in [true, false] {
+            let err = apply_write(
+                root,
+                append_pending(
+                    "ledger/2026/10.cfd",
+                    "2026-10-13 touch p-01M3TC5H00MPJG000000000000 call",
+                ),
+                &WriteOptions {
+                    dry_run,
+                    ..WriteOptions::default()
+                },
+            )
+            .expect_err("a missing identity must refuse dry run and apply");
+            assert_eq!(
+                DomainError::of(&err).map(DomainError::code),
+                Some("E_INVALID"),
+                "{err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains("user.name is not configured"),
+                "{err:#}"
+            );
+        }
+        // Refused before the apply, so nothing was written.
+        assert_eq!(std::fs::read_to_string(&ledger).expect("read"), original);
+        assert_eq!(
+            git(root, &["rev-list", "--count", "HEAD"], false)
+                .unwrap()
+                .trim(),
+            "1"
+        );
+    }
+
+    /// #770: merge-conflict markers are an apply-time refusal, but the bytes
+    /// are readable without writing, so a dry run must refuse them too.
+    #[test]
+    fn dry_run_and_apply_refuse_a_conflicted_target_alike() {
+        let dir = clean_vault();
+        let root = dir.path();
+        let conflicted = "notes\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n";
+        let target = root.join("README.md");
+        std::fs::write(&target, conflicted).expect("conflicted readme");
+        git(root, &["add", "-A"], false).expect("add");
+        git(root, &["commit", "-qm", "conflicted readme"], false).expect("commit");
+        // Committed, so the dirty-target gate cannot be what refuses this.
+        assert_eq!(git(root, &["status", "--porcelain"], false).unwrap(), "");
+
+        let dry = apply_write(
+            root,
+            append_pending("README.md", "more"),
+            &WriteOptions {
+                dry_run: true,
+                ..WriteOptions::default()
+            },
+        )
+        .expect_err("a dry run must refuse a conflicted target");
+        let applied = apply_write(
+            root,
+            append_pending("README.md", "more"),
+            &WriteOptions::default(),
+        )
+        .expect_err("apply must refuse a conflicted target");
+
+        for err in [&dry, &applied] {
+            assert_eq!(
+                DomainError::of(err).map(DomainError::code),
+                Some("E_CONFLICT"),
+                "{err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains("unresolved merge conflicts"),
+                "{err:#}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), conflicted);
+        assert_eq!(
+            git(root, &["rev-list", "--count", "HEAD"], false)
+                .unwrap()
+                .trim(),
+            "2"
         );
     }
 }
