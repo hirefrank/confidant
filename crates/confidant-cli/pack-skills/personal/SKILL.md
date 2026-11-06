@@ -299,7 +299,9 @@ that skill lands, this section moves there.
 1. **Meeting/call contact qualifies immediately.** If the operator is
    meeting with someone — a meeting or a call — that person belongs in the
    vault. Propose a minimal, factual record (name + what the sources show,
-   nothing inferred) together with the touch entry, in one approval.
+   nothing inferred) together with the touch entry, in one approval. A
+   meeting with a body (agenda, minutes, decisions) is an interaction
+   instead; it mirrors the touch automatically.
 2. **Email-only contact must cross a threshold.** Not everyone who emails
    the operator belongs in their relationship memory: cold outreach,
    one-off threads, and scheduling mail must not mint records. Count
@@ -333,6 +335,33 @@ them by analogy.
 The threshold numbers above are defaults the operator can tune; the shape
 is the guidance: meetings in, email earned, silent below threshold,
 overrides both ways.
+
+### Touch or interaction?
+
+**A contact earns an interaction when there is a body worth reading later.
+Without a body it is a touch.** The full rationale and examples are in
+`docs/touch-vs-interaction.md`; this is the rule to apply.
+
+| Source material | Write |
+|---|---|
+| 1:1 coaching session, call, coffee | `log touch` (`meet`/`video`/`meal`, `--duration`, `--mode one-on-one`) |
+| Session/meeting with notes, agenda, or decisions | interaction; it mirrors the touch for every participant |
+| Substantive 1:1 email thread with decisions or context worth rereading | interaction (mirrors the touch). A short thread of contact only is `log touch … email --mode one-on-one` |
+| Bulk investor update | note, never a touch |
+| Group social (game night, reunion) with no body | `log touch … event --mode group` (add `--duration` if known) |
+| Multi-person event with a body | interaction; every participant gets a mirrored touch |
+| Profile fact (role, relationship context, preferences) | the profile field or a note, never a touch |
+
+- **Never hand-log a touch for an interaction.** `record add` already mirrors
+  one per participant; adding another splits the moment and double-counts
+  contact.
+- **The medium does not decide; substance does.** A call with a decision is
+  an interaction; a long email that only says hello is a touch.
+- **`mode:` is the group mechanism.** A gathering that still counts as
+  contact with the person is a touch with `mode:group`, so it never reads as
+  a 1:1. `duration:` records how long it ran.
+- **`context` shows both** in one date-ordered `timeline`, so a reader never
+  has to know which store a moment landed in.
 
 ### Places and things
 

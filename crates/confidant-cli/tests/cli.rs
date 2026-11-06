@@ -5513,3 +5513,69 @@ fn alias_resolve_prefers_current_typed_entry() {
     let bundle = run_json(&["context", BEA], dir.path());
     assert_eq!(bundle["aliases"], serde_json::json!([]), "{bundle}");
 }
+
+/// #749: `context --json` returns the merged timeline on both paths, and a
+/// no-ai interaction never reaches the agent timeline while the operator path
+/// shows it with the badge.
+#[test]
+fn context_json_timeline_merges_touches_and_interactions() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.4\"\npacks = []\nvault_id = \"01M3TC5H00MPJG005VQC00000C\"\n[checks]\nas_of = \"2026-10-08\"\n",
+    )
+    .unwrap();
+    for (id, name) in [(ADA, "Ada Example"), (BEA, "Bea Demo")] {
+        let d = dir.path().join(format!("people/{id}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("profile.md"),
+            format!("---\nid: {id}\ntype: person\nname: {name}\n---\n\nFake person.\n"),
+        )
+        .unwrap();
+    }
+    std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+    std::fs::write(
+        dir.path().join("ledger/2026/10.cfd"),
+        format!("2026-10-01 touch {ADA} meal duration:60m mode:group\n"),
+    )
+    .unwrap();
+    let visible = "i-01M3TC5H00MPJG0048H0000008";
+    let hidden = "i-01M3TC5H00MPJG0048H0000009";
+    for (id, name, no_ai) in [
+        (visible, "Group dinner", ""),
+        (hidden, "Hidden lunch", "no-ai: true\n"),
+    ] {
+        let d = dir.path().join(format!("interactions/{id}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("interaction.md"),
+            format!(
+                "---\nid: {id}\ntype: interaction\nname: {name}\ndate: 2026-10-02\nperson: {ADA}\n{no_ai}---\n\n{name} body.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let agent = run_json(&["context", ADA], dir.path());
+    assert_eq!(agent["timeline"].as_array().unwrap().len(), 2, "{agent}");
+    assert_eq!(agent["timeline"][0]["type"], "touch", "{agent}");
+    assert_eq!(agent["timeline"][1]["type"], "interaction", "{agent}");
+    let dumped = serde_json::to_string(&agent).unwrap();
+    assert!(!dumped.contains("Hidden lunch"), "{dumped}");
+
+    let operator = run_json(&["context", ADA, "--for-operator"], dir.path());
+    assert_eq!(
+        operator["timeline"].as_array().unwrap().len(),
+        3,
+        "{operator}"
+    );
+    assert!(
+        operator["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["title"] == "Hidden lunch" && entry["no_ai"] == "true"),
+        "{operator}"
+    );
+}
