@@ -387,10 +387,16 @@ the dependent `[checks]` keys), then re-run. If the vault already has the
 pack's data/checks, `pack add --from-dir <dir> --allow-unresolved --yes`
 installs over it: only the pre-check is skipped, the post-check and `check`
 still gate, and unrelated errors roll back. The flag needs `--yes`; without
-it, `pack add` stays the read-only review. `pack remove --yes` refuses while
-ledger lines, metrics, or `[checks]` keys still use the pack, so remove or
-migrate those entries first, or keep the pack installed; a remove-side flag
-is not available yet (#699). The errors name the workaround.
+it, `pack add` stays the read-only review.
+
+Removing a pack a vault still uses: `pack remove <name> --yes` refuses.
+`pack remove <name> --allow-unresolved --yes` instead drops the pack from
+`packs` and keeps its vendored files and lock pin; its data and `[checks]`
+keys then warn `W_PACK_ORPHAN` rather than failing, so `check` exits 0 and
+later writes keep working while you migrate. The flag needs `--yes` and
+never prompts (`--no-input`/`--json` included). Migrate or delete the
+orphaned data, then run `pack remove <name> --yes` to delete the files and
+pin; re-adding the pack at the same version re-lists it.
 
 A local pack is unsigned but hash-pinned, so `pack verify` catches drift.
 The operator must review the manifest and `SKILL.md`: the skill text is

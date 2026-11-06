@@ -3017,7 +3017,7 @@ fn pack_remove_refuses_while_the_vault_uses_the_pack() {
     assert!(stderr.contains("example-pack"), "{stderr}");
     assert!(stderr.contains("verbs"), "{stderr}");
     assert!(stderr.contains("orphan"), "{stderr}");
-    assert!(stderr.contains("not available yet"), "{stderr}");
+    assert!(stderr.contains("--allow-unresolved"), "{stderr}");
     assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
     assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
     assert!(vault.path().join("packs/example-pack@0.1").is_dir());
@@ -3853,6 +3853,293 @@ fn pack_remove_yes_deletes_files_lock_and_entry() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
     assert_eq!(v["ok"], true, "{v}");
+}
+
+/// #699: `pack remove --allow-unresolved --yes` unlists the pack and keeps
+/// its vendored tree and pin. Its data and `[checks]` key become durable
+/// `W_PACK_ORPHAN` warnings, so a fresh `check` passes and a later write
+/// still commits while the operator migrates.
+#[cfg(unix)]
+#[test]
+fn pack_remove_allow_unresolved_unlists_and_keeps_files() {
+    let vault = listed_example_pack_vault_with_data();
+    let before: u32 = git(vault.path(), &["rev-list", "--count", "HEAD"])
+        .trim()
+        .parse()
+        .unwrap();
+
+    // Without --yes it is a dry run: the unlist is described, nothing moves.
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("would unlist"),
+        "{out:?}"
+    );
+    assert_eq!(
+        git(vault.path(), &["rev-list", "--count", "HEAD"])
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
+        before
+    );
+    assert!(vault
+        .path()
+        .join("packs/example-pack@0.1/SKILL.md")
+        .is_file());
+
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["outcome"], "unlisted", "{v}");
+    assert_eq!(v["allow_unresolved"], true, "{v}");
+    assert_eq!(
+        v["unlisted"],
+        serde_json::json!(["example-pack@0.1"]),
+        "{v}"
+    );
+    assert_eq!(v["kept"], serde_json::json!(["example-pack@0.1"]), "{v}");
+    let total = v["orphans"]["total"].as_u64().unwrap();
+    assert!(total >= 4, "verb, metric, and [checks] warning: {v}");
+    assert_eq!(v["orphans"]["new"], total, "{v}");
+
+    // Only the listing moved: the tree and the pin stay, and the commit is
+    // clean.
+    assert_eq!(
+        git(vault.path(), &["rev-list", "--count", "HEAD"])
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
+        before + 1
+    );
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = []"), "{cfg}");
+    let lock = std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap();
+    assert!(lock.contains("[[pack]]"), "{lock}");
+    assert!(lock.contains("example-pack"), "{lock}");
+    assert!(vault
+        .path()
+        .join("packs/example-pack@0.1/manifest.toml")
+        .is_file());
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+
+    // A fresh process: `check` exits 0 on warnings only (no errors), and
+    // every finding is the orphan warning.
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(check.status.success(), "{check:?}");
+    let c: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(c["ok"], true, "{c}");
+    assert_eq!(c["summary"]["errors"], 0, "{c}");
+    let findings = c["findings"].as_array().unwrap();
+    assert!(findings.len() >= 4, "{c}");
+    assert!(findings.iter().all(|f| f["code"] == "W_PACK_ORPHAN"), "{c}");
+
+    // The vault stays writable while the orphan data remains.
+    let out = Command::new(bin())
+        .args([
+            "log",
+            "touch",
+            "p-01M3TC5H00MPJG000000000000",
+            "call",
+            "--date",
+            "2026-10-13",
+            "--vault",
+        ])
+        .arg(vault.path())
+        .args(["--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+}
+
+/// #699: an unrelated error still gates the unlist. The pre-check is skipped
+/// here (the pack is listed but unpinned, the repairing path), so the
+/// post-check is what rolls the write back.
+#[cfg(unix)]
+#[test]
+fn pack_remove_allow_unresolved_rolls_back_an_unrelated_error() {
+    let vault = listed_example_pack_vault_with_data();
+    let cfg_path = vault.path().join("confidant.toml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    std::fs::write(
+        &cfg_path,
+        cfg.replace(
+            "example-pack.notes = \"warning\"",
+            "example-pack.notes = \"warning\"\nbogus_key = \"warning\"",
+        ),
+    )
+    .unwrap();
+    drop_lock(vault.path());
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "unrelated config error and a lost pin",
+        ],
+    );
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("E_CONFIG"),
+        "{out:?}"
+    );
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        cfg.contains("packs = [\"example-pack@0.1\"]"),
+        "the unlist must roll back: {cfg}"
+    );
+    assert!(vault
+        .path()
+        .join("packs/example-pack@0.1/SKILL.md")
+        .is_file());
+}
+
+/// #699: a later plain removal refuses while the data remains, is idempotent
+/// once already unlisted, and deletes the tree and pin after the migration.
+#[cfg(unix)]
+#[test]
+fn pack_remove_after_unlisting_refuses_while_data_remains_then_succeeds() {
+    let vault = listed_example_pack_vault_with_data();
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let unlisted: u32 = git(vault.path(), &["rev-list", "--count", "HEAD"])
+        .trim()
+        .parse()
+        .unwrap();
+
+    // The flag again is a no-op: nothing to unlist, and the tree stays.
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["unchanged"], true, "{v}");
+    assert_eq!(v["outcome"], "unlisted", "{v}");
+    assert_eq!(
+        git(vault.path(), &["rev-list", "--count", "HEAD"])
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
+        unlisted
+    );
+
+    // Drop the pack's `[checks]` key first, so the remaining refusal is
+    // driven only by ledger data. The hint must still name the pack, which
+    // means reading the unlisted vendored manifest (the registry no longer
+    // holds it).
+    let cfg_path = vault.path().join("confidant.toml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    std::fs::write(
+        &cfg_path,
+        cfg.replace("\nexample-pack.notes = \"warning\"\n", "\n"),
+    )
+    .unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "drop the pack checks key",
+        ],
+    );
+
+    // Plain removal still refuses: deleting the files would orphan the data.
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already unlisted"),
+        "{out:?}"
+    );
+    assert!(vault
+        .path()
+        .join("packs/example-pack@0.1/SKILL.md")
+        .is_file());
+
+    // Migrate off the pack: no ledger line uses its verbs or metric.
+    std::fs::write(vault.path().join("ledger/2026/10.cfd"), "").unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "migrate off the pack",
+        ],
+    );
+
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!vault
+        .path()
+        .join("packs/example-pack@0.1/SKILL.md")
+        .exists());
+    let lock = std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap();
+    assert!(!lock.contains("[[pack]]"), "{lock}");
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    let c = check_json(vault.path());
+    assert_eq!(c["ok"], true, "{c}");
+    assert_eq!(c["summary"]["warnings"], 0, "{c}");
 }
 
 /// Drop `confidant.lock` and commit the deletion, producing the #612 state:
@@ -4821,6 +5108,37 @@ fn write_example_pack_ledger_data(vault: &std::path::Path) {
         ),
     )
     .unwrap();
+}
+
+/// #699: a committed 0.1 vault that lists the example pack, carries its
+/// ledger data, and sets one of its `[checks]` keys. The pre-state checks
+/// clean. Fake data only.
+#[cfg(unix)]
+fn listed_example_pack_vault_with_data() -> tempfile::TempDir {
+    let vault = git_vault();
+    install_example_pack(vault.path());
+    std::fs::write(
+        vault.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n\n[checks]\nas_of = \"2026-10-08\"\nexample-pack.notes = \"warning\"\n",
+    )
+    .unwrap();
+    write_example_pack_ledger_data(vault.path());
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "use the pack",
+        ],
+    );
+    let report = check_json(vault.path());
+    assert_eq!(report["ok"], true, "{report}");
+    vault
 }
 
 /// Run `check --json` and return the parsed report.

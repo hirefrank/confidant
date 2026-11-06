@@ -273,6 +273,20 @@ impl VaultConfig {
         &mut self,
         manifests: &[&crate::packs::manifest::PackManifest],
     ) -> Vec<Finding> {
+        self.config_findings_with_orphans(manifests, &[])
+    }
+
+    /// `config_findings_with`, plus the names of registered-but-unlisted
+    /// packs (#699). A `[checks]` key those packs declare is
+    /// `W_PACK_ORPHAN` — the pack still owns it, so removing the pack's
+    /// listing must not turn the key into an `E_CONFIG` that blocks every
+    /// write. A malformed value is still `E_CONFIG`: only the ownership is
+    /// demoted, never a real config error.
+    pub fn config_findings_with_orphans(
+        &mut self,
+        manifests: &[&crate::packs::manifest::PackManifest],
+        orphan_packs: &[&str],
+    ) -> Vec<Finding> {
         let severity_keys = known_severity_keys(manifests);
         let int_keys = known_int_keys(manifests);
         let mut findings = Vec::new();
@@ -298,9 +312,11 @@ impl VaultConfig {
                 continue;
             }
             if severity_keys.contains(&key.as_str()) {
+                let mut invalid = false;
                 match self.checks.lookup(key) {
                     Some(toml::Value::String(s)) => {
                         if parse_severity_token(s).is_err() {
+                            invalid = true;
                             findings.push(
                                 Finding::new(
                                     FindingCode::Config,
@@ -312,23 +328,31 @@ impl VaultConfig {
                             );
                         }
                     }
-                    Some(_) => findings.push(
-                        Finding::new(
-                            FindingCode::Config,
-                            Severity::Error,
-                            format!("[checks] {key} must be a string"),
-                        )
-                        .at_file("confidant.toml"),
-                    ),
+                    Some(_) => {
+                        invalid = true;
+                        findings.push(
+                            Finding::new(
+                                FindingCode::Config,
+                                Severity::Error,
+                                format!("[checks] {key} must be a string"),
+                            )
+                            .at_file("confidant.toml"),
+                        );
+                    }
                     None => {}
+                }
+                if !invalid {
+                    push_orphan_key_warning(&mut findings, key, orphan_packs);
                 }
                 continue;
             }
             if int_keys.contains(&key.as_str()) {
                 let default = int_key_default(manifests, key);
                 let value = self.checks.lookup(key).cloned();
+                let mut invalid = false;
                 match value {
                     Some(toml::Value::Integer(n)) if n < 0 => {
+                        invalid = true;
                         findings.push(
                             Finding::new(
                                 FindingCode::Config,
@@ -342,6 +366,7 @@ impl VaultConfig {
                     Some(toml::Value::Integer(n)) => {
                         let n = n as u64;
                         if n > MAX_GAP_DAYS {
+                            invalid = true;
                             findings.push(
                                 Finding::new(
                                     FindingCode::Config,
@@ -359,6 +384,7 @@ impl VaultConfig {
                         }
                     }
                     Some(_) => {
+                        invalid = true;
                         findings.push(
                             Finding::new(
                                 FindingCode::Config,
@@ -371,6 +397,9 @@ impl VaultConfig {
                     }
                     None => {}
                 }
+                if !invalid {
+                    push_orphan_key_warning(&mut findings, key, orphan_packs);
+                }
                 continue;
             }
             // Legacy bare pack key: `[checks] <pack> = <value>` is accepted
@@ -382,6 +411,7 @@ impl VaultConfig {
             // one (`example-pack.bogus`, or a typo) is still an unknown key
             // rather than a silently ignored config line.
             if manifests.iter().any(|m| m.pack.name == key.as_str()) {
+                push_orphan_key_warning(&mut findings, key, orphan_packs);
                 continue;
             }
             // #656: a key under a listed pack that did not resolve (no
@@ -404,16 +434,21 @@ impl VaultConfig {
         }
 
         // Empty `[checks.<name>]` tables produce no leaf keys above; reject
-        // them when `<name>` is not a known pack (#433).
+        // them when `<name>` is not a known pack (#433). A known pack's empty
+        // table is harmless, but an orphan pack still owns it (#699).
         for (top_key, value) in &self.checks.rules {
-            if matches!(value, toml::Value::Table(_))
-                && top_key != "as_of"
-                && !manifests.iter().any(|m| m.pack.name == top_key.as_str())
-            {
+            if matches!(value, toml::Value::Table(_)) && top_key != "as_of" {
+                let known = manifests.iter().any(|m| m.pack.name == top_key.as_str());
                 // Only report if no leaf keys were already reported (avoid
                 // duplicates when the table has content).
                 let prefix = format!("{top_key}.");
                 let has_leaf = seen.iter().any(|k| k.starts_with(&prefix));
+                if known {
+                    if !has_leaf {
+                        push_orphan_key_warning(&mut findings, top_key, orphan_packs);
+                    }
+                    continue;
+                }
                 if !has_leaf {
                     // #656: same pack-not-resolved carve-out as above.
                     match self.unresolved_pack_pin(manifests, top_key) {
@@ -460,6 +495,31 @@ where
 /// The pack name a `[checks]` key belongs to: its first dotted segment.
 fn first_segment(key: &str) -> &str {
     key.split('.').next().unwrap_or(key)
+}
+
+/// #699: a `[checks]` key declared by a registered-but-unlisted pack. The
+/// pack still owns the key, so the key warns instead of failing the write
+/// that removed the pack's listing. `orphan_packs` holds `name@version`
+/// ids; the key's namespace is the base name.
+fn push_orphan_key_warning(findings: &mut Vec<Finding>, key: &str, orphan_packs: &[&str]) {
+    let namespace = first_segment(key);
+    let Some(owner) = orphan_packs.iter().find(|pack| {
+        **pack == namespace
+            || pack
+                .split_once('@')
+                .is_some_and(|(name, _)| name == namespace)
+    }) else {
+        return;
+    };
+    findings.push(
+        Finding::new(
+            FindingCode::PackOrphan,
+            Severity::Warning,
+            "[checks] key belongs to a disabled pack".to_owned(),
+        )
+        .at_file("confidant.toml")
+        .with_fix(format!("Enable {owner} or remove the key")),
+    );
 }
 
 /// #656: an unknown `[checks]` key under a listed pack that did not resolve
