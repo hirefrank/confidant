@@ -54,15 +54,17 @@ URL is known instead. This is the long form of step 3 of the install prompt in
    not a hard block on a fresh install: `confidant doctor` reports it as a
    warning, since older git is still usable for the commands Confidant
    runs. Upgrade when you can.
-2. **Git identity.** `init` commits, so it needs one. Check first with
-   `git config --global user.name` and `git config --global user.email`,
-   and set only values that are unset — do not overwrite an existing
-   identity. If a value is missing, ask the operator for it (do not
-   invent it) and set it before `init`:
+2. **Git identity.** `init` commits, but it does not need a global git
+   identity: it sets a neutral repo-local identity (`Confidant Operator
+   <operator@confidant.local>`) in `<vault>/.git/config`, so the
+   operator's global identity never lands in the vault's history. Do
+   not set a global identity for this. If the operator wants their own
+   name in the vault's history, ask them for it (do not invent it) and
+   set it per vault, inside the vault:
 
    ```sh
-   git config --global user.name "Your Name"
-   git config --global user.email "you@example.com"
+   git config --local user.name "Your Name"
+   git config --local user.email "you@example.com"
    ```
 
 3. **Git credentials — checked where the URL is known, not here.** At

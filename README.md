@@ -83,13 +83,16 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
      install: `confidant doctor` reports it as a warning, since older git
      is still usable for the commands Confidant runs. Upgrade when you
      can.
-   - Make sure git has an identity, because `init` commits: check first
-     with `git config --global user.name` and
-     `git config --global user.email`, and set only values that are
-     unset — do not overwrite an existing identity. If a value is
-     missing, ask me for it (do not invent it) and set
-     `git config --global user.name "Your Name"` and
-     `git config --global user.email "you@example.com"`.
+   - `init` commits, but it does not need a global git identity: it
+     sets a neutral repo-local identity (`Confidant Operator
+     <operator@confidant.local>`) in `<vault>/.git/config`, so the
+     operator's global identity never lands in the vault's history.
+     Do not set a global identity for this. If I want my own name in
+     the vault's history, ask me for it (do not invent it) and set it
+     per vault, inside the vault, with
+     `git config --local user.name "Your Name"` and
+     `git config --local user.email "you@example.com"` — that override
+     survives re-runs of `init`.
    - Do not probe remote credentials here: at this point you do not
      yet know whether there is a remote at all, let alone its URL (step
      6 asks that). Version and identity above are the whole of step 3;
