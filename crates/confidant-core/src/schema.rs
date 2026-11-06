@@ -340,7 +340,7 @@ pub fn contract_schema() -> Value {
             },
             "contextBundle": {
                 "title": "context --json",
-                "description": "Everything the vault knows about one entity: a core person or org, or a record of a pack-declared type with entity = true (#813, #814). `entity` is the canonical target view; `person` is a deprecated person-only alias, present only when the target is a core person. PII fields (name/profile/bodies/edge endpoint names) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions/edges are omitted entirely, never nulled. An edge is visible only when both endpoints are cleared and the edge itself is not no-ai: true, so a no-ai endpoint or no-ai edge omits the edge from the other endpoint's bundle with no count or hint; an operator bundle badges it instead. --exclude-private strips PII regardless; ledger facts and opaque edge ids/kinds/dates are kept. The `packs[\"personal@0.2\"]` entry on 0.1–0.3 (or `packs[\"personal@0.4\"]` on 0.4; core: context::personal) carries the personal pack's declared fields (birthday, dates, relationship, location, emails, phones, links, tags, …) plus cadence_days, cadence_never, snooze_until, last_touch, days_since_touch, overdue and recent_touches. cadence_never is true only when the declared cadence is the literal `never` (and is omitted otherwise), so it distinguishes a deliberate never-nudge from no cadence set: both omit cadence_days. --exclude-private removes the PII fields by name; title, company, cadence_days and snooze_until stay. For a person outside the cleared set (no-ai) the declared fields are denied by default: only snooze_until and the derived cadence/touch metadata (cadence_days, cadence_never, last_touch, days_since_touch, overdue, recent_touches) remain. A non-person-like bundle (an org, or a pack type without person_like) has empty `touchpoints`, `aliases`, and `packs`; a non-person-like pack entity also carries its declared fields in `entity.fields`, and an uncleared one returns no bundle at all on the agent path. Its notes/interactions are those linked by `org:` or `entity:`. A pack-declared type is a target only when it is enabled and its declaring pack is in scope; a disabled, retired, or undeclared type is operator-only. A retired record (spec 0.4) returns no bundle on either path; superseded ledger lines are omitted from touchpoints and pack views.",
+                "description": "Everything the vault knows about one entity: a core person or org, or a record of a pack-declared type with entity = true (#813, #814). `entity` is the canonical target view; `person` is a deprecated person-only alias, present only when the target is a core person. PII fields (name/profile/bodies/edge endpoint names) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions/edges are omitted entirely, never nulled. An edge is visible only when both endpoints are cleared and the edge itself is not no-ai: true, so a no-ai endpoint or no-ai edge omits the edge from the other endpoint's bundle with no count or hint; an operator bundle badges it instead. --exclude-private strips PII regardless; ledger facts and opaque edge ids/kinds/dates are kept. The `packs[\"personal@0.2\"]` entry on 0.1–0.3 (or `packs[\"personal@0.4\"]` on 0.4; core: context::personal) carries the personal pack's declared fields (birthday, dates, relationship, location, emails, phones, links, tags, …) plus cadence_days, cadence_never, snooze_until, last_touch, days_since_touch, overdue and recent_touches. cadence_never is true only when the declared cadence is the literal `never` (and is omitted otherwise), so it distinguishes a deliberate never-nudge from no cadence set: both omit cadence_days. --exclude-private removes the PII fields by name; title, company, cadence_days and snooze_until stay. For a person outside the cleared set (no-ai) the declared fields are denied by default: only snooze_until and the derived cadence/touch metadata (cadence_days, cadence_never, last_touch, days_since_touch, overdue, recent_touches) remain. A non-person-like bundle (an org, or a pack type without person_like) has empty `touchpoints`, `aliases`, and `packs`; a non-person-like pack entity also carries its declared fields in `entity.fields`, and an uncleared one returns no bundle at all on the agent path. Its notes/interactions are those linked by `org:` or `entity:`. A pack-declared type is a target only when it is enabled and its declaring pack is in scope; a disabled, retired, or undeclared type is operator-only. A retired record (spec 0.4) returns no bundle on either path; on the agent path superseded ledger lines are omitted from touchpoints and pack views, while the operator path lists them in `touchpoints` with `superseded: true` (pack views stay effective-only).",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "entity", "notes", "interactions", "edges", "packs", "aliases"],
                 "properties": {
@@ -391,6 +391,19 @@ pub fn contract_schema() -> Value {
                         "type": "array",
                         "description": "Edges whose endpoint is this entity, cleared-set-gated and merge-canonicalized (#813). Empty when the target has none or either endpoint is not cleared.",
                         "items": {"$ref": "#/$defs/edgeView"}
+                    },
+                    "touchpoints": {
+                        "type": "array",
+                        "description": "Mirrored `touch` ledger lines for this person (#179). The agent path returns only the effective view: a superseded line is absent. The operator path (`--for-operator`) also lists superseded lines, each marked `superseded: true`, so an operator can see what a retraction voided. The badge is operator-only and does not widen any agent-facing read. Empty for a non-person-like target.",
+                        "items": {
+                            "type": "object",
+                            "required": ["date"],
+                            "properties": {
+                                "date": {"type": "string"},
+                                "kind": {"type": ["string", "null"]},
+                                "superseded": {"type": "boolean", "description": "Operator path only: this line is superseded by a valid retraction. Absent on the agent path and on live lines."}
+                            }
+                        }
                     },
                     "packs": {
                         "type": "object",
@@ -606,6 +619,11 @@ mod tests {
         );
         assert!(s["$defs"]["rosterEntry"]["properties"]["orphan"].is_object());
         assert!(s["$defs"]["rosterEntry"]["properties"]["retired"].is_object());
+        assert!(
+            s["$defs"]["contextBundle"]["properties"]["touchpoints"]["items"]["properties"]
+                ["superseded"]
+                .is_object()
+        );
         assert!(
             s["$defs"]["findResponse"]["properties"]["matches"]["items"]["properties"]["ref"]
                 .is_object()

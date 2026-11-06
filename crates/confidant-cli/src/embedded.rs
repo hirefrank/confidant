@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn embedded_tree_has_expected_skills() {
         let ids = skill_ids();
-        assert_eq!(ids, vec!["pack-author", "qmd-search"]);
+        assert_eq!(ids, vec!["confidant", "pack-author", "qmd-search"]);
         assert!(SKILLS.get_dir("bin").is_none());
     }
 

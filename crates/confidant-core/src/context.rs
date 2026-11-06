@@ -183,6 +183,11 @@ pub struct TouchpointView {
     pub duration_minutes: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Operator path only (#838): this line is superseded by a valid
+    /// retraction. Absent on the agent path (where superseded lines are not
+    /// emitted at all) and on live lines, so agent JSON is unchanged.
+    #[serde(skip_serializing_if = "is_false")]
+    pub superseded: bool,
 }
 
 /// One interaction record linked to the person.
@@ -576,8 +581,20 @@ pub fn build_context(
         // Like aliases, these are ledger-derived metadata (not record PII),
         // so they carry no cleared-set gate; scope-filtered by verb ownership
         // (core for kind-less touchpoints).
-        touchpoints = vault
-            .effective_entries()
+        //
+        // #838: the agent path keeps the effective view (a superseded line is
+        // absent). The operator path additionally lists superseded lines,
+        // each marked `superseded: true`, so an operator can see what a
+        // retraction voided. That badge is operator-only and adds no agent
+        // privacy surface: no line the agent could not already see becomes
+        // visible, and the agent JSON never carries the field.
+        let entries: Vec<&crate::vault::SourcedEntry> = if for_operator {
+            vault.entries.iter().collect()
+        } else {
+            vault.effective_entries().collect()
+        };
+        touchpoints = entries
+            .into_iter()
             .filter(|s| {
                 s.entry.verb == "touch"
                     && canonical_on(&s.entry.id, &merges, as_of) == canonical
@@ -598,6 +615,7 @@ pub fn build_context(
                 // they do not depend on which pack claims the verb.
                 duration_minutes: crate::touch::extract_touch_duration(&s.entry),
                 mode: crate::touch::extract_touch_mode(&s.entry),
+                superseded: for_operator && vault.is_voided(s),
             })
             .collect();
         touchpoints.sort_by(|a, b| {
@@ -605,6 +623,7 @@ pub fn build_context(
                 .cmp(&b.date)
                 .then(a.kind.cmp(&b.kind))
                 .then(a.mode.cmp(&b.mode))
+                .then(a.superseded.cmp(&b.superseded))
         });
     }
 
@@ -1552,6 +1571,30 @@ mod tests {
             ada_bundle.touchpoints
         );
         assert_eq!(ada_bundle.touchpoints[0].kind.as_deref(), Some("call"));
+        assert!(
+            !ada_bundle.touchpoints[0].superseded,
+            "the agent path never marks or returns a superseded line"
+        );
+
+        // #838: the operator path lists the superseded duplicate too and
+        // badges it; the agent JSON above stays unchanged (one touchpoint,
+        // no `superseded` key).
+        let ada_operator = build_context(&vault, &ada, true, &PackScope::All, true).unwrap();
+        assert_eq!(
+            ada_operator.touchpoints.len(),
+            2,
+            "{:?}",
+            ada_operator.touchpoints
+        );
+        assert!(!ada_operator.touchpoints[0].superseded);
+        assert!(ada_operator.touchpoints[1].superseded);
+        let agent_json = serde_json::to_string(&ada_bundle).unwrap();
+        assert!(!agent_json.contains("superseded"), "{agent_json}");
+        let operator_json = serde_json::to_string(&ada_operator).unwrap();
+        assert!(
+            operator_json.contains("\"superseded\":true"),
+            "{operator_json}"
+        );
 
         let bea_bundle = build_context(&vault, &bea, true, &PackScope::All, false).unwrap();
         assert_eq!(
@@ -1564,6 +1607,27 @@ mod tests {
         let personal = &bea_bundle.packs["personal@0.4"];
         assert_eq!(personal["recent_touches"].as_array().unwrap().len(), 1);
         assert_eq!(personal["recent_touches"][0]["kind"], "meet");
+        // Pack state stays effective-only on both paths: the operator sees
+        // voided lines in `touchpoints`, not in a pack's aggregate view.
+        let bea_operator = build_context(&vault, &bea, true, &PackScope::All, true).unwrap();
+        assert_eq!(bea_operator.touchpoints.len(), 3);
+        assert_eq!(
+            bea_operator
+                .touchpoints
+                .iter()
+                .filter(|tp| tp.superseded)
+                .count(),
+            2,
+            "{:?}",
+            bea_operator.touchpoints
+        );
+        assert_eq!(
+            bea_operator.packs["personal@0.4"]["recent_touches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         assert!(build_context(&vault, &cam, true, &PackScope::All, false).is_none());
         assert!(build_context(&vault, &cam, true, &PackScope::All, true).is_none());

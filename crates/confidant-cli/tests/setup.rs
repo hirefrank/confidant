@@ -57,7 +57,7 @@ fn run(args: &[&str], env: &Env, extra: &[(&str, &str)]) -> (bool, Value, String
 }
 
 fn skill_ids() -> Vec<&'static str> {
-    vec!["pack-author", "qmd-search"]
+    vec!["confidant", "pack-author", "qmd-search"]
 }
 
 #[test]
@@ -65,7 +65,7 @@ fn setup_links_all_skills_as_symlinks() {
     let env = fresh_env();
     let (ok, v, _) = run(&["setup", "--agent", "all", "--json"], &env, &[]);
     assert!(ok, "{v}");
-    assert_eq!(v["linked"], 2, "{v}");
+    assert_eq!(v["linked"], 3, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     for id in skill_ids() {
@@ -977,7 +977,7 @@ fn update_offline_relinks_without_network() {
         &[("CONFIDANT_OFFLINE", "1")],
     );
     assert!(ok, "{v}");
-    assert_eq!(v["linked"], 2, "{v}");
+    assert_eq!(v["linked"], 3, "{v}");
     assert_eq!(v["update"]["status"], "disabled", "{v}");
 }
 
@@ -1540,7 +1540,7 @@ fn setup_json_next_steps_are_additive() {
     assert_eq!(v["next_steps"]["vault_set"], true, "{v}");
     assert!(v["next_steps"]["vault_export"].is_null(), "{v}");
     // Existing contract intact.
-    assert_eq!(v["linked"], 2, "{v}");
+    assert_eq!(v["linked"], 3, "{v}");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"), "{v}");
 }
 
@@ -1563,8 +1563,9 @@ fn setup_json_next_steps_unset_carries_export_line() {
     );
 }
 
-// #386/#653e: `setup` mentions qmd as optional only with `-v`; the note is
-// informational and setup still succeeds without qmd.
+// #386/#653e: the verbose-only `qmd` note is not printed on a plain setup.
+// #715's optional-layers checklist does name qmd (and its install cost) at
+// the end of every setup; the line below is the extra verbose note.
 #[test]
 fn setup_without_qmd_is_quiet_by_default_and_notes_it_with_verbose() {
     let env = fresh_env();
@@ -1579,9 +1580,11 @@ fn setup_without_qmd_is_quiet_by_default_and_notes_it_with_verbose() {
     assert!(quiet.ok, "stdout={}\nstderr={}", quiet.stdout, quiet.stderr);
     let both = format!("{}{}", quiet.stdout, quiet.stderr);
     assert!(
-        !both.contains("npm install -g @tobilu/qmd"),
-        "qmd note is noise on a first install: {both}"
+        !both.contains("Note: `qmd` not found"),
+        "the verbose qmd note is noise on a first install: {both}"
     );
+    // #715: the checklist still tells the operator the layer exists.
+    assert!(both.contains("npm install -g @tobilu/qmd"), "{both}");
 
     let verbose = run_raw(
         &["setup", "--agent", "all", "-v"],
@@ -1597,6 +1600,7 @@ fn setup_without_qmd_is_quiet_by_default_and_notes_it_with_verbose() {
     );
     let both = format!("{}{}", verbose.stdout, verbose.stderr);
     assert!(both.contains("confidant find"), "{both}");
+    assert!(both.contains("Note: `qmd` not found"), "{both}");
     assert!(both.contains("npm install -g @tobilu/qmd"), "{both}");
 }
 
@@ -1614,7 +1618,132 @@ fn setup_json_reports_qmd_availability_additively() {
     assert_eq!(v["next_steps"]["qmd_available"], false, "{v}");
     let note = v["next_steps"]["qmd_note"].as_str().expect("qmd_note");
     assert!(note.contains("confidant find"), "{v}");
-    assert_eq!(v["linked"], 2, "{v}");
+    assert_eq!(v["linked"], 3, "{v}");
+}
+
+// #720: setup reports both agent-integration surfaces, not just skill links.
+#[test]
+fn setup_json_names_mcp_alongside_skills() {
+    let env = fresh_env();
+    let empty = tempfile::tempdir().unwrap();
+    let r = run_raw(
+        &["setup", "--agent", "all", "--json"],
+        &env,
+        &[("PATH", empty.path().to_str().unwrap())],
+        &["CONFIDANT_VAULT"],
+        true,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    let v: Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(v["integrations"]["mcp"]["command"], "confidant mcp", "{v}");
+    assert_eq!(v["integrations"]["mcp"]["transport"], "stdio", "{v}");
+    assert_eq!(
+        v["integrations"]["skills"]["dir"],
+        v["skills_dir"].as_str().unwrap(),
+        "{v}"
+    );
+    let agents = v["integrations"]["skills"]["agents"].as_array().unwrap();
+    assert!(!agents.is_empty(), "{v}");
+}
+
+// #715: setup ends with an optional-layers checklist, each layer carrying a
+// state and a one-line tradeoff. Absent layers are never silent.
+#[test]
+fn setup_ends_with_optional_layers_checklist() {
+    let env = fresh_env();
+    let empty = tempfile::tempdir().unwrap();
+    let r = run_raw(
+        &["setup", "--agent", "all"],
+        &env,
+        &[("PATH", empty.path().to_str().unwrap())],
+        &["CONFIDANT_VAULT"],
+        true,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    let out = r.stdout;
+    for needle in [
+        "Agent integrations:",
+        "confidant mcp",
+        "Optional layers",
+        "tradeoff:",
+    ] {
+        assert!(out.contains(needle), "missing {needle:?}: {out}");
+    }
+    for id in ["vault", "skills", "qmd", "corpus", "embeddings"] {
+        assert!(out.contains(id), "missing layer {id}: {out}");
+    }
+    // The checklist is the final block, after the completion brief.
+    let brief = out.find("Completion brief").expect("brief missing");
+    let layers = out.find("Optional layers").expect("layers missing");
+    assert!(brief < layers, "checklist must follow the brief: {out}");
+    // Absent qmd is reported with the fallback tradeoff, not as ready.
+    assert!(out.contains("absent"), "{out}");
+}
+
+#[test]
+fn setup_json_lists_optional_layers_with_states() {
+    let env = fresh_env();
+    let empty = tempfile::tempdir().unwrap();
+    // Remove CONFIDANT_VAULT: the checklist's states are what this test
+    // asserts, and a test must never read the operator's real vault.
+    let r = run_raw(
+        &["setup", "--agent", "all", "--json"],
+        &env,
+        &[("PATH", empty.path().to_str().unwrap())],
+        &["CONFIDANT_VAULT"],
+        true,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    let v: Value = serde_json::from_str(&r.stdout).unwrap();
+    let layers = v["optional_layers"].as_array().expect("optional_layers");
+    let ids: Vec<&str> = layers.iter().map(|l| l["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec!["vault", "skills", "qmd", "corpus", "embeddings"],
+        "{v}"
+    );
+    for layer in layers {
+        assert!(layer["state"].is_string(), "{v}");
+        assert!(layer["detail"].is_string(), "{v}");
+        assert!(layer["tradeoff"].is_string(), "{v}");
+    }
+    let by_id = |id: &str| layers.iter().find(|l| l["id"] == id).unwrap();
+    assert_eq!(by_id("vault")["state"], "absent", "{v}");
+    assert_eq!(by_id("skills")["state"], "present", "{v}");
+    assert_eq!(by_id("qmd")["state"], "absent", "{v}");
+    assert_eq!(by_id("corpus")["state"], "absent", "{v}");
+    assert_eq!(by_id("embeddings")["state"], "absent", "{v}");
+}
+
+// #715: a shim named `qmd` is not a working qmd; setup says so instead of
+// treating semantic search as available.
+#[test]
+fn setup_verbose_does_not_trust_a_qmd_shim() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let env = fresh_env();
+        let stub = tempfile::tempdir().unwrap();
+        let script = stub.path().join("qmd");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho \"Robin Example — canned hit\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = run_raw(
+            &["setup", "--agent", "all", "-v"],
+            &env,
+            &[("PATH", stub.path().to_str().unwrap())],
+            &["CONFIDANT_VAULT"],
+            true,
+        );
+        assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+        let both = format!("{}{}", r.stdout, r.stderr);
+        assert!(both.contains("did not report a version"), "{both}");
+        assert!(both.contains("confidant find"), "{both}");
+        assert!(both.contains("not working"), "{both}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1716,7 +1845,7 @@ fn setup_dry_run_json_reports_planned_counts() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v["dry_run"], true, "{v}");
-    assert_eq!(v["linked"], 16, "{v}");
+    assert_eq!(v["linked"], 24, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     // Nothing materialized or linked.
     assert!(
@@ -1740,8 +1869,8 @@ fn setup_counts_shared_agent_dir_once() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
 
-    // 9 agent entries, 8 distinct dirs, 2 skills each.
-    assert_eq!(v["linked"], 16, "{v}");
+    // 9 agent entries, 8 distinct dirs, 3 skills each.
+    assert_eq!(v["linked"], 24, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     assert!(
         v["agents"]
@@ -1752,10 +1881,10 @@ fn setup_counts_shared_agent_dir_once() {
         "shared dir should keep both labels: {v}"
     );
 
-    // The shared dir got one link per skill, not two.
+    // The shared dir got one link per skill, not one per label.
     let shared = std::path::Path::new(&env.home).join(".agents/skills");
     let entries: Vec<_> = std::fs::read_dir(&shared).unwrap().flatten().collect();
-    assert_eq!(entries.len(), 2, "shared dir linked twice: {v}");
+    assert_eq!(entries.len(), 3, "shared dir linked twice: {v}");
     for entry in entries {
         assert!(entry.path().is_symlink(), "{:?}", entry.path());
     }
@@ -1804,7 +1933,7 @@ fn agents_human_lists_all_nine_before_setup() {
             r.stdout
         );
     }
-    assert!(r.stdout.contains("0/2"), "{}", r.stdout);
+    assert!(r.stdout.contains("0/3"), "{}", r.stdout);
     assert!(
         r.stdout
             .contains("`confidant setup --agent <name>` or `confidant setup --agent auto`"),
@@ -1863,7 +1992,7 @@ fn update_dry_run_writes_nothing() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v["dry_run"], true, "{v}");
-    assert_eq!(v["linked"], 16, "{v}");
+    assert_eq!(v["linked"], 24, "{v}");
     assert_eq!(v["update"]["status"], "disabled", "{v}");
 
     assert!(
@@ -1890,7 +2019,7 @@ fn update_dry_run_human_reports_planned_relink() {
     );
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     assert!(
-        r.stdout.contains("would re-link 16 skills"),
+        r.stdout.contains("would re-link 24 skills"),
         "planned relink not reported:\n{}",
         r.stdout
     );

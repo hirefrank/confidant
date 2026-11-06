@@ -215,7 +215,7 @@ fn place_03_fixture_hides_only_the_no_ai_edge_and_its_note() {
 }
 
 /// The checked-in spec 0.4 personal fixture (#745): the default
-/// `personal@0.3` types, their fields and edges, an `entity:` note, and a
+/// built-in personal types, their fields and edges, an `entity:` note, and a
 /// no-ai place. Fake data only.
 fn personal_04_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vaults/personal-0.4")
