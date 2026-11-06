@@ -295,13 +295,18 @@
       .page .story-grid { display: grid; grid-template-columns: .78fr 1.22fr; gap: 70px; align-items: start; }
       .page .story-copy p { margin: 0 0 16px; color: var(--dim); font-size: 18px; line-height: 1.7; }
       .page .story-copy .last-line { color: var(--ink); font-family: var(--disp); font-weight: 700; font-size: 23px; line-height: 1.35; }
-      .page .example { border-radius: 24px; border: 1px solid rgba(245,242,255,.16); background: var(--panel); padding: 28px; max-width: 760px; }
-      .page .example .message { padding: 16px 19px; border-radius: 17px; line-height: 1.55; font-size: 16px; }
-      .page .example .you { max-width: 78%; margin-left: auto; background: #3a2780; }
-      .page .example .agent { max-width: 91%; margin-top: 14px; background: #193d52; border: 1px solid rgba(47,214,192,.3); }
-      .page .example .speaker { display: block; font: 700 12px var(--mono); color: var(--teal); margin-bottom: 7px; }
-      .page .example .you .speaker { color: var(--coral); }
-      .page .example .caption { color: var(--faint); font-size: 12px; margin: 18px 0 0; line-height: 1.5; }
+      .page .handoff { display: grid; grid-template-columns: minmax(0, 1fr) 78px minmax(0, 1fr); gap: 14px; align-items: stretch; }
+      .page .handoff-card { min-width: 0; border-radius: 24px; border: 1px solid rgba(245,242,255,.16); background: var(--panel); padding: 25px; }
+      .page .handoff-card .phase { color: var(--gold); font: 600 12px var(--mono); letter-spacing: .06em; text-transform: uppercase; margin: 0 0 19px; }
+      .page .handoff-card:last-child .phase { color: var(--teal); }
+      .page .handoff-card .message { padding: 15px 17px; border-radius: 16px; line-height: 1.55; font-size: 16px; }
+      .page .handoff-card .you { max-width: 88%; margin-left: auto; background: #3a2780; }
+      .page .handoff-card .agent { max-width: 96%; margin-top: 13px; background: #193d52; border: 1px solid rgba(47,214,192,.3); }
+      .page .handoff-card .speaker { display: block; font: 700 12px var(--mono); color: var(--teal); margin-bottom: 7px; }
+      .page .handoff-card .you .speaker { color: var(--coral); }
+      .page .handoff-bridge { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--teal); text-align: center; font: 600 11px/1.3 var(--mono); }
+      .page .handoff-bridge .arrow { display: grid; place-items: center; width: 43px; height: 43px; border-radius: 50%; background: rgba(47,214,192,.12); border: 1px solid rgba(47,214,192,.35); font: 700 24px var(--disp); }
+      .page .handoff-caption { color: var(--faint); font-size: 12px; line-height: 1.5; margin: 15px 0 0; }
       .page .model-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 30px; }
       .page .model-item { border-top: 2px solid var(--teal); padding: 18px 4px 0; }
       .page .model-item:nth-child(2) { border-color: var(--coral); }
@@ -352,8 +357,10 @@
            the GitHub CTA immediately below. */
         .page nav .btn { display: none; }
         .page .model-grid { grid-template-columns: 1fr; }
-        .page .example { padding: 17px; }
-        .page .example .you, .page .example .agent { max-width: 100%; }
+        .page .handoff { grid-template-columns: 1fr; gap: 12px; }
+        .page .handoff-card { padding: 18px; }
+        .page .handoff-card .you, .page .handoff-card .agent { max-width: 100%; }
+        .page .handoff-bridge .arrow { transform: rotate(90deg); }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -425,19 +432,28 @@
           </div>
         </div>
         <div class="portability-grid">
-          <article><b>One source for many agents</b><p>Connect your agents to the same vault instead of maintaining a separate copy of each relationship for every tool.</p></article>
-          <article><b>People, not accounts</b><p>A person has a story, shared places, and a history with you. They aren't a deal in a sales pipeline.</p></article>
-          <article><b>Portable by design</b><p>The working record is plain text in your Git repo. Read it, diff it, back it up, or move it to another machine.</p></article>
+          <article><b>One source for many agents</b><p>Connect your agents to one vault. Keep one record per person.</p></article>
+          <article><b>People, not accounts</b><p>Remember how you know them, shared places, and moments.</p></article>
+          <article><b>Portable by design</b><p>Plain text in Git. Read it, diff it, back it up, or move it to another device.</p></article>
         </div>
       </div></section>
 
       <section class="block" id="example"><div class="wrap">
         <div class="sec-head"><p class="sec-tag">People first</p><h2>Remember where you <span class="co">left off with someone.</span></h2><p class="sec-sub">Confidant keeps how you know a person, what matters to them, and your history together, so a connected agent can find the details you need.</p></div>
-        <div class="example">
-          <div class="message you"><span class="speaker">You</span>I'm grabbing coffee with Robin tomorrow. What should I remember?</div>
-          <div class="message agent"><span class="speaker">Your agent, using Confidant</span>You last caught up over coffee. Robin mentioned a new climbing project, and you usually climb together on Thursdays.<br /><br />Afterward, I can propose an update to Robin's record for you to approve.</div>
-          <p class="caption">Illustrative exchange using a hypothetical vault. Agent behavior depends on its setup; Confidant provides the record and read tools.</p>
+        <div class="handoff" aria-label="Illustrative handoff between two agents">
+          <article class="handoff-card">
+            <p class="phase">01 · After coffee · Agent A</p>
+            <div class="message you"><span class="speaker">You</span>Robin mentioned a new climbing project today.</div>
+            <div class="message agent"><span class="speaker">Agent A</span>I can add that to Robin's record for you to review.</div>
+          </article>
+          <div class="handoff-bridge" aria-label="You approve the update"><span class="arrow" aria-hidden="true">→</span><span>You approve</span></div>
+          <article class="handoff-card">
+            <p class="phase">02 · Before next meetup · Agent B</p>
+            <div class="message you"><span class="speaker">You</span>What should I remember about Robin?</div>
+            <div class="message agent"><span class="speaker">Agent B</span>Robin mentioned a new climbing project. You usually climb together on Thursdays.</div>
+          </article>
         </div>
+        <p class="handoff-caption">Illustrative workflow. Connected agents can read approved, agent-visible details from the same vault; phrasing depends on each agent's setup.</p>
         <div class="model-grid">
           <div class="model-item"><h3>People first</h3><p>Who they are, how you know them, and what matters to that relationship.</p></div>
           <div class="model-item"><h3>Places and things</h3><p>The places and projects that bring people together, connected back to them.</p></div>
