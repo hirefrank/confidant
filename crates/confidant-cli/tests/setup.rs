@@ -991,21 +991,57 @@ fn update_offline_relinks_without_network() {
 /// answers one request and exits (same pattern as
 /// `update_behind_relinks_nothing`).
 #[cfg(feature = "test-overrides")]
+#[cfg(feature = "test-overrides")]
 fn stub_release_server(tag: &str) -> u16 {
+    stub_release_server_with_assets(tag, None, None)
+}
+
+/// Serve the latest-release JSON plus, optionally, the release assets the
+/// self-update path downloads. Assets live under `/download/`; anything else
+/// is a 404. The accept loop is bounded so the thread exits on its own.
+#[cfg(feature = "test-overrides")]
+fn stub_release_server_with_assets(tag: &str, sums: Option<&str>, installer: Option<&str>) -> u16 {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let body = serde_json::json!({"tag_name": tag}).to_string();
+    let sums = sums.map(str::to_owned);
+    let installer = installer.map(str::to_owned);
     std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
+        for _ in 0..16 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
             let mut buf = [0u8; 2048];
             let _ = stream.read(&mut buf);
+            let request = String::from_utf8_lossy(&buf);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let path = path.split('?').next().unwrap_or(path);
+            let (status, content_type, payload) = if path == "/" {
+                ("200 OK", "application/json", body.as_str())
+            } else if path.ends_with("/sha256.sum") {
+                match sums.as_deref() {
+                    Some(sums) => ("200 OK", "text/plain", sums),
+                    None => ("404 Not Found", "text/plain", "not found"),
+                }
+            } else if path.ends_with("/confidant-cli-installer.sh") {
+                match installer.as_deref() {
+                    Some(installer) => ("200 OK", "text/plain", installer),
+                    None => ("404 Not Found", "text/plain", "not found"),
+                }
+            } else {
+                ("404 Not Found", "text/plain", "not found")
+            };
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
             );
             let _ = stream.write_all(response.as_bytes());
         }
@@ -1388,25 +1424,66 @@ fn fake_dist_install(
     (receipt, bin.join("confidant"))
 }
 
+/// A fixed 64-hex checksum for the fake release archive the stub serves.
+#[cfg(feature = "test-overrides")]
+const TEST_ARCHIVE_HASH: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
+
+/// The archive name the CLI looks up for the platform running the test.
+#[cfg(feature = "test-overrides")]
+fn test_archive_name() -> &'static str {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "confidant-cli-x86_64-unknown-linux-gnu.tar.xz"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "confidant-cli-aarch64-apple-darwin.tar.xz"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "confidant-cli-x86_64-apple-darwin.tar.xz"
+    } else {
+        "confidant-cli-x86_64-unknown-linux-gnu.tar.xz"
+    }
+}
+
+#[cfg(feature = "test-overrides")]
+fn test_sums(hash: &str) -> String {
+    format!("{hash} *{}\n", test_archive_name())
+}
+
+/// The smallest stand-in for a cargo-dist installer: enough shape for the
+/// checksum cross-check, never executed by the tests (the recorder hook
+/// intercepts the run).
+#[cfg(feature = "test-overrides")]
+fn test_installer(hash: &str) -> String {
+    format!("#!/bin/sh\nset -e\n_checksum_style=\"sha256\"\n_checksum_value=\"{hash}\"\n")
+}
+
+/// The stub's `/download` base used by the asset tests.
+#[cfg(feature = "test-overrides")]
+fn stub_download_base(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/download")
+}
+
 #[cfg(all(feature = "test-overrides", not(windows)))]
 #[test]
 fn update_cargo_dist_self_updates_in_place() {
     // #876: a one-liner install replaces itself without a prompt, reports
     // the new version, and does not re-link skills from the old binary.
-    let port = stub_release_server("v999.0.0");
+    let sums = test_sums(TEST_ARCHIVE_HASH);
+    let installer = test_installer(TEST_ARCHIVE_HASH);
+    let port = stub_release_server_with_assets("v999.0.0", Some(&sums), Some(&installer));
     let env = fresh_env();
     let recorder = recorder_path(&env);
     let dir = tempfile::tempdir().unwrap();
-    let (receipt, exe) = fake_dist_install(dir.path(), &dir.path().join("bin"));
+    let bin = dir.path().join("bin");
+    let (receipt, exe) = fake_dist_install(dir.path(), &bin);
     let url = format!("http://127.0.0.1:{port}/");
+    let download = stub_download_base(port);
     let r = run_raw(
         &["update", "--agent", "all"],
         &env,
         &[
             ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            ("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL", download.as_str()),
             ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
             ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
-            ("CONFIDANT_TEST_SELF_UPDATE", "9.9.9"),
             (
                 "CONFIDANT_TEST_COMMAND_RECORDER",
                 recorder.to_str().unwrap(),
@@ -1417,16 +1494,21 @@ fn update_cargo_dist_self_updates_in_place() {
     );
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     assert!(r.stdout.contains("updating in place"), "{}", r.stdout);
-    assert!(r.stdout.contains("updated to 9.9.9"), "{}", r.stdout);
+    assert!(r.stdout.contains("updated to 999.0.0"), "{}", r.stdout);
     assert!(
         r.stdout.contains("Run `confidant setup`"),
         "the new binary must re-link skills: {}",
         r.stdout
     );
     assert!(!r.stderr.contains("[y/N]"), "{}", r.stderr);
-    assert_eq!(
-        std::fs::read_to_string(&recorder).unwrap().trim(),
-        "self-update confidant-cli"
+    let recorded = std::fs::read_to_string(&recorder).unwrap();
+    assert!(
+        recorded.contains("CONFIDANT_CLI_INSTALL_DIR="),
+        "installer run did not pin the receipt prefix: {recorded}"
+    );
+    assert!(
+        recorded.contains(bin.to_str().unwrap()),
+        "installer run named the wrong prefix: {recorded}"
     );
     assert!(
         !PathBuf::from(&env.share).join("skills").exists(),
@@ -1437,20 +1519,22 @@ fn update_cargo_dist_self_updates_in_place() {
 #[cfg(all(feature = "test-overrides", not(windows)))]
 #[test]
 fn update_cargo_dist_dry_run_reports_only() {
+    // The stub serves no assets: a dry run that tried to download would fail.
     let port = stub_release_server("v999.0.0");
     let env = fresh_env();
     let recorder = recorder_path(&env);
     let dir = tempfile::tempdir().unwrap();
     let (receipt, exe) = fake_dist_install(dir.path(), &dir.path().join("bin"));
     let url = format!("http://127.0.0.1:{port}/");
+    let download = stub_download_base(port);
     let r = run_raw(
         &["update", "--agent", "all", "--dry-run"],
         &env,
         &[
             ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            ("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL", download.as_str()),
             ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
             ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
-            ("CONFIDANT_TEST_SELF_UPDATE", "9.9.9"),
             (
                 "CONFIDANT_TEST_COMMAND_RECORDER",
                 recorder.to_str().unwrap(),
@@ -1479,14 +1563,15 @@ fn update_cargo_dist_json_reports_without_self_updating() {
     let dir = tempfile::tempdir().unwrap();
     let (receipt, exe) = fake_dist_install(dir.path(), &dir.path().join("bin"));
     let url = format!("http://127.0.0.1:{port}/");
+    let download = stub_download_base(port);
     let (ok, v, _) = run(
         &["update", "--agent", "all", "--json"],
         &env,
         &[
             ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            ("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL", download.as_str()),
             ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
             ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
-            ("CONFIDANT_TEST_SELF_UPDATE", "9.9.9"),
             (
                 "CONFIDANT_TEST_COMMAND_RECORDER",
                 recorder.to_str().unwrap(),
@@ -1513,26 +1598,35 @@ fn update_cargo_dist_failure_is_a_typed_error() {
     // A failed self-update is an expected, actionable failure: a typed
     // DomainError with a stable code and the one-liner as the fix, never
     // `internal_error`. The human path is the one that self-updates.
-    let port = stub_release_server("v999.0.0");
+    let sums = test_sums(TEST_ARCHIVE_HASH);
+    let installer = test_installer(TEST_ARCHIVE_HASH);
+    let port = stub_release_server_with_assets("v999.0.0", Some(&sums), Some(&installer));
     let env = fresh_env();
+    let recorder = recorder_path(&env);
     let dir = tempfile::tempdir().unwrap();
     let (receipt, exe) = fake_dist_install(dir.path(), &dir.path().join("bin"));
     let url = format!("http://127.0.0.1:{port}/");
+    let download = stub_download_base(port);
     let r = run_raw(
         &["update", "--agent", "all"],
         &env,
         &[
             ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            ("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL", download.as_str()),
             ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
             ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
-            ("CONFIDANT_TEST_SELF_UPDATE", "fail"),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+            ("CONFIDANT_TEST_COMMAND_FAIL", "1"),
         ],
         &[],
         true,
     );
     assert!(!r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     assert!(
-        r.stderr.contains("simulated self-update failure"),
+        r.stderr.contains("simulated installer failure"),
         "{}",
         r.stderr
     );
@@ -1542,6 +1636,113 @@ fn update_cargo_dist_failure_is_a_typed_error() {
         "the fix should name the one-liner: {}",
         r.stderr
     );
+}
+
+#[cfg(all(feature = "test-overrides", not(windows)))]
+#[test]
+fn update_cargo_dist_refuses_an_installer_with_unknown_checksums() {
+    // The installer embeds an archive hash that is not in the release's
+    // sha256.sum: never run it.
+    let sums = test_sums(TEST_ARCHIVE_HASH);
+    let installer = test_installer(&"b".repeat(64));
+    let port = stub_release_server_with_assets("v999.0.0", Some(&sums), Some(&installer));
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let dir = tempfile::tempdir().unwrap();
+    let (receipt, exe) = fake_dist_install(dir.path(), &dir.path().join("bin"));
+    let url = format!("http://127.0.0.1:{port}/");
+    let download = stub_download_base(port);
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            ("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL", download.as_str()),
+            ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
+            ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        true,
+    );
+    assert!(!r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(r.stderr.contains("not in"), "{}", r.stderr);
+    assert!(r.stderr.contains("(E_UPDATE_FAILED)"), "{}", r.stderr);
+    assert!(!recorder.exists(), "an unverified installer was run");
+}
+
+#[cfg(all(feature = "test-overrides", not(windows)))]
+#[test]
+fn update_cargo_dist_refuses_when_checksums_miss_the_platform() {
+    // sha256.sum has no entry for this platform's archive: refuse before
+    // running anything.
+    let sums = format!("{TEST_ARCHIVE_HASH} *source.tar.gz\n");
+    let installer = test_installer(TEST_ARCHIVE_HASH);
+    let port = stub_release_server_with_assets("v999.0.0", Some(&sums), Some(&installer));
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let dir = tempfile::tempdir().unwrap();
+    let (receipt, exe) = fake_dist_install(dir.path(), &dir.path().join("bin"));
+    let url = format!("http://127.0.0.1:{port}/");
+    let download = stub_download_base(port);
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            ("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL", download.as_str()),
+            ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
+            ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        true,
+    );
+    assert!(!r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(r.stderr.contains("do not cover"), "{}", r.stderr);
+    assert!(r.stderr.contains("(E_UPDATE_FAILED)"), "{}", r.stderr);
+    assert!(!recorder.exists(), "an uncovered installer was run");
+}
+
+#[cfg(all(feature = "test-overrides", not(windows)))]
+#[test]
+fn update_cargo_dist_reports_a_missing_installer_download() {
+    // The release metadata is there but the installer asset is not: a typed
+    // failure, and nothing is run.
+    let sums = test_sums(TEST_ARCHIVE_HASH);
+    let port = stub_release_server_with_assets("v999.0.0", Some(&sums), None);
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let dir = tempfile::tempdir().unwrap();
+    let (receipt, exe) = fake_dist_install(dir.path(), &dir.path().join("bin"));
+    let url = format!("http://127.0.0.1:{port}/");
+    let download = stub_download_base(port);
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            ("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL", download.as_str()),
+            ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
+            ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        true,
+    );
+    assert!(!r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(r.stderr.contains("could not download"), "{}", r.stderr);
+    assert!(r.stderr.contains("(E_UPDATE_FAILED)"), "{}", r.stderr);
+    assert!(!recorder.exists(), "a missing installer was run");
 }
 
 #[cfg(feature = "test-overrides")]
@@ -1563,7 +1764,6 @@ fn update_wrong_copy_receipt_refuses_loudly() {
             ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
             ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
             ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
-            ("CONFIDANT_TEST_SELF_UPDATE", "9.9.9"),
             (
                 "CONFIDANT_TEST_COMMAND_RECORDER",
                 recorder.to_str().unwrap(),
@@ -1618,18 +1818,20 @@ fn update_brew_prints_guidance_and_never_self_replaces() {
 #[cfg(feature = "test-overrides")]
 #[test]
 fn update_cargo_dist_offline_never_self_updates() {
+    let port = stub_release_server("v999.0.0");
     let env = fresh_env();
     let recorder = recorder_path(&env);
     let dir = tempfile::tempdir().unwrap();
     let (receipt, exe) = fake_dist_install(dir.path(), &dir.path().join("bin"));
+    let download = stub_download_base(port);
     let r = run_raw(
         &["update", "--agent", "all"],
         &env,
         &[
             ("CONFIDANT_OFFLINE", "1"),
+            ("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL", download.as_str()),
             ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
             ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
-            ("CONFIDANT_TEST_SELF_UPDATE", "9.9.9"),
             (
                 "CONFIDANT_TEST_COMMAND_RECORDER",
                 recorder.to_str().unwrap(),

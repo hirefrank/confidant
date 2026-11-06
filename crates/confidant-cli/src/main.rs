@@ -3793,8 +3793,9 @@ impl InstallMethod {
     }
 
     /// Program + argv to run when the operator confirms the offer. Only
-    /// `cargo install` is offered: a cargo-dist install self-replaces via
-    /// axoupdater (#876), and brew must never be replaced by hand.
+    /// `cargo install` is offered: a cargo-dist install self-replaces from
+    /// its verified release installer (#876), and brew must never be
+    /// replaced by hand.
     fn run_spec(&self) -> Option<(&'static std::ffi::OsStr, &'static [&'static str])> {
         match self {
             InstallMethod::CargoInstall => {
@@ -3831,7 +3832,7 @@ struct InstallDetection {
     stray_receipt: Option<InstallReceipt>,
 }
 
-/// Candidate receipt directories, mirroring the installer/axoupdater
+/// Candidate receipt directories, mirroring the cargo-dist installer's
 /// search: `$XDG_CONFIG_HOME` first, then the platform default
 /// (`%LOCALAPPDATA%` on Windows, `~/.config` elsewhere). Windows is not a
 /// supported target (#502), but detection stays in parity with the
@@ -3856,9 +3857,9 @@ fn receipt_config_roots(
     roots
 }
 
-/// The first existing install receipt, in the same order the installer and
-/// axoupdater look. `None` when no receipt exists (a `cargo install`, brew,
-/// or distro-package install).
+/// The first existing install receipt, in the same order the installer
+/// looks. `None` when no receipt exists (a `cargo install`, brew, or
+/// distro-package install).
 fn install_receipt_path() -> Option<PathBuf> {
     // Integration-test hook: point detection at a known receipt (or at a
     // path that does not exist) without touching the real config dir.
@@ -10410,7 +10411,7 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                             println!("confidant {local} is behind the latest release {tag}; run `{DIST_INSTALLER_ONELINER}`, then re-run `confidant setup`.");
                         } else {
                             println!("confidant {local} is behind the latest release {tag}; updating in place…");
-                            let new_version = self_update_cargo_dist(install_prefix)?;
+                            let new_version = self_update_cargo_dist(install_prefix, tag)?;
                             println!(
                                 "updated to {new_version}. Run `confidant setup` to re-link skills from the new binary."
                             );
@@ -10478,61 +10479,246 @@ fn update_failed(detail: impl Into<String>) -> anyhow::Error {
     )
 }
 
-/// Replace a cargo-dist install in place (#876). axoupdater reads the same
-/// receipt detection used, fetches the latest GitHub Release, and runs the
-/// release installer with the receipt's install prefix pinned, so the binary
-/// that gets replaced is the one this process is running from.
-fn self_update_cargo_dist(install_prefix: &Path) -> anyhow::Result<String> {
-    // Integration-test hook: fake the replace (and record it) so the suite
-    // never downloads a release or runs a real installer.
+/// Release-asset download base (everything before the tag). Integration
+/// tests point this at a local stub so no test touches GitHub.
+fn release_download_base() -> String {
     #[cfg(feature = "test-overrides")]
-    if let Ok(fake) = std::env::var("CONFIDANT_TEST_SELF_UPDATE") {
+    if let Ok(base) = std::env::var("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL") {
+        return base;
+    }
+    "https://github.com/hirefrank/confidant/releases/download".to_owned()
+}
+
+/// The release archive for the platform this binary was built for, matching
+/// `dist-workspace.toml`'s targets. `None` on anything else: self-update
+/// refuses with a typed error whose fix is the one-liner, rather than
+/// guessing at an archive name.
+fn release_target_archive() -> Option<&'static str> {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("confidant-cli-x86_64-unknown-linux-gnu.tar.xz")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("confidant-cli-aarch64-apple-darwin.tar.xz")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("confidant-cli-x86_64-apple-darwin.tar.xz")
+    } else {
+        None
+    }
+}
+
+/// Lowercase hex SHA-256. `sha2` is already in the dependency graph (the
+/// vault's content hash uses it); this reuses it instead of pulling a
+/// checksum crate for one call.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Parse a cargo-dist `sha256.sum` into `(asset name, lowercase hex)`.
+/// Handles both `<hex> *<name>` (GNU binary marker) and `<hex>  <name>`;
+/// malformed lines are skipped, never trusted.
+fn parse_sha256_sum(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let hash = parts.next()?;
+            let name = parts.next()?;
+            if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
+            Some((
+                name.trim_start_matches('*').to_owned(),
+                hash.to_ascii_lowercase(),
+            ))
+        })
+        .collect()
+}
+
+/// The archive checksums a cargo-dist installer embeds
+/// (`_checksum_value="<hex>"`); every one is verified by the installer
+/// itself before it installs anything.
+fn installer_embedded_checksums(script: &str) -> Vec<String> {
+    const MARKER: &str = "_checksum_value=\"";
+    script
+        .match_indices(MARKER)
+        .filter_map(|(start, marker)| {
+            let rest = &script[start + marker.len()..];
+            let end = rest.find('"')?;
+            let value = &rest[..end];
+            (value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
+                .then(|| value.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+/// Verify the downloaded release installer before running it (#876).
+///
+/// cargo-dist 0.32 publishes `sha256.sum` with an entry per archive and per
+/// source tarball, but **no entry for the installer script itself** (checked
+/// against the v0.8.0 assets and the release's `dist-manifest.json`). So:
+///
+/// - If a future release does publish an installer line, verify the script's
+///   SHA-256 against it (the strongest check).
+/// - Otherwise require that every archive checksum the installer embeds is
+///   present in `sha256.sum`, and that this platform's archive is covered.
+///   The installer then re-verifies that archive before installing it, the
+///   same chain the published one-liner uses — but a script whose embedded
+///   hashes disagree with the release checksums is refused here, unrun.
+fn verify_installer(
+    tag: &str,
+    installer: &[u8],
+    sums: &[(String, String)],
+    archive: &str,
+) -> anyhow::Result<()> {
+    const INSTALLER_NAME: &str = "confidant-cli-installer.sh";
+    let installer_sha = sha256_hex(installer);
+    if let Some((_, expected)) = sums.iter().find(|(name, _)| name == INSTALLER_NAME) {
+        if !installer_sha.eq_ignore_ascii_case(expected) {
+            return Err(update_failed(format!(
+                "the release installer for {tag} does not match sha256.sum \
+                 (expected {expected}, got {installer_sha}); refusing to run it"
+            )));
+        }
+        return Ok(());
+    }
+
+    let Some((_, expected)) = sums.iter().find(|(name, _)| name == archive) else {
+        return Err(update_failed(format!(
+            "the release checksums for {tag} do not cover {archive}; refusing to run the installer"
+        )));
+    };
+    let script = String::from_utf8_lossy(installer);
+    let embedded = installer_embedded_checksums(&script);
+    if embedded.is_empty() {
+        return Err(update_failed(format!(
+            "the release installer for {tag} embeds no archive checksums; refusing to run it"
+        )));
+    }
+    let known: BTreeSet<&str> = sums.iter().map(|(_, hash)| hash.as_str()).collect();
+    if let Some(unknown) = embedded.iter().find(|hash| !known.contains(hash.as_str())) {
+        return Err(update_failed(format!(
+            "the release installer for {tag} embeds checksum {unknown}, which is not in \
+             sha256.sum; refusing to run it"
+        )));
+    }
+    if !embedded.iter().any(|hash| hash == expected) {
+        return Err(update_failed(format!(
+            "the release installer for {tag} does not embed the checksum for {archive}; \
+             refusing to run it"
+        )));
+    }
+    Ok(())
+}
+
+/// Download a release asset. Fails closed with an actionable code; the body
+/// is never echoed beyond the URL and the HTTP error.
+fn fetch_release_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(60)))
+        .build()
+        .into();
+    let mut response = agent
+        .get(url)
+        .header("User-Agent", "confidant-cli")
+        .header("Accept", "application/octet-stream")
+        .call()
+        .map_err(|err| update_failed(format!("could not download {url}: {err}")))?;
+    response
+        .body_mut()
+        .read_to_vec()
+        .map_err(|err| update_failed(format!("could not read {url}: {err}")))
+}
+
+/// Write the verified installer to a temp file and run it with the receipt's
+/// install prefix pinned, so it replaces this copy even when the caller's
+/// environment points elsewhere. The installer verifies the platform
+/// archive's checksum itself before installing it.
+fn run_release_installer(installer: &[u8], install_prefix: &Path) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().map_err(|err| {
+        update_failed(format!(
+            "could not create a temp dir for the installer: {err}"
+        ))
+    })?;
+    let script = dir.path().join("confidant-cli-installer.sh");
+    std::fs::write(&script, installer)
+        .map_err(|err| update_failed(format!("could not write the installer: {err}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).map_err(
+            |err| update_failed(format!("could not make the installer executable: {err}")),
+        )?;
+    }
+    // Integration-test hook: record the run instead of executing a real
+    // installer, and reuse the same failure switch as the #376 offer path.
+    // The suite never executes a downloaded installer: a test that forgot
+    // the recorder gets a clear failure instead of running a script.
+    #[cfg(feature = "test-overrides")]
+    {
+        let display = format!(
+            "sh {} (CONFIDANT_CLI_INSTALL_DIR={})",
+            script.display(),
+            install_prefix.display()
+        );
         if let Ok(path) = std::env::var("CONFIDANT_TEST_COMMAND_RECORDER") {
             use std::io::Write as _;
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)?;
-            writeln!(f, "self-update confidant-cli")?;
+            writeln!(f, "{display}")?;
+            if std::env::var("CONFIDANT_TEST_COMMAND_FAIL").is_ok() {
+                return Err(update_failed("simulated installer failure"));
+            }
+            return Ok(());
         }
-        if fake == "fail" {
-            return Err(update_failed("simulated self-update failure"));
-        }
-        return Ok(fake);
+        Err(update_failed(
+            "refusing to run an installer under test-overrides without a command recorder",
+        ))
     }
-
-    let mut updater = axoupdater::AxoUpdater::new_for(DIST_APP_NAME);
-    updater
-        .load_receipt()
-        .map_err(|err| update_failed(format!("could not read the install receipt: {err}")))?;
-    // Detection already checked the same receipt; re-check against the
-    // updater's own view before anything is downloaded or replaced.
-    if !updater
-        .check_receipt_is_for_this_executable()
-        .map_err(|err| update_failed(format!("could not verify the install receipt: {err}")))?
+    #[cfg(not(feature = "test-overrides"))]
     {
-        return Err(anyhow::Error::new(DomainError::conflict(format!(
-            "the cargo-dist install receipt does not cover this binary ({}); refusing to replace it",
-            install_prefix.display()
-        )))
-        .with_fix("Run `confidant update` from the copy the receipt names"));
+        let status = std::process::Command::new("sh")
+            .arg(&script)
+            .env("CONFIDANT_CLI_INSTALL_DIR", install_prefix)
+            .env("CARGO_DIST_FORCE_INSTALL_DIR", install_prefix)
+            .status()
+            .map_err(|err| update_failed(format!("could not run the release installer: {err}")))?;
+        if !status.success() {
+            return Err(update_failed(format!(
+                "the release installer exited with status {status}"
+            )));
+        }
+        Ok(())
     }
-    // The caller already established the install is behind, so skip the
-    // updater's own second release lookup and version comparison.
-    updater.always_update(true);
-    // Keep stdout/stderr clean for the human output below; the installer's
-    // captured output still rides on the error if it fails.
-    updater.disable_installer_output();
-    let result = updater
-        .run_sync()
-        .map_err(|err| update_failed(format!("self-update failed: {err}")))?;
-    match result {
-        Some(result) => Ok(result.new_version.to_string()),
-        // `always_update(true)` makes this unreachable in practice; treat it
-        // as "no newer release" rather than claiming a version we did not
-        // install.
-        None => Ok(env!("CARGO_PKG_VERSION").to_owned()),
-    }
+}
+
+/// Replace a cargo-dist install in place (#876) without an updater
+/// framework: fetch the release's `sha256.sum` and installer, verify the
+/// installer against those checksums, then run it with the receipt prefix
+/// pinned. The installer verifies the platform archive before installing it,
+/// so the binary that lands is the one the release checksums cover.
+fn self_update_cargo_dist(install_prefix: &Path, tag: &str) -> anyhow::Result<String> {
+    let base = release_download_base();
+    let archive = release_target_archive().ok_or_else(|| {
+        update_failed(format!(
+            "no self-update archive is published for {}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+    })?;
+    let sums_body = fetch_release_bytes(&format!("{base}/{tag}/sha256.sum"))?;
+    let sums = parse_sha256_sum(&String::from_utf8_lossy(&sums_body));
+    let installer = fetch_release_bytes(&format!("{base}/{tag}/confidant-cli-installer.sh"))?;
+    verify_installer(tag, &installer, &sums, archive)?;
+    run_release_installer(&installer, install_prefix)?;
+    // The installer installed the release the tag names; report that tag
+    // without its `v` so it reads like `confidant --version`.
+    Ok(tag.trim_start_matches('v').to_owned())
 }
 
 /// Shared tail of `update`: re-link skills from this binary and report.
@@ -11751,9 +11937,9 @@ fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result
 mod tests {
     use super::{
         confirm_yn, git_version_check_from, looks_like_version_or_usage, offerable_update,
-        parse_ahead_behind, parse_git_remotes, parse_git_version, parse_tui_version,
-        reject_unsupported_prefix, sync_push_refspec, AheadBehind, Cli, InstallMethod, JOURNEYS,
-        MIN_GIT_VERSION,
+        parse_ahead_behind, parse_git_remotes, parse_git_version, parse_sha256_sum,
+        parse_tui_version, reject_unsupported_prefix, sha256_hex, sync_push_refspec,
+        verify_installer, AheadBehind, Cli, InstallMethod, JOURNEYS, MIN_GIT_VERSION,
     };
     use clap::CommandFactory;
     use std::path::{Path, PathBuf};
@@ -12217,6 +12403,98 @@ origin\tssh://git@host.example/org/repo.git (push)
         assert_eq!(unknown.update_command(), None);
         assert_eq!(unknown.run_spec(), None);
         assert!(!unknown.self_updates());
+    }
+
+    #[test]
+    fn sha256_hex_matches_a_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn release_checksums_parse_both_sum_styles() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let text = format!(
+            "{a} *confidant-cli-x86_64-unknown-linux-gnu.tar.xz\n\
+             {b}  source.tar.gz\n\
+             not a checksum line\n"
+        );
+        assert_eq!(
+            parse_sha256_sum(&text),
+            vec![
+                (
+                    "confidant-cli-x86_64-unknown-linux-gnu.tar.xz".to_owned(),
+                    a.clone()
+                ),
+                ("source.tar.gz".to_owned(), b),
+            ]
+        );
+        assert!(parse_sha256_sum("").is_empty());
+        assert!(parse_sha256_sum("zz *short").is_empty());
+    }
+
+    #[test]
+    fn installer_verification_prefers_a_published_installer_checksum() {
+        let installer = b"#!/bin/sh\n_checksum_value=\"not-hex\"\n";
+        let sums = vec![(
+            "confidant-cli-installer.sh".to_owned(),
+            sha256_hex(installer),
+        )];
+        assert!(verify_installer(
+            "v9.9.9",
+            installer,
+            &sums,
+            "confidant-cli-x86_64-unknown-linux-gnu.tar.xz"
+        )
+        .is_ok());
+        // A future release that publishes an installer line gets the
+        // strongest check: a mismatch refuses before the fallback.
+        let wrong = vec![("confidant-cli-installer.sh".to_owned(), "0".repeat(64))];
+        let err = verify_installer("v9.9.9", installer, &wrong, "x").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not match sha256.sum"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn installer_verification_cross_checks_embedded_archive_checksums() {
+        let archive = "confidant-cli-x86_64-unknown-linux-gnu.tar.xz";
+        let ours = "a".repeat(64);
+        let other = "b".repeat(64);
+        let sums = vec![
+            (archive.to_owned(), ours.clone()),
+            ("source.tar.gz".to_owned(), other.clone()),
+        ];
+        // Every embedded hash is published, and ours is covered: run.
+        let good = format!("_checksum_value=\"{ours}\"\n_checksum_value=\"{other}\"\n");
+        assert!(verify_installer("v9.9.9", good.as_bytes(), &sums, archive).is_ok());
+        // An embedded hash absent from sha256.sum: refuse.
+        let tampered = format!("_checksum_value=\"{}\"\n", "c".repeat(64));
+        let err = verify_installer("v9.9.9", tampered.as_bytes(), &sums, archive).unwrap_err();
+        assert!(format!("{err:#}").contains("not in sha256.sum"), "{err:#}");
+        // No embedded checksums at all: refuse.
+        let err = verify_installer("v9.9.9", b"#!/bin/sh\n", &sums, archive).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("embeds no archive checksums"),
+            "{err:#}"
+        );
+        // The platform archive is not listed: refuse.
+        let err = verify_installer(
+            "v9.9.9",
+            good.as_bytes(),
+            &sums,
+            "confidant-cli-other.tar.xz",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("do not cover"), "{err:#}");
     }
 
     #[test]

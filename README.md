@@ -204,8 +204,9 @@ run `confidant update` (see [Updating](#updating)). Contributors:
 then follows the install method it detects:
 
 - **One-liner / release installer:** it updates itself in place — the
-  receipt the installer writes says where it lives — and prints the new
-  version. Run `confidant setup` afterwards to re-link skills from the new
+  receipt the installer writes says where it lives, and the installer is
+  checked against the release's published checksums before it runs — then
+  prints the new version. Run `confidant setup` afterwards to re-link skills from the new
   binary. The one-liner, if you prefer to re-run it yourself, is
   `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh`.
 - **Homebrew:** it prints `brew upgrade confidant-cli`; Homebrew owns that
