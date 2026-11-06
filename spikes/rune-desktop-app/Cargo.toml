@@ -1,0 +1,15 @@
+[package]
+name = "confidant-rune-spike"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "THROWAWAY SPIKE: a Rune desktop shell over the Confidant demo vault. Not a product crate — see docs/research/rune-desktop-app-spike.md."
+
+# Its own workspace, like fuzz/: keep Rune's dependency graph (wgpu,
+# winit, edition 2024) out of the main workspace and out of CI's gate.
+[workspace]
+
+[dependencies]
+confidant-core = { path = "../../crates/confidant-core", version = "0.8.0" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "47cb857795c3b1dd5097c15d6161719ae738ddda" }
