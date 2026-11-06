@@ -83,9 +83,10 @@ pub struct Vault {
     /// External packs that failed to load, fail closed (PD12). Converted
     /// to findings in `check.rs`; read commands ignore them.
     pub pack_problems: Vec<packs_external::PackProblem>,
-    /// Vendored packs that are no longer listed. Their type declarations are
-    /// known (so records parse and warn) and their edge kinds/fields warn as
-    /// orphans, but their verbs/rules are not enabled.
+    /// Vendored packs that are no longer listed. Their type declarations
+    /// (0.3+) are known so records parse and warn, and their verbs, fields,
+    /// edge kinds, balance metrics, and `[checks]` keys warn as orphans, but
+    /// their rules are not enabled.
     disabled_packs: Vec<DisabledPackClaims>,
 }
 
@@ -352,9 +353,23 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
             (compiled, Vec::new(), Vec::new(), false)
         };
 
+    // Vendored packs whose listing was removed stay known for orphan
+    // warnings: their verbs, metrics, edge kinds, and fields keep their
+    // owner, and (spec 0.3+) their record types stay parseable. The same
+    // scan feeds `config_findings`: a `[checks]` key the pack declares is
+    // `W_PACK_ORPHAN`, not `E_CONFIG` (#699).
+    let (unlisted_sources, disabled_packs, unlisted_manifests) = match spec {
+        Some(spec) if SpecVersion::is_supported(&config.spec) => {
+            unlisted_pack_claims(root, &config, &pack_registry, spec)
+        }
+        _ => (Vec::new(), Vec::new(), Vec::new()),
+    };
+    let orphan_names: Vec<&str> = disabled_packs.iter().map(|pack| pack.name).collect();
+
     let mut manifests = crate::packs::pack_manifests_for_config();
     manifests.extend(external_manifests);
-    let mut findings = config.config_findings_with(&manifests);
+    manifests.extend(unlisted_manifests);
+    let mut findings = config.config_findings_with_orphans(&manifests, &orphan_names);
 
     // #493 review: a broken lockfile is one finding covering the whole
     // external list (mapped to E_PACK_INVALID), not one Unknown per
@@ -398,17 +413,9 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
             enabled: enabled_names.contains(pack.name()),
         })
         .collect();
-    let mut disabled_packs = Vec::new();
     let spec_03_or_newer = spec.is_some_and(|s| s >= SpecVersion::V03);
     if spec_03_or_newer {
-        let (extra_sources, extra_packs) = unlisted_type_sources(
-            root,
-            &config,
-            &pack_registry,
-            spec.unwrap_or(SpecVersion::V02),
-        );
-        sources.extend(extra_sources);
-        disabled_packs = extra_packs;
+        sources.extend(unlisted_sources);
     }
     let (retired, retired_problems) = if spec_03_or_newer {
         retired_decls(&config.retired_types)
@@ -740,19 +747,29 @@ fn flag_entry_with(
     }
 }
 
-/// Declarations from a vendored pack that is no longer listed. They stay
+/// Claims from a vendored pack that is no longer listed (#699). They stay
 /// known so a disabled pack's records parse and warn instead of turning the
 /// collection into an unknown directory. They are registered only as type
-/// sources and orphan claims, never as enabled packs: rules and writes stay
-/// disabled, while their records/fields/edges warn as orphans. A pack whose
-/// manifest does not verify or support this spec is skipped (its data then
-/// fails closed as an unknown collection).
-fn unlisted_type_sources(
+/// sources, orphan claims, and `[checks]` key owners, never as enabled packs:
+/// rules and writes stay disabled, while their records/fields/edges/keys warn
+/// as orphans. A pack whose manifest does not verify or support this spec is
+/// skipped (its data then fails closed as an unknown collection).
+///
+/// The claims are collected on every supported spec: verbs, metrics, edge
+/// kinds, and fields exist before 0.3, so unlisting a pack must not turn its
+/// data into `E_UNKNOWN_*` on a 0.1 or 0.2 vault. Type sources are only
+/// returned for 0.3+, where a vault may declare pack types.
+#[allow(clippy::type_complexity)]
+fn unlisted_pack_claims(
     root: &Path,
     config: &VaultConfig,
     registered: &PackRegistry,
     spec: SpecVersion,
-) -> (Vec<TypeSource>, Vec<DisabledPackClaims>) {
+) -> (
+    Vec<TypeSource>,
+    Vec<DisabledPackClaims>,
+    Vec<&'static crate::packs::manifest::PackManifest>,
+) {
     let listed: HashSet<&str> = config
         .packs
         .iter()
@@ -775,10 +792,11 @@ fn unlisted_type_sources(
         .map(|retired| retired.collection.as_str())
         .collect();
     let Ok(listing) = paths::read_dir(root, Path::new("packs")) else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
     let mut out = Vec::new();
     let mut packs: Vec<DisabledPackClaims> = Vec::new();
+    let mut manifests = Vec::new();
     for ent in listing.entries {
         if !ent.utf8 || !ent.kind.is_directory() {
             continue;
@@ -799,7 +817,6 @@ fn unlisted_type_sources(
         };
         if manifest.pack.name != name
             || manifest.pack.version != version
-            || manifest.record_types.decls.is_empty()
             || !manifest
                 .pack
                 .requires_spec
@@ -809,24 +826,25 @@ fn unlisted_type_sources(
             continue;
         }
         let pack = crate::packs::manifest_pack::build_manifest_pack(manifest, String::new());
-        let decls: Vec<crate::record_type::RecordTypeDecl> = pack
-            .record_type_decls()
-            .iter()
-            .filter(|decl| {
-                !retired_names.contains(decl.name)
-                    && !retired_prefixes.contains(decl.id_prefix)
-                    && !retired_collections.contains(decl.collection)
-            })
-            .copied()
-            .collect();
-        if decls.is_empty() {
-            continue;
+        if spec >= SpecVersion::V03 {
+            let decls: Vec<crate::record_type::RecordTypeDecl> = pack
+                .record_type_decls()
+                .iter()
+                .filter(|decl| {
+                    !retired_names.contains(decl.name)
+                        && !retired_prefixes.contains(decl.id_prefix)
+                        && !retired_collections.contains(decl.collection)
+                })
+                .copied()
+                .collect();
+            if !decls.is_empty() {
+                out.push(TypeSource {
+                    owner: TypeOwner::Pack(pack.name()),
+                    decls: Box::leak(decls.into_boxed_slice()),
+                    enabled: false,
+                });
+            }
         }
-        out.push(TypeSource {
-            owner: TypeOwner::Pack(pack.name()),
-            decls: Box::leak(decls.into_boxed_slice()),
-            enabled: false,
-        });
         if !packs.iter().any(|existing| existing.name == pack.name()) {
             packs.push(DisabledPackClaims {
                 name: pack.name(),
@@ -835,9 +853,13 @@ fn unlisted_type_sources(
                 fields: pack.fields(),
                 balance_metrics: pack.balance_metrics(),
             });
+            // The manifest also keeps a `[checks]` key the vault still sets
+            // from becoming `E_CONFIG`; `config_findings` reports it as
+            // `W_PACK_ORPHAN` instead.
+            manifests.push(pack.pack_manifest());
         }
     }
-    (out, packs)
+    (out, packs, manifests)
 }
 
 fn push_type_problems(findings: &mut Vec<Finding>, problems: &[TypeProblem]) {
