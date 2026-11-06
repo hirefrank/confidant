@@ -1,6 +1,6 @@
 ---
 name: "confidant"
-description: "Standing rules for every Confidant interaction: plain English before internal vocabulary, every operator decision as a structured choice with a marked recommendation and rationale, propose → confirm → apply, status stated as outcomes, routing to setup, pack-author, qmd-search, or report-a-problem, and setup's closing jumping-off point with the discipline that keeps opportunities surfacing later. Load this before any other Confidant skill."
+description: "Standing rules for every Confidant interaction: plain English before internal vocabulary, every operator decision as a structured choice with a marked recommendation and rationale, propose → confirm → apply, status stated as outcomes, routing to setup, pack-author, qmd-search, or report-a-problem, setup's closing jumping-off point with the discipline that keeps opportunities surfacing later, and the inferred sync posture that keeps multiple writers safe. Load this before any other Confidant skill."
 ---
 
 # Working with the operator
@@ -28,6 +28,9 @@ human word. Do not recite a glossary.
 | `no-ai` | marked private — never read by AI |
 | spec | the file-format version |
 | edge | a relationship between two pages |
+| fast-forward | catch up to the shared copy without creating a merge |
+| diverged | both copies have changes the other one does not |
+| push / pull | send your changes to the shared copy / bring its changes here |
 
 - Prefer the human word wherever meaning survives: "the vault" or "the
   folder that holds your notes", never "the vault directory at …" when the
@@ -210,6 +213,105 @@ Discipline:
   recommendation and its rationale — and no `no-ai` record is ever named
   as the reason for one.
 
+## 7. Sync posture: infer the topology, then state the rule
+
+How often to sync is not a frequency preference. It follows from **how many
+writers exist**. Infer the topology before setup's completion report, then
+state the posture in the operator's terms.
+
+### Infer first, ask last
+
+Read, do not ask:
+
+- **Remote?** Is there an `origin` or another remote? `confidant sync
+  --json` fails with `E_NO_REMOTE` when no remote or no upstream is
+  configured, and `status` says which branch follows what.
+- **Other machines?** Recent commit authors and timestamps, `doctor`'s
+  ahead/behind line, and commits that arrive between your own writes show
+  another writer. A second clone on the same host counts too.
+- **Other agents?** `confidant agents` and the setup output list the agents
+  installed here; more than one is a multi-agent signal, so ask whether they
+  all write to this vault.
+
+Classify into one of four, and name the evidence you used:
+
+| Topology | Looks like | Posture |
+|---|---|---|
+| Local only | no remote | No copy leaves this machine: recommend a private remote before anything else, and say plainly that the vault dies with the disk. |
+| Single writer | a remote, and every recent commit is this instance's | Push after each applied batch; a pull is a formality, needed only when returning to a machine that has been idle. |
+| Two writers | a remote plus commits from another machine or clone, or the operator says so | Fetch and fast-forward before any read that matters and before every write batch; push immediately after writes; stop on divergence. |
+| Multi-agent | two or more agents write here, or agents write on several machines | The two-writer rules, plus a one-time tag (`--request-id`) on every write so a retry after a failed push replays instead of duplicating. |
+
+Ask only what the evidence cannot settle, as one structured choice: "Do you
+also use Confidant on another computer, or does anyone else write to this
+vault?" — options in the operator's terms, a recommendation drawn from the
+evidence, and "Not sure" (use the evidence, and say what would change it).
+
+A second machine used mainly for reading still needs the fetch-before-read
+half of the two-writer posture, even though it never commits.
+
+### State it in the completion report
+
+One plain-English line, then the rule you will follow. Never a git lecture,
+and never "two writers" without saying which two:
+
+- **Local only:** "There is no copy off this machine, so losing the laptop
+  loses the vault. Recommended: add a private remote (GitHub or another
+  host) so it survives."
+- **Single writer:** "Your vault backs up to its private remote after each
+  batch of changes; you don't need to remember to sync."
+- **Two writers:** "This machine and your laptop can both change the vault.
+  I'll catch up before anything that matters and before each batch, then
+  back it up as part of the same confirmation. If the two copies have
+  diverged, I'll stop and show you both sides instead of writing on a stale
+  copy."
+- **Multi-agent:** the two-writer line, plus "every change gets a one-time
+  tag, so a retry can't duplicate it."
+
+### Execute it on events, not a timer
+
+Hook sync onto moments that already exist; a timer is a backstop, not the
+mechanism.
+
+- **Before a write batch**, and before any read that matters (a
+  pre-meeting brief, a "what changed" pass): fetch, and fast-forward when
+  the posture calls for it.
+- **After an applied batch:** push. Fold it into the batch's own propose →
+  confirm → apply — the confirmation says "and back this up to your private
+  remote" — so one yes covers both and the operator never has to remember.
+- **The daily routine, if they have one, is the heartbeat:** its first step
+  is the fetch, its last the push.
+- **A periodic fetch is a backstop** for an idle machine. Do not install a
+  timer unless the operator chooses one, and never a background job that
+  writes without a confirmation.
+
+Commands: `confidant sync` reports ahead/behind and refuses on divergence;
+`confidant sync --pull` fast-forwards; `confidant sync --push` pushes. Both
+are confirmed network writes — pass `--yes` only after the operator has
+confirmed that exact step.
+
+### Divergence is a stop sign
+
+If the branch has diverged, or the tree is dirty, stop the batch. Say what
+exists on each side, what is safe, and the exact recovery step. Never merge,
+rebase, force-push, or write around it without an explicit choice, and never
+let an agent "resolve" history silently. In a two-writer or multi-agent
+posture, never write on a stale base.
+
+### Sync's report should name the posture
+
+`confidant sync` reports ahead/behind and the action, but it does not know
+the install topology. So:
+
+- surface the posture yourself, in the operator's words, whenever sync's
+  result matters — including whether the vault is *inside* it ("the last
+  pushed change is three days old; that is outside your posture");
+- treat the missing posture line in `sync`/`status` as a product observation
+  to mention to the operator, not as something to work around with invented
+  flags, hooks, or vault edits;
+- do not change the CLI here: this skill is guidance, and the report change
+  is a separate product decision.
+
 ## Routing
 
 Name the capability in plain English and say why you are switching; do not
@@ -227,7 +329,13 @@ Handoff notes:
 
 - **Setup** closes with the jumping-off point in section 6: three to five
   routines from this operator's actual vault and sources — and the same
-  discipline keeps later opportunities surfacing, one at a time.
+  discipline keeps later opportunities surfacing, one at a time. It also
+  infers and states the sync posture from section 7, because the operator
+  should not have to know to ask how the copies stay in step.
+- **Sync**: execute the posture on events, not a timer (section 7). Fetch
+  before writes and before reads that matter when there is more than one
+  writer; push as part of the batch confirmation; stop loudly on
+  divergence. Surface the posture in the operator's words.
 - **Pack authoring**: the operator reviews the claims and the pack's skill
   text like code. Never install, update, or commit a pack without explicit
   confirmation.
