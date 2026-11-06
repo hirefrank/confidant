@@ -131,6 +131,100 @@ fn path_with_fake_qmd(dir: &Path) -> std::ffi::OsString {
     path
 }
 
+/// Run git in `vault` for fixture setup (#725 tests). Fake identity only.
+#[cfg(unix)]
+fn run_git(vault: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .arg("-C")
+        .arg(vault)
+        .args(args)
+        .output()
+        .expect("git should run")
+}
+
+/// `git init` + one commit, returning the commit id. Fake identity only.
+#[cfg(unix)]
+fn init_and_commit(vault: &Path, message: &str) -> String {
+    assert!(run_git(vault, &["init", "-q"]).status.success());
+    assert!(run_git(vault, &["add", "-A"]).status.success());
+    let out = run_git(
+        vault,
+        &[
+            "-c",
+            "user.name=Confidant Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_git(vault, &["rev-parse", "HEAD"]);
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[cfg(unix)]
+fn commit_empty(vault: &Path, message: &str) -> String {
+    let out = run_git(
+        vault,
+        &[
+            "-c",
+            "user.name=Confidant Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_git(vault, &["rev-parse", "HEAD"]);
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Write the marker `qmd-index.py` records (#725). Fake data only.
+#[cfg(unix)]
+fn write_build_marker(vault: &Path, commit: &str) {
+    write_build_marker_with_embed(vault, commit, true);
+}
+
+#[cfg(unix)]
+fn write_build_marker_with_embed(vault: &Path, commit: &str, embedded: bool) {
+    std::fs::create_dir_all(vault.join(".confidant")).unwrap();
+    std::fs::write(
+        vault.join(".confidant/qmd-build.json"),
+        serde_json::json!({
+            "commit": commit,
+            "built_at": "2026-11-06T00:00:00Z",
+            "embedded": embedded,
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// A git vault whose corpus build marker matches HEAD.
+#[cfg(unix)]
+fn make_current_vault(vault: &Path) -> String {
+    let head = init_and_commit(vault, "fixture");
+    write_build_marker(vault, &head);
+    head
+}
+
 #[cfg(unix)]
 #[test]
 fn doctor_qmd_present_without_corpus_points_at_the_skill() {
@@ -162,6 +256,7 @@ fn doctor_qmd_corpus_without_vectors_points_at_skill_wrapper() {
     let vault_dir = tempfile::tempdir().unwrap();
     let vault = vault_dir.path().join("vault");
     common::copy_dir(&demo(), &vault);
+    make_current_vault(&vault);
     std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
     // The probe skips `qmd status` until the store exists (some qmd
     // versions create an empty index file as a side effect); a missing
@@ -201,6 +296,7 @@ fn doctor_qmd_with_vectors_reports_ready() {
     let vault_dir = tempfile::tempdir().unwrap();
     let vault = vault_dir.path().join("vault");
     common::copy_dir(&demo(), &vault);
+    make_current_vault(&vault);
     std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
     // The probe only runs once the store file exists.
     std::fs::create_dir_all(vault.join(".confidant/qmd")).unwrap();
@@ -241,6 +337,7 @@ fn doctor_qmd_status_failure_does_not_point_at_embed() {
     let vault_dir = tempfile::tempdir().unwrap();
     let vault = vault_dir.path().join("vault");
     common::copy_dir(&demo(), &vault);
+    make_current_vault(&vault);
     std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
     std::fs::create_dir_all(vault.join(".confidant/qmd")).unwrap();
     std::fs::write(vault.join(".confidant/qmd/index.sqlite"), b"fake").unwrap();
@@ -286,4 +383,112 @@ fn doctor_qmd_stub_on_path_is_not_trusted() {
     assert!(msg.contains("confidant find"), "{msg}");
     let fix = c["fix"].as_str().expect("fix field missing");
     assert!(fix.contains("npm install -g @tobilu/qmd"), "{fix}");
+}
+
+/// #725: a corpus built from an older HEAD is stale; doctor says how far
+/// behind it is instead of reporting search as ready.
+#[cfg(unix)]
+#[test]
+fn doctor_qmd_warns_when_index_is_commits_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fake_qmd(dir.path());
+    let vault_dir = tempfile::tempdir().unwrap();
+    let vault = vault_dir.path().join("vault");
+    common::copy_dir(&demo(), &vault);
+    let built = make_current_vault(&vault);
+    assert!(!built.is_empty());
+    // Move HEAD without changing vault content: the build is now behind.
+    commit_empty(&vault, "second");
+    std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
+
+    let v = run_doctor(
+        &vault,
+        &path_with_fake_qmd(dir.path()),
+        &[("QMD_FAKE_VECTORS", "3")],
+    );
+    let c = check(&v, "qmd-search").expect("qmd-search check missing");
+    assert_eq!(c["status"], "warning", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("search index is 1 commit behind"), "{msg}");
+    assert!(msg.contains("vault HEAD"), "{msg}");
+    let fix = c["fix"].as_str().expect("fix field missing");
+    assert!(fix.contains("qmd-index.py"), "{fix}");
+    assert!(fix.contains("--embed"), "{fix}");
+    assert!(fix.contains("verify with one query"), "{fix}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_qmd_current_index_is_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fake_qmd(dir.path());
+    let vault_dir = tempfile::tempdir().unwrap();
+    let vault = vault_dir.path().join("vault");
+    common::copy_dir(&demo(), &vault);
+    make_current_vault(&vault);
+    std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
+
+    let v = run_doctor(
+        &vault,
+        &path_with_fake_qmd(dir.path()),
+        &[("QMD_FAKE_VECTORS", "3")],
+    );
+    let c = check(&v, "qmd-search").expect("qmd-search check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("index current with the vault HEAD"), "{msg}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_qmd_current_index_without_embed_is_not_silent_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fake_qmd(dir.path());
+    let vault_dir = tempfile::tempdir().unwrap();
+    let vault = vault_dir.path().join("vault");
+    common::copy_dir(&demo(), &vault);
+    let head = init_and_commit(&vault, "fixture");
+    write_build_marker_with_embed(&vault, &head, false);
+    std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
+
+    let v = run_doctor(
+        &vault,
+        &path_with_fake_qmd(dir.path()),
+        &[("QMD_FAKE_VECTORS", "3")],
+    );
+    let c = check(&v, "qmd-search").expect("qmd-search check missing");
+    // #725: a rebuild that skipped --embed leaves vectors on old content.
+    assert_eq!(c["status"], "warning", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("without `--embed`"), "{msg}");
+    assert!(msg.contains("vector results may be incomplete"), "{msg}");
+    let fix = c["fix"].as_str().expect("fix field missing");
+    assert!(fix.contains("--embed"), "{fix}");
+}
+
+/// #725: a corpus with no build record (built by an older skill, or a
+/// failed rebuild) is unknown, never a silent ok.
+#[cfg(unix)]
+#[test]
+fn doctor_qmd_missing_build_marker_is_not_silent_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fake_qmd(dir.path());
+    let vault_dir = tempfile::tempdir().unwrap();
+    let vault = vault_dir.path().join("vault");
+    common::copy_dir(&demo(), &vault);
+    init_and_commit(&vault, "fixture");
+    std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
+
+    let v = run_doctor(
+        &vault,
+        &path_with_fake_qmd(dir.path()),
+        &[("QMD_FAKE_VECTORS", "3")],
+    );
+    let c = check(&v, "qmd-search").expect("qmd-search check missing");
+    assert_eq!(c["status"], "warning", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("freshness is unknown"), "{msg}");
+    assert!(msg.contains("no build record"), "{msg}");
+    let fix = c["fix"].as_str().expect("fix field missing");
+    assert!(fix.contains("qmd-index.py"), "{fix}");
 }

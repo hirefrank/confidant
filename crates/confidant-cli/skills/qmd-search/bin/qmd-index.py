@@ -45,6 +45,12 @@ until this script reruns. In a ledger file, an edited or removed vault line
 now costs only the corpus lines that no longer align: the line map is built
 from a text index and every other line still resolves (fail closed per
 line), and a rerun clears it.
+
+Each successful build records the vault HEAD it was built from (commit,
+UTC time, and whether `--embed` ran) in `<vault>/.confidant/qmd-build.json`
+(#725). `confidant doctor` compares that record with the live HEAD and warns
+"search index is N commits behind", so a missed manual rebuild is visible
+instead of silent.
 """
 import argparse
 import json
@@ -53,10 +59,12 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 COLLECTION = "confidant"
 CORPUS_REL = os.path.join(".confidant", "qmd-corpus")
 STORE_REL = os.path.join(".confidant", "qmd")
+BUILD_MARKER_REL = os.path.join(".confidant", "qmd-build.json")
 LEDGER_SUFFIX = ".cfd"
 
 
@@ -210,6 +218,51 @@ def stage_cleared_corpus(vault, cli=None):
     return corpus, len(record_files), ledger_written
 
 
+def vault_head(vault):
+    """The vault's current git HEAD, or None (no git, no repo, no commit)."""
+    git = shutil.which("git")
+    if git is None:
+        return None
+    try:
+        p = subprocess.run([git, "-C", vault, "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    commit = (p.stdout or "").strip()
+    return commit if p.returncode == 0 and commit else None
+
+
+def record_build_head(vault, embedded=False):
+    """Record the vault HEAD this corpus was built from (#725).
+
+    `confidant doctor` reads `<vault>/.confidant/qmd-build.json` and compares
+    its commit with the live HEAD, so a missed rebuild shows up as "search
+    index is N commits behind" instead of silently stale results. `embedded`
+    records whether this build ran `--embed`, because a corpus rebuild
+    without it leaves vectors pointing at the previous content. The record
+    is best effort: a write failure leaves the index correct but the
+    staleness signal missing, so it is a loud warning, never a silent skip.
+    """
+    path = os.path.join(vault, BUILD_MARKER_REL)
+    payload = {
+        "commit": vault_head(vault),
+        "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "embedded": bool(embedded),
+    }
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+            f.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except OSError as e:
+        print(f"warning: could not record the built HEAD at {path}: {e}",
+              file=sys.stderr)
+
+
 def qmd_store_paths(vault):
     """QMD's own index store lives under the vault, never in ~/.cache."""
     store = os.path.join(vault, STORE_REL)
@@ -356,6 +409,10 @@ def main():
     if args.embed:
         print("embedding (first run downloads models)...")
         run_qmd(["embed"], env)
+    # #725: record the HEAD this corpus was built from so `doctor` can warn
+    # when the index is behind. Only after staging + registration + embed
+    # succeeded: a failed embed must not look fresh.
+    record_build_head(vault, embedded=args.embed)
     print("done. query with: bin/qmd-query.py --vault "
           + vault + ' "your question"')
 

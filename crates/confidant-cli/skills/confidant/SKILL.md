@@ -340,8 +340,11 @@ Handoff notes:
   text like code. Never install, update, or commit a pack without explicit
   confirmation.
 - **Search**: present the tradeoffs before opting in — a second toolchain
-  (Node) and multi-GB model downloads. Re-index after any vault-changing
-  work in the session, and after a pull that brought new commits.
+  (Node) and multi-GB model downloads.
+- **Derived state**: the search index is derived from the vault. After any
+  vault-changing event in the session — writes you applied, or a pull that
+  brought new commits — re-run the index/embed step and verify it with one
+  query before reporting done; `doctor` warns when the index is behind.
 - **Problem reports**: never paste vault content into an issue. Use sizes,
   finding codes, and redacted snippets.
 

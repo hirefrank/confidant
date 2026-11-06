@@ -3166,6 +3166,8 @@ fn qmd_setup_note() -> Option<String> {
 /// `<vault>/.confidant/qmd-corpus/` — the QMD search corpus (ADR-6).
 const QMD_CORPUS_REL: &str = ".confidant/qmd-corpus";
 const QMD_STORE_REL: &str = ".confidant/qmd";
+/// #725: the vault HEAD `qmd-index.py` recorded when it built the corpus.
+const QMD_BUILD_MARKER_REL: &str = ".confidant/qmd-build.json";
 
 pub(crate) fn ensure_corpus_gitignored(root: &Path) -> Result<(), DomainError> {
     let git_dir = std::process::Command::new("git")
@@ -6709,6 +6711,108 @@ fn qmd_state() -> QmdState {
     }
 }
 
+/// #725: how the corpus build compares with the vault's current HEAD.
+/// `Unknown` is never "ok": a corpus with no usable build record (built by
+/// an older skill, or by a failed rebuild) still gets a warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CorpusFreshness {
+    Current { built_at: String, embedded: bool },
+    Behind { commits: u64, built_at: String },
+    Unknown(String),
+}
+
+/// `git -C <root> rev-parse HEAD`, or `None` when the vault has no git HEAD.
+fn git_head(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!head.is_empty()).then_some(head)
+}
+
+/// Commits reachable from `to` but not from `from`. `None` when git cannot
+/// compare (the build commit is not in this history, e.g. after a rebase).
+fn git_commits_between(root: &Path, from: &str, to: &str) -> Option<u64> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-list", "--count", &format!("{from}..{to}")])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Compare `<vault>/.confidant/qmd-build.json` (written by `qmd-index.py`)
+/// with the live HEAD (#725). A missing or unreadable record is `Unknown`,
+/// never a silent `Current`: the caller reports it at warn level.
+fn corpus_freshness(root: &Path) -> CorpusFreshness {
+    let raw = match std::fs::read_to_string(root.join(QMD_BUILD_MARKER_REL)) {
+        Ok(raw) => raw,
+        Err(_) => {
+            return CorpusFreshness::Unknown(
+                "no build record; re-run the index step to record one".to_owned(),
+            );
+        }
+    };
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => {
+            return CorpusFreshness::Unknown(
+                "the build record is unreadable; rebuild it".to_owned(),
+            );
+        }
+    };
+    let built_at = value["built_at"]
+        .as_str()
+        .unwrap_or("unknown time")
+        .to_owned();
+    let built = value["commit"]
+        .as_str()
+        .map(str::trim)
+        .filter(|commit| !commit.is_empty());
+    let embedded = value["embedded"].as_bool().unwrap_or(false);
+    let Some(built) = built else {
+        return CorpusFreshness::Unknown(
+            "the corpus was built before the vault had a commit".to_owned(),
+        );
+    };
+    let Some(current) = git_head(root) else {
+        return CorpusFreshness::Unknown("cannot read the vault's git HEAD".to_owned());
+    };
+    if built == current {
+        return CorpusFreshness::Current { built_at, embedded };
+    }
+    match git_commits_between(root, built, &current) {
+        Some(commits) if commits > 0 => CorpusFreshness::Behind { commits, built_at },
+        // 0 with different commits means the recorded build is not behind
+        // (a rewound or replaced history); do not claim "current".
+        Some(_) => CorpusFreshness::Unknown(
+            "the build commit is not an ancestor of the current HEAD".to_owned(),
+        ),
+        None => {
+            CorpusFreshness::Unknown("the build commit is not in this vault's history".to_owned())
+        }
+    }
+}
+
+/// The rebuild instruction shared by every staleness warning.
+fn qmd_rebuild_fix(root: &Path) -> String {
+    format!(
+        "Run \"$(confidant which --skills-dir)\"/qmd-search/bin/qmd-index.py \
+         --vault \"{}\" --embed, then verify with one query",
+        root.display()
+    )
+}
+
 /// #386: informational `qmd` search-availability check. qmd is optional,
 /// so a missing qmd is `ok` — the same rule as the offline staleness check:
 /// it just means search falls back to `confidant find` (see
@@ -6717,10 +6821,15 @@ fn qmd_state() -> QmdState {
 /// semantic search and a corpus built by the `qmd-search` skill is needed
 /// to enable it, so an `ok` badge on that message is easy to miss.
 ///
-/// Reports, in order: qmd on PATH? corpus built? embeddings present?
+/// Reports, in order: qmd on PATH and working (#715)? corpus built?
+/// corpus built from the current HEAD (#725)? embeddings present?
 /// (BM25 keyword search is ready without embeddings; semantic/hybrid
 /// ranking needs the skill wrapper's `--embed`, not a bare `qmd embed`,
 /// because QMD's store is relocated under the vault. #666)
+///
+/// Staleness wins over "ready": a corpus built from an older HEAD is a
+/// warning even when it has vectors, and a missing/unreadable build record
+/// is `unknown`, never a silent `ok` (#725).
 fn qmd_search_check(root: &Path) -> DoctorCheck {
     const ID: &str = "qmd-search";
     const INSTALL_HINT: &str = "npm install -g @tobilu/qmd";
@@ -6772,16 +6881,55 @@ fn qmd_search_check(root: &Path) -> DoctorCheck {
             ),
         };
     }
+    // #725: staleness is checked before the embeddings probe, because a
+    // stale index is never "ready" even when it has vectors.
+    match corpus_freshness(root) {
+        CorpusFreshness::Behind { commits, built_at } => {
+            return DoctorCheck {
+                id: ID,
+                status: "warning",
+                message: format!(
+                    "search index is {commits} commit{} behind the vault HEAD \
+                     (last built {built_at}); results may be incomplete or out of date",
+                    if commits == 1 { "" } else { "s" }
+                ),
+                fix: Some(qmd_rebuild_fix(root)),
+            };
+        }
+        CorpusFreshness::Unknown(reason) => {
+            return DoctorCheck {
+                id: ID,
+                status: "warning",
+                message: format!(
+                    "search index freshness is unknown ({reason}); rebuild it to record the HEAD"
+                ),
+                fix: Some(qmd_rebuild_fix(root)),
+            };
+        }
+        CorpusFreshness::Current {
+            embedded: false, ..
+        } => {
+            return DoctorCheck {
+                id: ID,
+                status: "warning",
+                message: "search index is current with the vault HEAD but was last built \
+                          without `--embed`; vector results may be incomplete"
+                    .to_owned(),
+                fix: Some(qmd_rebuild_fix(root)),
+            };
+        }
+        CorpusFreshness::Current { .. } => {}
+    }
     match qmd_embedded_vectors(root, &qmd) {
         Some(n) if n > 0 => ok(format!(
             "hybrid/vector search available ({n} embedded vectors); \
-             keyword (BM25) search is also ready"
+             keyword (BM25) search is also ready; index current with the vault HEAD"
         )),
         Some(_) => DoctorCheck {
             id: ID,
             status: "ok",
-            message: "keyword (BM25) search ready; semantic/hybrid ranking is optional \
-                      and not enabled (no embeddings)"
+            message: "keyword (BM25) search ready; index current with the vault HEAD; \
+                      semantic/hybrid ranking is optional and not enabled (no embeddings)"
                 .to_owned(),
             // #666: a bare `qmd embed` would target QMD's default store.
             // This project relocates QMD under the vault via
@@ -8763,6 +8911,31 @@ fn completion_brief(cli: &Cli, vault: Option<&Path>) -> CompletionBrief {
             "QMD corpus: {}; last modified {modified}.",
             path.display()
         ));
+        // #725: the doctor check is the safety net, but `setup`/`status`
+        // print this brief, so state staleness here too.
+        if let Some(root) = vault {
+            match corpus_freshness(root) {
+                CorpusFreshness::Current { built_at, embedded } => {
+                    if embedded {
+                        search_lines.push(format!(
+                            "Index current with the vault HEAD (built {built_at})."
+                        ));
+                    } else {
+                        search_lines.push(format!(
+                            "Index built {built_at} is current with the vault HEAD but was \
+                             last built without `--embed`; vector results may be incomplete."
+                        ));
+                    }
+                }
+                CorpusFreshness::Behind { commits, built_at } => search_lines.push(format!(
+                    "Index is {commits} commit{} behind the vault HEAD (built {built_at}); rebuild before relying on ranked results.",
+                    if commits == 1 { "" } else { "s" }
+                )),
+                CorpusFreshness::Unknown(reason) => search_lines.push(format!(
+                    "Index freshness is unknown ({reason}); rebuild to record the HEAD."
+                )),
+            }
+        }
         search_lines.push(
             "Search results are a snapshot from that time. Refresh the corpus after changes; exact lookups (`resolve`, `context`, `find`) read the live vault."
                 .to_owned(),
