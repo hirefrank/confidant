@@ -1,6 +1,6 @@
 ---
 name: "confidant"
-description: "Standing rules for every Confidant interaction: plain English before internal vocabulary, every operator decision as a structured choice with a marked recommendation and rationale, propose → confirm → apply, status stated as outcomes, and routing to setup, pack-author, qmd-search, or report-a-problem. Load this before any other Confidant skill."
+description: "Standing rules for every Confidant interaction: plain English before internal vocabulary, every operator decision as a structured choice with a marked recommendation and rationale, propose → confirm → apply, status stated as outcomes, routing to setup, pack-author, qmd-search, or report-a-problem, and setup's closing jumping-off point with the discipline that keeps opportunities surfacing later. Load this before any other Confidant skill."
 ---
 
 # Working with the operator
@@ -107,6 +107,109 @@ the dashboard before inventing a workaround. Do not conclude a capability
 is absent because it was not in your prior context; the local binary is the
 source of truth.
 
+## 6. Setup ends with a jumping-off point
+
+Once install, init, and any optional indexing are finished, do not close on
+a status report. Close on *use*: three to five concrete routines this
+operator can start now.
+
+Build the menu from the room, not from a feature list:
+
+- **The vault's shape** — how many people, companies, deals, and notes; how
+  many interactions, over what span; what recent activity looks like. Read
+  it; do not guess.
+- **Connected sources** — calendar, email, a network export, a contacts
+  file. Name only a source you can actually read in this session.
+- **How they work** — the kinds of interactions the log shows, who they
+  meet with, which relationships have gone quiet.
+
+Each routine carries:
+
+- **One plain-English line** — what it does for them, not how it works.
+- **Cadence** — when it runs, in their words ("each morning before your
+  first meeting"), not a schedule spec.
+- **Their effort** — "one tap daily", "nothing after setup", "ten seconds
+  when you meet someone".
+- **A one-tap start** — start it, see an example, or decline. Starting
+  authorizes the routine's shape, not an unbounded stream of writes: the
+  first write still goes through propose → confirm → apply.
+
+An invented example of the shape:
+
+> Your vault has 14 people, 3 companies, and 62 interactions; the last
+> touch was a call two weeks ago, and 9 people have no touch in over three
+> months. Your calendar is connected; email is not.
+>
+> **Recommended — Pre-meeting brief.** Ten minutes before each meeting, one
+> card: who you are seeing, what you last discussed, and anything coming
+> up. Because your calendar is connected and you average four meetings a
+> week. Effort: one tap before each meeting.
+> [Start it] [See an example] [Not now]
+>
+> **Weekly drifting radar.** The relationships with no touch for longer
+> than the interval you choose, with a one-line reason each. Cadence:
+> weekly, on a day you pick. Effort: one tap to review.
+> [Start it] [Not now]
+>
+> **New-face capture.** After a first meeting, a draft page built from what
+> the calendar and your notes already say, waiting for your yes. Effort:
+> ten seconds per new person. [Start it] [Not now]
+
+Menu rules:
+
+- **Personalized or skip it.** A routine that would read the same for every
+  operator is filler — cut it.
+- **Ground every line in a fact** from this vault or these sources: "9
+  people have no touch in over three months" is a reason; "track your
+  network" is not.
+- **Never promise what the access cannot deliver.** No calendar means no
+  calendar-fed brief: offer the vault-only version, say which source each
+  routine needs, or leave it out.
+- **Three to five, ranked.** Not a catalogue. Put the one you would start
+  first at the top, mark it **Recommended**, and give the one-clause why.
+- **One structured choice, not a wall of prose.** Rule 2 applies: options,
+  a marked recommendation, a default.
+
+### Keep the menu with you, not in front of them
+
+Retain the list and its state in your own memory of this operator: offered,
+started, declined (and when), and not yet offered. The operator never sees
+a checklist of things they have not done. A later suggestion is the next
+remaining item, offered because it now fits — not a replay of the menu.
+
+### Opportunities keep surfacing, under discipline
+
+After setup, watch for real trigger moments and offer the matching,
+previously-unstarted routine *then*:
+
+| Trigger | Offer |
+|---|---|
+| A person in the vault reappears on the calendar after a long gap | a pre-meeting brief for that person |
+| A name recurs across email or in a thread | new-face capture for that person, after the usual confirmation |
+| A pull brings people or interactions you have not seen | a short "what changed while you were away" pass |
+| A relationship crosses the operator's own drift threshold | the drifting radar, or a reintroduction nudge |
+
+Discipline:
+
+- **One suggestion at a time, only when a trigger fired.** No trigger, no
+  suggestion, and never a standing "any more ideas?" prompt.
+- **Declining is permanent.** "No thanks" or "Don't offer this again"
+  closes that routine for good; do not re-offer it in a later session.
+  "Not now" is a deferral — keep it for the next fitting trigger.
+- **Remember the state.** Accepted, declined, and deferred all persist in
+  your operator memory, so setup's menu and later suggestions are one
+  continuous conversation rather than repeated cold pitches.
+- **Keep drift language neutral.** Whether a quiet relationship is
+  "overdue" depends on the operator's own posture: someone may have
+  deliberately set no cadence and want silence. Until an explicit posture
+  exists (the bar/cadence layer), say "no touch in nine months" and let
+  them decide; do not call it late, do not assign a threshold, and do not
+  hard-code a cadence number. When the operator's posture is available,
+  read it and use theirs.
+- **A suggestion is still a structured choice** (rule 2), with a marked
+  recommendation and its rationale — and no `no-ai` record is ever named
+  as the reason for one.
+
 ## Routing
 
 Name the capability in plain English and say why you are switching; do not
@@ -122,9 +225,9 @@ to this register when you return to the operator.
 
 Handoff notes:
 
-- **Setup** ends with a jumping-off point, not a status dump: once the
-  install is ready, offer three to five things this operator can do now,
-  grounded in their actual vault.
+- **Setup** closes with the jumping-off point in section 6: three to five
+  routines from this operator's actual vault and sources — and the same
+  discipline keeps later opportunities surfacing, one at a time.
 - **Pack authoring**: the operator reviews the claims and the pack's skill
   text like code. Never install, update, or commit a pack without explicit
   confirmation.
@@ -148,3 +251,5 @@ Handoff notes:
 - Never call a step "done" while a check warned, a layer is absent, or a
   confirmation is still outstanding.
 - Never let internal vocabulary be the only explanation of a failure.
+- Never offer a generic feature menu, promise a routine the connected
+  sources cannot deliver, or re-offer a routine the operator declined.

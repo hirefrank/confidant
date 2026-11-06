@@ -4801,6 +4801,46 @@ fn record_schema(vault: &confidant_core::Vault, require_declared: bool) -> Recor
     }
 }
 
+/// #838: refuse a *new* front-matter reference to a retired record.
+///
+/// `record add` has no previous version, so every reference in the file is
+/// new. `record edit` passes the stored record so a reference that was
+/// already on disk is grandfathered: a record may have referenced the target
+/// before it was retired, and an unrelated edit must not become impossible.
+/// The check is therefore "new to this file", not "present in the file", and
+/// removing or keeping an existing reference is always allowed.
+///
+/// Merge-canonicalizes the target first: a reference to a merged-away member
+/// of a retired record is a reference to the retired record.
+fn refuse_new_retired_references(
+    vault: &confidant_core::vault::Vault,
+    rec: &Record,
+    existing: Option<&Record>,
+) -> anyhow::Result<()> {
+    let prior: Vec<RecordId> = existing.map(Record::reference_ids).unwrap_or_default();
+    for id in rec.reference_ids() {
+        if prior.contains(&id) {
+            continue;
+        }
+        let canonical = confidant_core::canonical_record_id(vault, &id);
+        if !vault.is_retired(&canonical) {
+            continue;
+        }
+        let target = if canonical == id {
+            id.to_string()
+        } else {
+            format!("{id} (merged into {canonical})")
+        };
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "{target} is retired; a new reference to a retired record is refused"
+        )))
+        .with_fix(&format!(
+            "Unretire it first (`confidant record unretire {canonical}`), or reference a live record"
+        )));
+    }
+    Ok(())
+}
+
 fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     let text = std::fs::read_to_string(file).map_err(|e| {
@@ -4821,6 +4861,7 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
             "record add does not create notes; use `confidant note add --body-file`",
         )));
     }
+    refuse_new_retired_references(&vault, &rec, None)?;
     if let Some(decl) = vault.type_registry().get(rec.kind.as_str()) {
         if !decl.enabled {
             return Err(anyhow::Error::new(
@@ -5777,6 +5818,10 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
     let rec = &prepared.rec;
     let rel = &prepared.rel;
     let id_str = rec.id.to_string();
+    // #838: a *new* reference to a retired record is refused; references
+    // already in the stored file are grandfathered so an unrelated edit
+    // still works.
+    refuse_new_retired_references(&vault, rec, vault.records.get(&id))?;
     let outcome = apply_record_write(root, &vault, prepared.pending, &write_options(cli))?;
     let extra = serde_json::json!({
         "id": id_str,

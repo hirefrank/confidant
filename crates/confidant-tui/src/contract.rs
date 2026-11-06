@@ -328,6 +328,11 @@ pub struct TouchpointView {
     pub date: String,
     #[serde(default)]
     pub kind: Option<String>,
+    /// Operator path only (#838): the line is superseded by a retraction.
+    /// The agent path never emits a superseded line, so an absent field
+    /// means "live" and old CLI output stays valid.
+    #[serde(default)]
+    pub superseded: bool,
 }
 
 /// Output of `confidant record list --json --no-input` (#558).
@@ -701,6 +706,18 @@ mod tests {
         .unwrap();
         assert_eq!(ctx.person.id, "p-1");
         assert_eq!(ctx.touchpoints.len(), 1);
+        assert!(!ctx.touchpoints[0].superseded, "absent defaults to live");
+
+        // Operator context (#838) badges a superseded line; the field is
+        // additive so an older CLI's JSON still parses.
+        let operator: Context = serde_json::from_str(
+            r#"{"person": {"id": "p-1", "name": "Ada Example", "no_ai": "false"},
+                "touchpoints": [{"date": "2026-10-02", "kind": "meet",
+                                 "superseded": true}],
+                "packs": {}, "aliases": [], "scope": [], "for_operator": true}"#,
+        )
+        .unwrap();
+        assert!(operator.touchpoints[0].superseded);
     }
 
     #[test]

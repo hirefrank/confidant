@@ -113,10 +113,14 @@ on the agent path at all.
 A `retract` line supersedes a prior ledger line without editing or deleting
 it. A superseded line is not searchable on the agent path and is absent from
 `allowlist`, so it never enters the QMD corpus; `find --for-operator` still
-shows it. A retraction line is searchable only when its own ID tokens **and
-its target line** are allowed. Without that second gate the ref would be a
-hash oracle: an agent could test a guess about a hidden line. A retracted
-line whose target is hidden therefore stays hidden with it.
+shows it. The operator `context` path also lists superseded lines in
+`touchpoints` with `superseded: true` so an operator can see what a
+retraction voided; the agent bundle omits them entirely, so this is
+operator-only display, not a new agent-visible surface. A retraction line is
+searchable only when its own ID tokens **and its target line** are allowed.
+Without that second gate the ref would be a hash oracle: an agent could test
+a guess about a hidden line. A retracted line whose target is hidden
+therefore stays hidden with it.
 
 A `retired: true` record is not in the cleared set. It and records/lines that
 name it are omitted from agent `find`, `context`, `resolve`, `alias resolve`,

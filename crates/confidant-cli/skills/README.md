@@ -8,7 +8,7 @@ Three skills ship today:
 
 | Skill | What it does |
 |---|---|
-| `confidant/` | Standing register for every interaction: plain English, structured choices with a recommendation, propose → confirm → apply, and routing to the task skills |
+| `confidant/` | Standing register for every interaction: plain English, structured choices with a recommendation, propose → confirm → apply, routing to the task skills, and setup's personalized jumping-off point |
 | `qmd-search/` | Optional QMD-backed search over a local index; falls back to `confidant find` |
 | `pack-author/` | Scaffold and refine a local schema pack with `confidant pack init` |
 
