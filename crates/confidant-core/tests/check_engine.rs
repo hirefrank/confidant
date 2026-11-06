@@ -6220,9 +6220,61 @@ name = "greet"
     assert_eq!(version_finding["file"].as_str().unwrap(), "confidant.toml");
 }
 
-/// #438: the vault scanner never treats `packs/**` as records — a
-/// person-shaped file inside a vendored pack is pack data, never a
-/// record.
+/// #699: a vendored pack whose listing was removed still owns its claims on
+/// every supported spec. Its verbs and `[checks]` keys warn `W_PACK_ORPHAN`
+/// (never `E_UNKNOWN_VERB` / `E_CONFIG`), so `pack remove --allow-unresolved`
+/// leaves a vault that `check` and later writes accept.
+#[test]
+fn unlisted_vendored_pack_claims_warn_orphans_before_spec_03() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-05 greet {ADA} kind:wave\n"),
+    );
+    let hash = install_external_pack_with_manifest(
+        dir.path(),
+        "example-pack",
+        "0.1",
+        r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["W_GREET_STALE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[messages."W_GREET_STALE"]
+default = "stale greeting"
+
+[[checks.severity]]
+key = "example-pack.notes"
+default = "warning"
+
+[[verbs]]
+name = "greet"
+id_type = "person"
+"#,
+        "# example pack.\n",
+    );
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    // Vendored and pinned, but not listed.
+    external_vault_toml(dir.path(), "", "example-pack.notes = \"warning\"\n");
+
+    let json = report_json(dir.path(), None);
+    assert_eq!(json["summary"]["errors"], 0, "{json}");
+    let codes = codes(&json);
+    assert_eq!(
+        codes,
+        vec!["W_PACK_ORPHAN", "W_PACK_ORPHAN"],
+        "verb and [checks] key must both warn: {json:?}"
+    );
+}
+
 #[test]
 fn packs_dir_contents_are_not_records() {
     let dir = tempfile::tempdir().unwrap();

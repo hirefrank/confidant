@@ -253,11 +253,14 @@ a usage error (exit 2) with a fix telling you to install it after init
 packs, then `pack add`.
 
 To undo the change, `confidant pack remove <name> --yes` removes the
-vendored files, the lock entry, and the `packs` listing. Data written under
-the pack's verbs then becomes `W_PACK_ORPHAN` warnings, not errors; the
-personal pack is never orphaned. `confidant pack list` and
-`confidant pack verify` show what is installed and whether the hash still
-matches.
+vendored files, the lock entry, and the `packs` listing; it refuses while
+the vault still uses the pack. `confidant pack remove <name>
+--allow-unresolved --yes` instead unlists the pack and keeps its files and
+pin, so data written under its verbs warns `W_PACK_ORPHAN` (not an error)
+until you migrate it; a later plain `pack remove` deletes the files once
+the data is gone. The personal pack is never orphaned. `confidant pack list`
+and `confidant pack verify` show what is installed and whether the hash
+still matches.
 
 ### 3.3 The honest caveat: pack scope is policy, not a boundary
 

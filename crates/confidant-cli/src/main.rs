@@ -528,6 +528,11 @@ enum PackAction {
         /// Apply the removal.
         #[arg(long)]
         yes: bool,
+        /// Unlist the pack but keep its vendored files and lock entry, so
+        /// its data and `[checks]` keys warn `W_PACK_ORPHAN` until migrated.
+        /// A later `pack remove` (no flag) deletes them once the data is gone.
+        #[arg(long)]
+        allow_unresolved: bool,
     },
     /// Update an installed pack to a new rev, printing the diff first.
     Update {
@@ -1081,10 +1086,18 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 cmd_pack_verify(&cli, vault_root.as_deref(), name.as_deref())
                     .map_err(pack_fetch::escape_domain_error)
             }
-            PackAction::Remove { name, yes } => {
-                cmd_pack_remove(&cli, vault_root.as_deref(), name.clone(), *yes)
-                    .map_err(pack_fetch::escape_domain_error)
-            }
+            PackAction::Remove {
+                name,
+                yes,
+                allow_unresolved,
+            } => cmd_pack_remove(
+                &cli,
+                vault_root.as_deref(),
+                name.clone(),
+                *yes,
+                *allow_unresolved,
+            )
+            .map_err(pack_fetch::escape_domain_error),
             PackAction::Update {
                 name,
                 rev,
@@ -1560,31 +1573,50 @@ fn manifest_tokens(manifest: &confidant_core::packs::manifest::PackManifest) -> 
         .collect()
 }
 
-/// The names the vault's loaded copy of `name` declares. Empty when the
-/// pack is not loadable (a missing or unreadable copy), so the hint stays
-/// silent rather than guessing.
+/// The names the vault's loaded copy of `name` declares. An unlisted
+/// vendored pack is not in the registry, so its manifest is read from the
+/// tree instead (the #694 hint must name its data too). Empty when the pack
+/// is not loadable (a missing or unreadable copy), so the hint stays silent
+/// rather than guessing.
 fn installed_pack_tokens(root: &Path, name: &str) -> Vec<String> {
-    let Ok(vault) = confidant_core::load_vault(root) else {
-        return Vec::new();
-    };
-    vault
-        .pack_registry()
-        .all()
-        .iter()
-        .find(|pack| pack.name() == name)
-        .map(|pack| {
-            pack.verbs()
-                .iter()
-                .map(|verb| (*verb).to_owned())
-                .chain(
-                    pack.balance_metrics()
-                        .iter()
-                        .map(|metric| (*metric).to_owned()),
-                )
-                .chain(pack.edge_kinds().iter().map(|kind| kind.name.to_owned()))
-                .collect()
-        })
-        .unwrap_or_default()
+    let registry_tokens = confidant_core::load_vault(root).ok().and_then(|vault| {
+        vault
+            .pack_registry()
+            .all()
+            .iter()
+            .find(|pack| {
+                pack.name() == name
+                    || pack
+                        .name()
+                        .split_once('@')
+                        .is_some_and(|(base, _)| base == name)
+            })
+            .map(|pack| {
+                pack.verbs()
+                    .iter()
+                    .map(|verb| (*verb).to_owned())
+                    .chain(
+                        pack.balance_metrics()
+                            .iter()
+                            .map(|metric| (*metric).to_owned()),
+                    )
+                    .chain(pack.edge_kinds().iter().map(|kind| kind.name.to_owned()))
+                    .collect()
+            })
+    });
+    if let Some(tokens) = registry_tokens {
+        return tokens;
+    }
+    for id in vendored_ids_for(root, name).unwrap_or_default() {
+        let Some((id_name, id_version)) = id.split_once('@') else {
+            continue;
+        };
+        let dir = root.join(vendored_rel(id_name, id_version));
+        if let Some(manifest) = confidant_core::packs::dir::read_manifest_best_effort(&dir) {
+            return manifest_tokens(&manifest);
+        }
+    }
+    Vec::new()
 }
 
 /// #694: a stderr hint after `pack add --yes` is blocked, tailored to the
@@ -1656,15 +1688,22 @@ fn with_allow_unresolved(
     payload
 }
 
-/// #694: a stderr hint after `pack remove --yes` is blocked. The report
+/// #694/#699: a stderr hint after `pack remove --yes` is blocked. The report
 /// still prints unchanged and the exit stays 1; this only names the
 /// workaround. Returns `None` when no finding names this pack, so a
 /// pre-check failure on an unrelated vault does not blame the removal.
+///
+/// `listed` says whether the pack still has a `packs` entry (a plain removal)
+/// or is already unlisted (`--allow-unresolved` ran earlier). With
+/// `allow_unresolved` the hint must not claim the flag again: the post-check
+/// failed on findings unlisting cannot resolve.
 fn pack_remove_blocked_hint(
     root: &Path,
     report: &confidant_core::check::CheckReport,
     name: &str,
     owned: &[String],
+    listed: bool,
+    allow_unresolved: bool,
 ) -> Option<String> {
     let blocked = report
         .findings
@@ -1675,8 +1714,19 @@ fn pack_remove_blocked_hint(
         return None;
     }
     let name = pack_fetch::escape_line(name);
+    if allow_unresolved {
+        return Some(
+            "hint: --allow-unresolved unlisted the pack, but the post-check still failed, so nothing was committed. The findings above are not ones unlisting can resolve; fix them, then re-run `confidant pack remove`."
+                .to_owned(),
+        );
+    }
+    if !listed {
+        return Some(format!(
+            "hint: {name} is already unlisted; its data and [checks] keys warn W_PACK_ORPHAN until migrated. Remove or migrate those entries, then re-run `confidant pack remove {name} --yes`."
+        ));
+    }
     Some(format!(
-        "hint: the vault still uses {name}'s verbs, metrics, [checks] keys, or edge kinds, so removing the pack would leave orphan data. Remove or migrate those entries (and drop the [checks] keys) first, or keep the pack installed. An explicit remove-side flag is tracked in #699 and is not available yet."
+        "hint: the vault still uses {name}'s verbs, metrics, [checks] keys, or edge kinds, so removing the pack would leave orphan data. Migrate or remove those entries first, or run `confidant pack remove {name} --allow-unresolved --yes` to unlist the pack and keep its files while you migrate (the data then warns W_PACK_ORPHAN)."
     ))
 }
 
@@ -2362,11 +2412,19 @@ fn vendored_ids_for(root: &Path, name: &str) -> anyhow::Result<Vec<String>> {
 /// alone. When `confidant.lock` is missing (a lost lock, a bad merge, a
 /// partial restore) the listing and the vendored directory still identify the
 /// pack, so removal is the escape `check`'s `E_PACK_UNKNOWN` fix can point at.
+///
+/// #699: with `--allow-unresolved` the command *unlists* the pack instead:
+/// it drops the `packs` entry but keeps the vendored tree and lock pin. The
+/// registry still owns the pack's claims as a disabled pack, so its data and
+/// `[checks]` keys are durable `W_PACK_ORPHAN` warnings rather than errors.
+/// `check` and every later write keep working while the operator migrates; a
+/// later plain `pack remove` deletes the files once the data is gone.
 fn cmd_pack_remove(
     cli: &Cli,
     vault_root: Option<&Path>,
     name: String,
     yes: bool,
+    allow_unresolved: bool,
 ) -> anyhow::Result<ExitCode> {
     let root = vault_root_required(vault_root, "pack remove")?;
     let mut lock = read_lockfile_or_empty(root)?;
@@ -2421,17 +2479,73 @@ fn cmd_pack_remove(
         .chain(drop_listings.iter().filter(|l| !ids.contains(*l)))
         .cloned()
         .collect();
+    let was_listed = !drop_listings.is_empty();
 
-    if !yes {
+    // Already unlisted (tree and/or lock entry still there): the flag has
+    // nothing to drop. Say so and report the warnings left to migrate;
+    // a plain `pack remove` is the command that deletes the files.
+    if allow_unresolved && drop_listings.is_empty() {
+        let total = pack_orphan_total(root);
         if cli.json {
             print_json(&ok_envelope(
                 Some(root),
                 serde_json::json!({
                     "command": "pack-remove",
-                    "dry_run": true,
-                    "would_remove": listed,
+                    "outcome": "unlisted",
+                    "allow_unresolved": true,
+                    "unchanged": true,
+                    "unlisted": Vec::<String>::new(),
+                    "kept": listed,
+                    "orphans": { "new": 0, "total": total },
                 }),
             ))?;
+        } else {
+            println!(
+                "{} is already unlisted; nothing to unlist",
+                listed
+                    .iter()
+                    .map(|id| pack_fetch::escape_line(id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!("check: {total} W_PACK_ORPHAN warning(s)");
+            println!(
+                "next: migrate or remove the orphaned data, then run `confidant pack remove {} --yes`",
+                pack_fetch::escape_line(&name)
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if !yes {
+        if cli.json {
+            let payload = if allow_unresolved {
+                serde_json::json!({
+                    "command": "pack-remove",
+                    "dry_run": true,
+                    "outcome": "unlisted",
+                    "allow_unresolved": true,
+                    "would_unlist": drop_listings.iter().cloned().collect::<Vec<_>>(),
+                    "kept": listed,
+                })
+            } else {
+                serde_json::json!({
+                    "command": "pack-remove",
+                    "dry_run": true,
+                    "outcome": "removed",
+                    "would_remove": listed,
+                })
+            };
+            print_json(&ok_envelope(Some(root), payload))?;
+        } else if allow_unresolved {
+            println!("would unlist (keep files and the lock entry; pass --yes to apply):");
+            for id in &drop_listings {
+                println!("  {}", pack_fetch::escape_line(id));
+            }
+            println!("kept:");
+            for id in &listed {
+                println!("  {}", pack_fetch::escape_line(id));
+            }
         } else {
             println!("would remove (pass --yes to apply):");
             for id in &listed {
@@ -2440,6 +2554,21 @@ fn cmd_pack_remove(
             }
         }
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if allow_unresolved {
+        return cmd_pack_unlist(
+            cli,
+            root,
+            UnlistPlan {
+                cfg_text: &cfg_text,
+                cfg_packs,
+                drop_listings: &drop_listings,
+                kept: &listed,
+                name: &name,
+                lock_entries: &lock_entries,
+            },
+        );
     }
 
     let mut changes = Vec::new();
@@ -2463,11 +2592,15 @@ fn cmd_pack_remove(
     }
     let mut packs = cfg_packs;
     packs.retain(|p| !drop_listings.contains(p));
-    changes.push(FileChange::WriteFile {
-        path: PathBuf::from("confidant.toml"),
-        contents: confidant_core::config::VaultConfig::set_packs(&cfg_text, &packs)
-            .map_err(anyhow::Error::new)?,
-    });
+    // An unlisted pack has no listing to rewrite; skip the file so a later
+    // plain removal does not normalize an unrelated `confidant.toml`.
+    if !drop_listings.is_empty() {
+        changes.push(FileChange::WriteFile {
+            path: PathBuf::from("confidant.toml"),
+            contents: confidant_core::config::VaultConfig::set_packs(&cfg_text, &packs)
+                .map_err(anyhow::Error::new)?,
+        });
+    }
 
     let summary = format!("pack: remove {}", listed.join(", "));
     let pending = PendingWrite {
@@ -2498,7 +2631,7 @@ fn cmd_pack_remove(
     let hint = match &outcome {
         WriteOutcome::CheckBlocked { report } => {
             let owned = installed_pack_tokens(root, &name);
-            pack_remove_blocked_hint(root, report, &name, &owned)
+            pack_remove_blocked_hint(root, report, &name, &owned, was_listed, false)
         }
         _ => None,
     };
@@ -2507,12 +2640,140 @@ fn cmd_pack_remove(
         root,
         "pack-remove",
         outcome,
-        serde_json::json!({ "removed": listed }),
+        serde_json::json!({ "outcome": "removed", "removed": listed }),
     )?;
     if let Some(hint) = hint {
         writeln!(io::stderr(), "{hint}")?;
     }
     Ok(code)
+}
+
+/// The state `cmd_pack_remove` hands to its `--allow-unresolved` path.
+struct UnlistPlan<'a> {
+    cfg_text: &'a str,
+    cfg_packs: Vec<String>,
+    drop_listings: &'a BTreeSet<String>,
+    kept: &'a [String],
+    name: &'a str,
+    lock_entries: &'a [confidant_core::packs::lock::LockEntry],
+}
+
+/// `pack remove --allow-unresolved --yes`: drop the pack from `packs` but keep
+/// its vendored tree and lock pin (#699). The registry still knows the pack,
+/// so its data and `[checks]` keys become durable `W_PACK_ORPHAN` warnings;
+/// the post-check gates the commit exactly as a plain removal does, so an
+/// unrelated error still rolls back.
+fn cmd_pack_unlist(cli: &Cli, root: &Path, plan: UnlistPlan<'_>) -> anyhow::Result<ExitCode> {
+    let UnlistPlan {
+        cfg_text,
+        cfg_packs,
+        drop_listings,
+        kept,
+        name,
+        lock_entries,
+    } = plan;
+    let before = pack_orphan_total(root);
+    let mut packs = cfg_packs;
+    packs.retain(|listed| !drop_listings.contains(listed));
+    let contents = confidant_core::config::VaultConfig::set_packs(cfg_text, &packs)
+        .map_err(anyhow::Error::new)?;
+    let changes = vec![FileChange::WriteFile {
+        path: PathBuf::from("confidant.toml"),
+        contents,
+    }];
+    let unlisted: Vec<String> = drop_listings.iter().cloned().collect();
+    let summary = format!("pack: unlist {} (keep files)", unlisted.join(", "));
+    let pending = PendingWrite {
+        changes,
+        canonical_request: summary.clone(),
+        summary,
+    };
+    // A listing without a lock pin is the `E_PACK_UNKNOWN` this unlisting
+    // repairs, so that case skips the pre-check; the post-check still gates.
+    // A healthy listing runs the usual pre-check and refuses unrelated
+    // errors before applying anything.
+    let all_pinned = unlisted.iter().all(|id| {
+        id.split_once('@').is_some_and(|(id_name, id_version)| {
+            lock_entries
+                .iter()
+                .any(|entry| entry.name == id_name && entry.version == id_version)
+        })
+    });
+    let outcome = if all_pinned {
+        apply_write(root, pending, &write_options(cli))?
+    } else {
+        apply_write_repairing(root, pending, &write_options(cli))?
+    };
+    let applied = matches!(outcome, WriteOutcome::Applied { .. });
+    // `new` is the count the unlisting added: a fresh load's warning total
+    // minus the pre-removal total. Other disabled packs' warnings sit in both
+    // counts and cancel; only data this pack owned appears new.
+    let total = if applied {
+        pack_orphan_total(root)
+    } else {
+        before
+    };
+    let new = total.saturating_sub(before);
+    let hint = match &outcome {
+        WriteOutcome::CheckBlocked { report } => {
+            let owned = installed_pack_tokens(root, name);
+            pack_remove_blocked_hint(root, report, name, &owned, true, true)
+        }
+        _ => None,
+    };
+    let code = finish_write(
+        cli,
+        root,
+        "pack-remove",
+        outcome,
+        serde_json::json!({
+            "outcome": "unlisted",
+            "allow_unresolved": true,
+            "unlisted": unlisted,
+            "kept": kept,
+            "orphans": { "new": new, "total": total },
+        }),
+    )?;
+    if applied && !cli.json {
+        println!(
+            "unlisted {}: vendored copy and lock entry kept (where present)",
+            unlisted
+                .iter()
+                .map(|id| pack_fetch::escape_line(id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("check: {total} W_PACK_ORPHAN warning(s), {new} new; the vault stays writable");
+        println!(
+            "next: migrate or remove the orphaned data (each warning names its file and line), then run"
+        );
+        println!(
+            "  confidant pack remove {} --yes",
+            pack_fetch::escape_line(name)
+        );
+        println!(
+            "to keep using it instead, re-list the vendored pack with `confidant pack add --from-dir <pack> --yes`"
+        );
+    }
+    if let Some(hint) = hint {
+        writeln!(io::stderr(), "{hint}")?;
+    }
+    Ok(code)
+}
+
+/// The number of `W_PACK_ORPHAN` warnings in the vault, read from a fresh
+/// load so it matches what the next `check` reports. Zero when the vault
+/// cannot be loaded: the write's own post-check has already gated the commit,
+/// so this is a reporting convenience, never a gate.
+fn pack_orphan_total(root: &Path) -> usize {
+    let Ok(vault) = load_vault(root) else {
+        return 0;
+    };
+    check_vault(&vault, &CheckOptions::default())
+        .findings
+        .iter()
+        .filter(|finding| finding.code.as_str() == "W_PACK_ORPHAN")
+        .count()
 }
 
 /// `pack update <name> --rev <ref>`: re-fetch a new rev, print the diff, and

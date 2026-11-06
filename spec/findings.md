@@ -19,7 +19,7 @@ present, for CI users who want the stricter gate.
 |---|---|---|---|
 | `E_PARSE` | error | | A ledger line or record file does not match the grammar. |
 | `E_UNREADABLE` | error | | A file is not valid UTF-8 or a directory cannot be read. |
-| `E_CONFIG` | error | | `confidant.toml` is missing a required field, is not valid TOML, or a `[checks]` key/value is unknown, mistyped, or out of range. |
+| `E_CONFIG` | error | | `confidant.toml` is missing a required field, is not valid TOML, or a `[checks]` key/value is unknown, mistyped, or out of range. A key declared by an enabled or registered-but-unlisted pack is known; when that pack is unlisted the key is `W_PACK_ORPHAN` instead (its value is still validated here). |
 | `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1`, `0.2`, `0.3`, or `0.4`. |
 | `E_VAULT_LEGACY_ENCRYPTED` | error | | The vault matches the ≤0.7 encrypted-vault shell: a `keys/` tree beyond `.gitkeep`, an `enc:` front-matter header, or an `enc:` ledger line. `check` emits this one finding and stops; `find`, `context`, `allowlist`, `resolve`, and `alias resolve` return it as a command error instead of scanning. The message is the whole diagnosis and remedy; the finding carries no file path, id, or record content. |
 | `E_PACK_UNKNOWN` | error | | A listed pack is neither compiled into this CLI nor resolved through `confidant.lock`. The fix hint points at `confidant pack add`. The message may name the failing `name@version` exactly as listed in `confidant.toml`; `file` is `confidant.toml`. Not reported when `spec` is unsupported: external packs are not resolved and `check` stops after `E_SPEC_UNSUPPORTED`. |
@@ -27,7 +27,7 @@ present, for CI users who want the stricter gate.
 | `E_PACK_HASH` | error | | An external pack's vendored files do not match the lockfile hash, or the vendored directory is missing. The message names the failing `name@version` exactly as listed in `confidant.toml`; `file` is the vendored path `packs/<name>@<version>`. |
 | `E_PACK_INVALID` | error | | An external pack's manifest or contents fail validation: bad `manifest_version`, unknown keys, name or finding-code regex violations, reserved names, capability-limit (PD8) violations, or disallowed files (PD7). A vendored-pack failure names the `name@version` exactly as listed in `confidant.toml` and sets `file` to the vendored path `packs/<name>@<version>`; a broken `confidant.lock` is a separate name-free finding. |
 | `E_PACK_CONFLICT` | error | | Two pack declarations claim the same verb, record type, record-type prefix, record-type collection, field, balance metric, or edge kind. The pack set is incoherent: `check` reports the conflict and skips all pack folding for enabled packs (core checks still run). |
-| `W_PACK_ORPHAN` | warning | | A ledger verb, record field, record type, balance metric, or edge kind belongs to a pack that is not enabled. Since 0.3 this includes a record whose type belongs to a removed pack (a `[[retired_types]]` tombstone or an undeclared two-letter pack prefix). Warnings never block writes; the operator enables/re-adds the pack or removes the data. Agent reads fail closed on an orphaned record type. |
+| `W_PACK_ORPHAN` | warning | | A ledger verb, record field, record type, balance metric, edge kind, or pack-owned `[checks]` key belongs to a pack that is not enabled. A vendored, hash-pinned pack that is missing from `packs` counts as registered but not enabled: that is the state `pack remove --allow-unresolved` leaves, and its data/config keys warn here until migrated (see the migration window below). Since 0.3 this includes a record whose type belongs to a removed pack (a `[[retired_types]]` tombstone or an undeclared two-letter pack prefix). Warnings never block writes; the operator enables/re-adds the pack or removes the data. Agent reads fail closed on an orphaned record type. |
 | `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, merge `TO`, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, and an alphanumeric run 20–32 characters that fails ULID validation or a longer run whose first 26 characters canonicalize to a ULID). A `person` / `org` / `deal` / `entity` value (including ASCII case variants: `Person:`, `ORG:`, `Entity:`, …) accepts `[[id|Alias]]` only inside `[[…]]` (bare `p-A|Name` is this code), a trailing comment after a space or tab then `#`, and treats empty / `~` / YAML `null` as no reference. Check reports the line number and, when the key is a known spec key (including a case-variant ref key, named as written), the key name; it never echoes the token. |
 | `E_INVALID_FILENAME` | error | | A collection or record directory contains a name that is not a record ID, a non-UTF-8 name, or a leftover `.confidant-tmp-*` file. |
 | `E_ID_PATH_MISMATCH` | error | | Front matter `id` does not equal the path ID, or a note's `person` does not match `people/<id>/`. On `find`, a mismatch on a note, interaction, or deal uncleares only that record; a mismatch or `E_DUPLICATE_ID` on a person's profile uncleares that whole person. |
@@ -63,6 +63,23 @@ present, for CI users who want the stricter gate.
 | `E_RETRACT_CHAIN` | error | | A retraction chain is invalid: the same target is retracted twice, two retractions name different replacements, a replacement cycle exists, or the replacement is already superseded at the retraction date. |
 | `E_RETRACT_ORDER` | error | | A retraction is dated before its target or replacement line. |
 | `E_RETRACT_NOT_ALLOWED` | error | | The target is a `retract` or `merge` line, or the retraction/replacement subject ID differs from the target line's subject. |
+
+### Pack removal migration window
+
+`pack remove <name> --allow-unresolved --yes` removes the pack from `packs`
+but keeps its vendored tree and `confidant.lock` pin. That state is
+*registered but not enabled*: the pack's verbs, fields, record types,
+balance metrics, edge kinds, and declared `[checks]` keys stay owned, so
+each use is `W_PACK_ORPHAN` rather than `E_UNKNOWN_*` / `E_CONFIG`. Warnings
+do not block writes, so the vault stays usable (`check` exits 0 under the
+default `--fail-on error`) while the operator migrates the data or moves
+the `[checks]` keys. A later plain `pack remove <name> --yes` deletes the
+tree and pin once no orphan warnings remain; re-adding the pack at the same
+hash re-lists it and clears them.
+
+The window changes no privacy rule: `W_PACK_ORPHAN` is a warning attached to
+data the operator already owns, and no `no-ai` or privacy finding is
+downgraded or hidden by it.
 
 **Retired, not emitted, never reused.** These old built-in names stay
 reserved and must never be reused for a new meaning; nothing emits them in
