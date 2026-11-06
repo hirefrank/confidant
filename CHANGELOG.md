@@ -18,7 +18,8 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 - Spec 0.3 edge-level `no-ai` (#820): an edge may carry `no-ai: true` / `false`. A hidden edge is omitted from every agent read while both endpoints stay visible; the operator path still sees it and `context` badges it. Orgs remain `no-ai`-free; 0.2 vaults reject the edge key with `E_FRONTMATTER`.
 
 ### Fixed
-- Re-running `confidant init` on an existing vault no longer resets a per-vault git identity in `<vault>/.git/config` to `Confidant Operator`; the neutral identity is written only for keys the vault has not set, so the override the `FALLBACK_GIT_NAME` docs describe survives. `init --help` and the init comments now describe the always-neutral default instead of "only when git has no identity".
+- Re-running `confidant init` on an existing vault no longer resets a per-vault git identity in `<vault>/.git/config` to `Confidant Operator`; the neutral identity is written only for keys the vault has not set, so the override the `FALLBACK_GIT_NAME` docs describe survives. `init --help` and the init comments now describe the always-neutral default instead of "only when git has no identity". (#845)
+- An edge with an unrecognized `kind` now lists the valid kinds for the vault in the `E_UNKNOWN_EDGE_KIND` fix instead of only suggesting enabling the pack that defines it; the pack suggestion stays for a kind owned by a disabled pack (`W_PACK_ORPHAN`). (#846)
 
 ## [0.8.0] - 2026-11-01
 

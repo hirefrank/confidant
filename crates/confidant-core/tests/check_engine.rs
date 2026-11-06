@@ -5480,6 +5480,26 @@ fn personal_edge_kind_is_valid_when_enabled() {
 }
 
 #[test]
+fn unknown_edge_kind_fix_lists_the_valid_kinds() {
+    let dir = personal_vault();
+    person(dir.path(), ADA, "Ada Example");
+    person(dir.path(), BEA, "Bea Demo");
+    // Misspelled kind under personal@0.1: the pack is already enabled, so
+    // "enable the pack" cannot be the fix — the valid kinds should be listed.
+    edge(dir.path(), EDGE1, ADA, BEA, "freind");
+    let vault = load_vault(dir.path()).unwrap();
+    let report = check_vault(&vault, &CheckOptions::default());
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.code == FindingCode::UnknownEdgeKind)
+        .unwrap_or_else(|| panic!("expected unknown edge kind: {:?}", report.findings));
+    let fix = finding.fix.as_deref().unwrap_or_default();
+    assert!(fix.contains("friend"), "{fix}");
+    assert!(!fix.contains("freind"), "{fix}");
+}
+
+#[test]
 fn personal_touch_note_integrity_checks_note_owner() {
     let dir = personal_vault();
     person(dir.path(), ADA, "Ada Example");
