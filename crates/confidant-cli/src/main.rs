@@ -3706,27 +3706,9 @@ fn apply_ledger_correction(
     canonical_request: String,
     extra: serde_json::Value,
 ) -> anyhow::Result<ExitCode> {
-    if !cli.dry_run {
-        require_git_repo(root, cli.no_input)?;
-        for path in changes.keys() {
-            if !root.join(path).exists() {
-                continue;
-            }
-            let rel = path.to_string_lossy();
-            let status = confidant_core::write::git(
-                root,
-                &["status", "--porcelain", "--", &rel],
-                cli.no_input,
-            )?;
-            if !status.trim().is_empty() {
-                return Err(anyhow::Error::new(DomainError::conflict(format!(
-                    "{} has uncommitted changes; appending would commit them too",
-                    path.display()
-                )))
-                .with_fix("Commit, stash, or discard your changes to that file, then retry"));
-            }
-        }
-    }
+    // #611/#770: an append commits the whole target file, so a target with
+    // uncommitted changes is refused. `apply_write` runs that read-only gate
+    // for dry run and apply alike; nothing is repeated here.
     let pending = PendingWrite {
         changes: changes
             .into_iter()
@@ -4308,33 +4290,8 @@ fn cmd_import(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
     }
     // #611: appending commits the whole month file (`git add`), so an
     // unrelated uncommitted line in it would be swept into this commit.
-    // Refuse before writing anything; the dry run still previews. This is
-    // the ledger-append step of the proposal flow, which the TUI cannot
-    // check itself (it never reads the vault). Other append paths are out
-    // of this fix's scope.
-    if !cli.dry_run {
-        require_git_repo(root, cli.no_input)?;
-        for path in by_file.keys() {
-            if !confidant_core::paths::exists(root, path)? {
-                continue;
-            }
-            let rel = path.to_string_lossy();
-            let status = confidant_core::write::git(
-                root,
-                &["status", "--porcelain", "--", &rel],
-                cli.no_input,
-            )?;
-            if !status.trim().is_empty() {
-                return Err(anyhow::Error::new(
-                    DomainError::conflict(format!(
-                        "{} has uncommitted changes; appending would commit them too",
-                        path.display()
-                    ))
-                    .with_fix("Commit, stash, or discard your changes to that file, then retry"),
-                ));
-            }
-        }
-    }
+    // The write pipeline refuses that target for dry run and apply alike
+    // (#770), so it is not repeated here.
     let total = entries.len();
     let lines: Vec<String> = by_file.values().flatten().cloned().collect();
     let changes: Vec<FileChange> = by_file

@@ -285,7 +285,7 @@ pub fn contract_schema() -> Value {
             },
             "writeResponse": {
                 "title": "log touch / import / note add --json",
-                "description": "One commit per write. Commit messages carry only opaque IDs, verbs, hashes. --request-id must be unguessable (at least 22 characters; use a ULID or UUIDv4): the Request-Hash trailer HMACs the canonical request with the raw id as key, and trailers are permanent, so a guessable id is an offline guessing oracle even after shredding. A dry run runs the same read-only pre-write check as apply (skipped for a repairing write), never writes, and reports the post-write check as skipped because it needs the applied tree.",
+                "description": "One commit per write. Commit messages carry only opaque IDs, verbs, hashes. --request-id must be unguessable (at least 22 characters; use a ULID or UUIDv4): the Request-Hash trailer HMACs the canonical request with the raw id as key, and trailers are permanent, so a guessable id is an offline guessing oracle even after shredding. A dry run runs every read-only gate apply runs — the git-repository requirement, the dirty-append-target refusal, the merge-conflict refusal, and the pre-write check (skipped for a repairing write) — so a passing preview means apply passes the same gates. It never writes, and reports the post-write check as skipped because it needs the applied tree.",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "command"],
                 "properties": {
@@ -296,7 +296,7 @@ pub fn contract_schema() -> Value {
                     "dry_run": {"type": "boolean"},
                     "checks": {
                         "type": "object",
-                        "description": "Dry-run only: which write-pipeline checks ran. `pre` is `passed` after the same read-only pre-check apply runs, or `skipped` for a repairing write (whose apply path skips it too). `post` is always `skipped`: the post-write check needs the applied tree, and a dry run never writes. Do not treat a dry run as validating the result.",
+                        "description": "Dry-run only: which write-pipeline checks ran. `pre` is `passed` after the same read-only pre-check apply runs, or `skipped` for a repairing write (whose apply path skips it too). `post` is always `skipped`: the post-write check needs the applied tree, and a dry run never writes. The other read-only gates (git repository, dirty append target, merge-conflict markers, configured git identity) refuse the dry run with exactly the error apply returns, so they have no status here. Do not treat a dry run as validating the result.",
                         "required": ["pre", "post"],
                         "properties": {
                             "pre": {"type": "string", "enum": ["passed", "skipped"]},
