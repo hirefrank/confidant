@@ -60,9 +60,14 @@ Every choice carries:
 
 Offer a defer option ("Not now") when the choice is optional; a yes/no is a
 choice, not a question. Never ask something the tooling already answers: run
-`doctor`/`status`, read `--help`, inspect the vault, and ask only what the
-evidence cannot settle. If you are genuinely torn, say what would change
-your recommendation. One decision at a time; do not stack questions.
+`doctor`/`status`, read `--help`, and query the vault through the CLI with
+`check`, `find`, or `context`, then ask only what the evidence cannot
+settle. "Inspect the vault" means running those commands, never opening its
+plaintext files yourself: the system-of-record rule (`confidant routing`)
+is that vault files are not hand-read, and the CLI is what enforces the
+`no-ai` boundary while answering from the record. If you are genuinely
+torn, say what would change your recommendation. One decision at a time; do
+not stack questions.
 
 ## 3. Propose → confirm → apply
 
@@ -116,11 +121,18 @@ Once install, init, and any optional indexing are finished, do not close on
 a status report. Close on *use*: three to five concrete routines this
 operator can start now.
 
+**The bar comes first.** These routines follow the operator's own rules, so
+setup asks the three bar moments in section 8 *before* it generates this
+menu. The answers decide what the menu may contain — above all whether a
+drift routine belongs in it at all: if they chose silence, it is not
+offered. Ask the bar afterwards and you risk offering something they have
+already ruled out, and a decline is permanent.
+
 Build the menu from the room, not from a feature list:
 
 - **The vault's shape** — how many people, companies, deals, and notes; how
-  many interactions, over what span; what recent activity looks like. Read
-  it; do not guess.
+  many interactions, over what span; what recent activity looks like. Get it
+  from `check` and `find`; do not guess, and do not hand-read files.
 - **Connected sources** — calendar, email, a network export, a contacts
   file. Name only a source you can actually read in this session.
 - **How they work** — the kinds of interactions the log shows, who they
@@ -133,9 +145,10 @@ Each routine carries:
   first meeting"), not a schedule spec.
 - **Their effort** — "one tap daily", "nothing after setup", "ten seconds
   when you meet someone".
-- **A one-tap start** — start it, see an example, or decline. Starting
-  authorizes the routine's shape, not an unbounded stream of writes: the
-  first write still goes through propose → confirm → apply.
+- **A one-tap start** — starting it is one option in the single choice
+  below; "See an example" can ride along with the recommended routine.
+  Starting authorizes the routine's shape, not an unbounded stream of
+  writes: the first write still goes through propose → confirm → apply.
 
 An invented example of the shape:
 
@@ -143,20 +156,28 @@ An invented example of the shape:
 > touch was a call two weeks ago, and 9 people have no touch in over three
 > months. Your calendar is connected; email is not.
 >
-> **Recommended — Pre-meeting brief.** Ten minutes before each meeting, one
-> card: who you are seeing, what you last discussed, and anything coming
-> up. Because your calendar is connected and you average four meetings a
-> week. Effort: one tap before each meeting.
-> [Start it] [See an example] [Not now]
+> Three routines fit that:
 >
-> **Weekly drifting radar.** The relationships with no touch for longer
-> than the interval you choose, with a one-line reason each. Cadence:
-> weekly, on a day you pick. Effort: one tap to review.
-> [Start it] [Not now]
+> 1. **Pre-meeting brief.** Ten minutes before each meeting, one card: who
+>    you are seeing, what you last discussed, and anything coming up.
+>    Cadence: before each meeting. Effort: one tap before each meeting.
+> 2. **Weekly drifting radar.** The relationships with no touch for longer
+>    than the interval you choose, with a one-line reason each. Cadence:
+>    weekly, on a day you pick. Effort: one tap to review.
+> 3. **New-face capture.** After a first meeting, a draft page built from
+>    what the calendar and your notes already say, waiting for your yes.
+>    Effort: ten seconds per new person.
 >
-> **New-face capture.** After a first meeting, a draft page built from what
-> the calendar and your notes already say, waiting for your yes. Effort:
-> ten seconds per new person. [Start it] [Not now]
+> **Which would you start first?**
+>
+> **Recommended — Pre-meeting brief**, because your calendar is connected
+> and you average four meetings a week. That is the one I would start
+> today.
+> [Start the pre-meeting brief] [Start the weekly drifting radar]
+> [Start new-face capture] [Not now]
+
+The routines above are the menu's content; the choice is one question about
+where to start, not a column of buttons.
 
 Menu rules:
 
@@ -169,9 +190,14 @@ Menu rules:
   calendar-fed brief: offer the vault-only version, say which source each
   routine needs, or leave it out.
 - **Three to five, ranked.** Not a catalogue. Put the one you would start
-  first at the top, mark it **Recommended**, and give the one-clause why.
-- **One structured choice, not a wall of prose.** Rule 2 applies: options,
-  a marked recommendation, a default.
+  first at the top, and give it the one-clause why.
+- **One structured choice, not a wall of prose.** Rule 2 applies. Ask
+  "which routine would you start first?" — the recommended routine marked
+  **Recommended** with its rationale, the others named as the alternatives,
+  and a defer option that is also the default (nothing starts). Three
+  routines plus "Not now" is four options, inside rule 2's limit; if you
+  have five, offer the recommended one and the next two that fit now, and
+  keep the rest in your memory for a later trigger.
 
 ### Keep the menu with you, not in front of them
 
@@ -188,7 +214,7 @@ previously-unstarted routine *then*:
 | Trigger | Offer |
 |---|---|
 | A person in the vault reappears on the calendar after a long gap | a pre-meeting brief for that person |
-| A name recurs across email or in a thread | new-face capture for that person, after the usual confirmation |
+| An email-only contact crosses the personal pack's capture threshold | new-face capture for that person, after the usual confirmation |
 | A pull brings people or interactions you have not seen | a short "what changed while you were away" pass |
 | A relationship crosses the operator's own drift threshold | the drifting radar, or a reintroduction nudge |
 
@@ -196,6 +222,11 @@ Discipline:
 
 - **One suggestion at a time, only when a trigger fired.** No trigger, no
   suggestion, and never a standing "any more ideas?" prompt.
+- **Email alone does not earn a page.** For a new face seen only in email,
+  apply the personal pack's capture policy first: contact must cross its
+  exchange-day threshold before capture is even offered. The policy owns the
+  numbers; do not restate, invent, or improvise them here. A name that
+  merely recurs is not yet a qualifying trigger.
 - **Declining is permanent.** "No thanks" or "Don't offer this again"
   closes that routine for good; do not re-offer it in a later session.
   "Not now" is a deferral — keep it for the next fitting trigger.
@@ -207,7 +238,8 @@ Discipline:
   deliberately set no cadence and want silence. Say "no touch in nine
   months" and let them decide; do not call it late, do not assign a
   threshold, and do not hard-code a cadence number. The bar (section 8) is
-  where their posture comes from — use theirs once it is set.
+  where their posture comes from, and setup elicits it before this menu, so
+  use theirs and leave out any drift routine it rules out.
 - **A suggestion is still a structured choice** (rule 2), with a marked
   recommendation and its rationale — and no `no-ai` record is ever named
   as the reason for one.
@@ -272,6 +304,15 @@ and never "two writers" without saying which two:
 Hook sync onto moments that already exist; a timer is a backstop, not the
 mechanism.
 
+**The events below are gated on having a remote.** A **local only** vault
+has nothing to fetch from and nothing to push to: skip both steps entirely
+rather than running `sync` and collecting `E_NO_REMOTE` on every batch. The
+confirmation below offers to back the batch up to the private remote; on a
+local-only vault there is no such promise to make, so say plainly that
+nothing leaves this machine and repeat the "add a private remote"
+recommendation from the completion report. Everything here applies to the
+three remote-bearing postures.
+
 - **Before a write batch**, and before any read that matters (a
   pre-meeting brief, a "what changed" pass): fetch, and fast-forward when
   the posture calls for it.
@@ -320,6 +361,12 @@ moments they already care about, reflect them back, and keep them.
 
 Like section 7, this is "get the facts, then state the rule" — the difference
 is that the rule is theirs, so you ask rather than infer.
+
+**Ask this before the menu.** Setup asks these three moments before it
+generates the jumping-off menu in section 6, never after it. The menu is
+built from the answers — a drift routine belongs there only if the third
+answer allows one — and a routine offered too early and declined is closed
+for good. The order is not cosmetic.
 
 ### Ask three moments, not a schema
 
@@ -420,18 +467,21 @@ Handoff notes:
 
 - **Setup** closes with the jumping-off point in section 6: three to five
   routines from this operator's actual vault and sources — and the same
-  discipline keeps later opportunities surfacing, one at a time. It also
+  discipline keeps later opportunities surfacing, one at a time. It first
   infers and states the sync posture from section 7, because the operator
-  should not have to know to ask how the copies stay in step, and elicits
-  the bar in section 8 so capture and cadence follow their rules.
+  should not have to know to ask how the copies stay in step, and it elicits
+  the bar in section 8 *before* building the menu, so capture, cadence, and
+  the routines offered all follow their rules.
 - **The bar** (section 8): keep the operator's own answers, in their words
   and with dates, in your persistent operator memory; reflect them back and
   re-ask when their behaviour disagrees. Never substitute a default or
   retro-edit existing pages as part of a bar change.
 - **Sync**: execute the posture on events, not a timer (section 7). Fetch
   before writes and before reads that matter when there is more than one
-  writer; push as part of the batch confirmation; stop loudly on
-  divergence. Surface the posture in the operator's words.
+  writer; push as part of the batch confirmation; stop loudly on divergence.
+  A local-only vault has no fetch or push to run — recommend a private
+  remote instead of promising a backup. Surface the posture in the
+  operator's words.
 - **Pack authoring**: the operator reviews the claims and the pack's skill
   text like code. Never install, update, or commit a pack without explicit
   confirmation.
