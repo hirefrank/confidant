@@ -492,3 +492,10 @@ built from (and whether `--embed` ran) in
 `<vault>/.confidant/qmd-build.json`, and `doctor` warns when the index is N
 commits behind or was last built without `--embed` (a missing or unreadable
 record is `unknown`, never a silent `ok`).
+
+On a CPU-only host, prefer bm25 or `--mode hybrid --no-rerank`: the LLM
+rerank stage can stall (`Reranking N chunks`) on hosts with few cores, while
+BM25 stays fast and vector/no-rerank hybrid are the ~15–17s-warm semantic
+fallback. The `qmd-search` skill's "CPU-only hosts" section carries the full
+posture (issue #794); `qmd-query.py` exposes `--no-rerank` and `-C N`, and a
+timed-out hybrid query names the rerank fallback instead of failing silently.

@@ -44,6 +44,49 @@ already work. `confidant doctor` reports the layer's state
 only a name on PATH (a stub or test shim) is not trusted; the checks probe
 `qmd --version`.
 
+## CPU-only hosts: prefer bm25 or `--no-rerank`
+
+The LLM rerank stage is the expensive part, and it is the wrong default on a
+host without a usable GPU. The accepted posture (issue #794, #774 stays open
+for the cold hang):
+
+- **BM25 is the default.** It is fast at any vault size and is the persisted
+  `default_mode` unless preflight recommends otherwise. It works with no
+  model downloads.
+- **Vector and `--no-rerank` hybrid are the semantic fallback.** Roughly
+  vector cost: ~15–17s warm on the measured 2-CPU field host, with a much
+  larger first (cold) model-touching run. Usable, not instant.
+- **Hybrid *with* reranking is not viable on CPU-only hosts.** On the
+  measured 2-CPU host it never finished inside a 200s bound, stalling at
+  `Reranking N chunks...`; expansion had already finished. A 12-core CPU
+  host completes it in seconds, so this is about the host class, not "any
+  CPU is too slow". Do not promise rerank latency on an unknown host.
+- **Reducing candidates helps the rerank stage but is not a fix.** `-C N`
+  (default 40) lowers how many chunks are reranked; it is bounded, not free,
+  and quality can drop (fewer candidates, sometimes fewer results). Measure
+  before recommending it as a permanent setting.
+
+What to do:
+
+```sh
+# CPU-only, semantic recall needed: no rerank
+"$(confidant which --skills-dir)"/qmd-search/bin/qmd-query.py --vault /path/to/vault --mode hybrid --no-rerank "quarterly planning"
+
+# CPU-only, fastest and always works
+"$(confidant which --skills-dir)"/qmd-search/bin/qmd-query.py --vault /path/to/vault --mode bm25 "quarterly planning"
+
+# Try a bounded rerank on a marginal host (lower candidate count)
+"$(confidant which --skills-dir)"/qmd-search/bin/qmd-query.py --vault /path/to/vault --mode hybrid -C 5 "quarterly planning"
+```
+
+If reranking stalls, **say so; do not time out silently.** Name the stage you
+saw (`Reranking N chunks`), stop waiting, and recommend `--no-rerank` or
+`--mode bm25`; keyword search still works, so this is a slower-mode report,
+not "search is broken". The wrapper's 180s timeout carries that hint (and
+the `#722` hub/compute hypotheses) in `fallback_hint`; an agent that sees it
+should relay the rerank fallback to the operator instead of retrying the same
+mode. Do not report a stalled run as a successful search.
+
 ## Upkeep: you own index freshness
 
 The corpus and embeddings are **derived state**. Keeping them fresh is your

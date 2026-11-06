@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Query a vault through the local QMD index, honoring the §12 allowlist.
 
-Usage: qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] [--packs LIST] QUERY
+Usage: qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] [--packs LIST]
+                     [--no-rerank] [-C N] QUERY
 
 - Runs `qmd query|search|vsearch --json` against the `confidant` collection.
 - EVERY hit is verified against the §12 allowlist in ONE CLI call per run:
@@ -450,6 +451,14 @@ def main():
     ap.add_argument("--packs", default=None, metavar="LIST",
                     help="comma-separated pack scope (issue #178); passed to "
                          "the allowlist and fallback `find` calls")
+    ap.add_argument("--no-rerank", action="store_true",
+                    help="hybrid only: skip LLM reranking (RRF scores only). "
+                         "The CPU-only fallback posture (#794): reranking can "
+                         "stall on hosts with few CPU cores")
+    ap.add_argument("-C", "--candidate-limit", type=int, default=None,
+                    metavar="N",
+                    help="hybrid only: max candidates to rerank (default 40; "
+                         "lower is faster, at a quality cost — #794)")
     ap.add_argument("query", nargs=argparse.REMAINDER)
     args = ap.parse_args()
     query = " ".join(args.query).strip()
@@ -463,6 +472,11 @@ def main():
     config = read_qmd_config()
     vault_config = read_vault_qmd_config(vault)
     mode = resolve_mode(args.mode, vault_config, config)
+    if (args.no_rerank or args.candidate_limit is not None) and mode != "hybrid":
+        sys.exit("error: --no-rerank and --candidate-limit apply only to "
+                 "--mode hybrid (bm25 has no rerank stage; vector has none)")
+    if args.candidate_limit is not None and args.candidate_limit < 1:
+        sys.exit("error: --candidate-limit must be at least 1")
     # Extra args for the allowlist and fallback `confidant find` calls.
     find_extra = ["--packs", args.packs] if args.packs else []
     corpus = os.path.join(vault, CORPUS_REL)
@@ -503,6 +517,14 @@ def main():
                  f"first (downloads models on first run), or use --mode bm25")
 
     sub = {"hybrid": "query", "bm25": "search", "vector": "vsearch"}[mode]
+    qmd_argv = [qmd, sub, query, "--json", "-n", str(args.n), "-c", COLLECTION]
+    if mode == "hybrid":
+        # #794: CPU-only hosts can stall in the rerank stage; these are the
+        # documented fallbacks when that happens.
+        if args.no_rerank:
+            qmd_argv.append("--no-rerank")
+        if args.candidate_limit is not None:
+            qmd_argv += ["-C", str(args.candidate_limit)]
     # No start_new_session here, on purpose (#775): qmd-preflight.py's
     # smoke timeout kills the wrapper's whole process group, and that
     # group kill is what reaps this qmd child when the wrapper itself
@@ -510,9 +532,8 @@ def main():
     # group and re-create the orphan leak. This run's own timeout
     # kills the direct qmd child via subprocess.run.
     try:
-        p = subprocess.run([qmd, sub, query, "--json", "-n", str(args.n),
-                            "-c", COLLECTION],
-                           capture_output=True, text=True, timeout=180, env=env)
+        p = subprocess.run(qmd_argv, capture_output=True, text=True,
+                           timeout=180, env=env)
     except subprocess.TimeoutExpired:
         # #722 item 6: a query that blocks must say so. The 0.7.0
         # timeout reported only `via: find-fallback`, sending
@@ -521,8 +542,16 @@ def main():
         # — conditioned on whether offline mode is already forced
         # (timeout_hint), so an already-offline timeout is never blamed
         # on the hub.
-        return fallback(f"qmd {sub} timed out after 180s",
-                        hint=timeout_hint(env))
+        hint = timeout_hint(env)
+        if mode == "hybrid" and not args.no_rerank:
+            # #794: this is the known CPU-only failure mode. Say which
+            # stage and the fallback; never let a rerank stall look like
+            # a generic network or hardware problem.
+            hint = (hint + " " if hint else "") + (
+                "the hybrid query did not finish within 180s; on a CPU-only "
+                "host the LLM rerank stage can stall (\"Reranking N chunks\"). "
+                "Retry with --no-rerank, or use --mode bm25 (#794).")
+        return fallback(f"qmd {sub} timed out after 180s", hint=hint)
     if p.returncode != 0:
         return fallback(f"qmd {sub} failed")
     try:
