@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
-    <meta name="description" content="Confidant is relationship memory you own — a local-first, git-backed memory for the people in your life. Open source, Apache-2.0." />
+    <meta name="description" content="Confidant is relationship memory you own: one shared, plain-text memory for you and your AI agents — the people in your life, and the places and things that connect them. Open source, Apache-2.0." />
     <link rel="icon" href="data:," />
     <title>Confidant — Relationship memory you own</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -314,12 +314,12 @@
             <div>
               <span class="pill">● Open source · Apache-2.0 · Local-first</span>
               <h1>Relationship memory <span class="co">you</span> <span class="t">own</span>.</h1>
-              <p class="lede">Remember the people who matter: the friend you meant to call, a birthday coming up, the details you want to carry into the next conversation. Confidant keeps that memory in <strong>plain files you own</strong>, ready for you and your AI agents.</p>
+              <p class="lede">Your agents draft the email, remember the birthday, and keep the notes — and each one touches the same people you do. Confidant is the one memory they all share with you: <strong>plain files you own</strong>, for the people in your life and the places and things that connect them.</p>
               <div class="cta-row">
                 <a class="btn solid" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">Get it on GitHub</a>
                 <a class="btn" href="#packs">Meet the packs</a>
               </div>
-              <p class="hero-note">Free forever — it's open source. Runs anywhere the <b>confidant</b> CLI runs.</p>
+              <p class="hero-note">Free forever — open source, local-first, no account.</p>
             </div>
             <div class="shard-stage" aria-hidden="true">
               <svg class="shard s1" style="--r:-8deg" viewBox="0 0 100 100"><polygon points="8,12 92,4 74,88 0,70" fill="#2fd6c0" opacity=".92"/></svg>
@@ -345,9 +345,9 @@
 
       <section class="block" id="packs">
         <div class="wrap">
-          <div class="sec-head"><p class="sec-tag">Built for real life</p><h2>The little things <span class="t">add up</span>.</h2><p class="sec-sub">Start with your personal relationships. Confidant keeps people, dates, and a history of touchpoints together, so caring for your relationships doesn't depend on remembering everything.</p></div>
+          <div class="sec-head"><p class="sec-tag">Built for real life</p><h2>The little things <span class="t">add up</span>.</h2><p class="sec-sub">Start with the people. Confidant keeps each person — and the places and things they connect through — together with a history of touchpoints, so caring for your relationships doesn't depend on remembering everything.</p></div>
           <div class="pack-grid">
-            <article class="pack-card c-core"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Remember</p><h3>A place for each person</h3><p>Keep notes, birthdays, and the details you want to remember in a readable Markdown file.</p></article>
+            <article class="pack-card c-core"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Remember</p><h3>A place for each person</h3><p>Keep each person, the places that matter, and the things you're working on as readable Markdown records.</p></article>
             <article class="pack-card c-draft"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Reconnect</p><h3>Notice what needs attention</h3><p>Set a cadence, log a call or a visit, and let <code>confidant check</code> surface overdue connections and upcoming dates.</p></article>
             <article class="pack-card c-yours"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Make it yours</p><h3>Grow with packs</h3><p>The personal pack is built in. When you need a different vocabulary, optional packs extend your vault; the pack-author skill can help draft one for your review.</p></article>
           </div>
@@ -357,7 +357,7 @@
       <section class="contrast" aria-label="What Confidant is not">
         <div class="wrap">
           <div class="contrast-inner">
-            <p><span class="line-a">Businesses need CRMs.</span><span class="line-b">Humans need to <span class="co">remember</span>.</span></p>
+            <p><span class="line-a">Businesses needed a CRM when many hands shared one set of relationships.</span><span class="line-b">You just got many hands — <span class="t">one memory</span>, shared, and <span class="co">yours</span>.</span></p>
           </div>
         </div>
       </section>
@@ -367,7 +367,7 @@
         <div class="feat-grid">
           <article class="feat"><div class="chip">1</div><h3>Plain files</h3><p>Your vault is a Git repository of readable records and a dated ledger. Inspect it, back it up, and take it with you.</p></article>
           <article class="feat"><div class="chip">2</div><h3>Thoughtful reminders</h3><p>Find overdue touchpoints and upcoming dates with a local check, based on the details you choose to keep.</p></article>
-          <article class="feat"><div class="chip">3</div><h3>Agents that can help</h3><p>Embedded skills help your AI agent work with your vault, with a propose, confirm, and apply workflow.</p></article>
+          <article class="feat"><div class="chip">3</div><h3>Agents that can help</h3><p>Embedded skills help your AI agents read and write your vault with a propose, confirm, and apply workflow — or connect them directly over MCP.</p></article>
           <article class="feat"><div class="chip">4</div><h3>Your boundaries</h3><p>Mark a record <code>no-ai</code> to keep it out of agent-facing reads. The files themselves remain readable on disk.</p></article>
           <article class="feat"><div class="chip">5</div><h3>Use it your way</h3><p>Work from the command line, the terminal interface, or an agent. Sync through a private Git remote if you choose.</p></article>
           <article class="feat"><div class="chip">6</div><h3>Open source</h3><p>Built in Rust and available under Apache-2.0. Confidant has no server holding your vault.</p></article>
@@ -385,14 +385,17 @@
 <span class="hl">A touchpoint is overdue · a birthday is coming up</span>
 
 <span class="cm"># Keep a record after you reach out</span>
-<span class="p">$</span> confidant log touch "Robin Example" text</pre></div></div></section>
+<span class="p">$</span> confidant log touch "Robin Example" text
+
+<span class="cm"># Fix a mistake without erasing history</span>
+<span class="p">$</span> confidant retract "Robin Example" --line 2026-09-14 --reason "logged under the wrong person"</pre></div></div></section>
       <section class="block" id="privacy"><div class="wrap"><div class="sec-head"><p class="sec-tag">Privacy, in plain language</p><h2>Know where your <span class="co">memory</span> lives.</h2></div><div class="trust-grid"><div><p class="big">Your vault is yours to keep. It is also readable by anyone who can access its files.</p><p>Confidant stores records as plaintext in a Git repository, including its history. Use full-disk encryption on trusted devices and a private remote if you sync. Confidant does not add its own encryption layer.</p><p>There is no Confidant server storing your vault. You can inspect the open-source code and the files yourself.</p></div><ul class="pieces"><li><i></i><div>On your device<span>Keep your vault on a trusted, encrypted machine.</span></div></li><li><i></i><div>Private remote<span>Anyone with access to your Git repo can read its records and history.</span></div></li><li><i></i><div>Agent boundaries<span><code>no-ai</code> excludes marked records from agent-facing reads; it does not encrypt them.</span></div></li><li><i></i><div>Files you own<span>Plain text and Git make your memory portable and inspectable.</span></div></li></ul></div></div></section>
 
       <section class="cta-band">
         <div class="wrap">
           <div class="cta-card">
             <h2>Ready to hold all the pieces yourself?</h2>
-            <p>Confidant is free and open source. Grab it from GitHub, spin up a vault, and keep your network in the one pair of hands it belongs in — yours.</p>
+            <p>Confidant is free and open source. Grab it from GitHub, spin up a vault, and keep your relationships in the one pair of hands they belong in — yours.</p>
             <div class="cta-row">
               <a class="btn solid" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">github.com/hirefrank/confidant</a>
               <a class="btn teal" href="#how">How it works</a>
