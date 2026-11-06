@@ -1,6 +1,6 @@
 ---
 name: "personal"
-description: "Personal relationships, places, and things pack (personal@0.4): identity and contact fields, the touch ledger verb with optional duration and 1:1/group mode, birthdays/dates, keep-in-touch cadence with basis, mode note, never/snooze, place/thing records with kind and address, relationship/place/thing edge kinds, the capture policy for what belongs in the vault, and every finding code the pack can emit — what each means and what to do about it."
+description: "Personal relationships, places, and things pack (personal@0.4): identity and contact fields, the one-line relationship context, role/company history, typed alias history, the touch ledger verb with optional duration and 1:1/group mode, birthdays/dates, keep-in-touch cadence with basis, mode note, never/snooze, place/thing records with kind and address, relationship/place/thing edge kinds, the capture policy for what belongs in the vault, and every finding code the pack can emit — what each means and what to do about it."
 ---
 
 # personal@0.4
@@ -19,6 +19,10 @@ you're working on or care about, and the moments that connect them.**
 - A touch can carry an optional `duration:` and `mode:` (1:1 vs group), so a
   60-minute session and a birthday party are facts on the line rather than
   prose in a note.
+- The person record can answer "how do I know them" directly:
+  `relationship_context` (the one-line story), `role_history` (the
+  role/company timeline), and `alias_history` (typed aliases with a
+  current/historical marker and a source).
 - `place` (`pl`, `places/`) and `thing` (`th`, `things/`) are pack-declared
   entities with required `name` and `kind`, optional `address`/`tags`/`links`,
   and their own edges. They are not person-like: no aliases, cadence, or
@@ -87,7 +91,10 @@ stay in the ledger.
 | `tags` | list | Free-form; `/` expresses hierarchy, no tree enforcement. |
 | `birthday` | `YYYY-MM-DD` or `--MM-DD` | The `--MM-DD` form is year-less. |
 | `dates` | comma-separated `LABEL:DATE` | Other recurring dates (for example an anniversary). |
-| `relationship` | non-empty string | How the person relates to the operator (for example `friend`). Renamed from 0.1's `relationship_to_me`. |
+| `relationship` | non-empty string | How the person relates to the operator as a category (for example `friend`, `investor`). Renamed from 0.1's `relationship_to_me`. |
+| `relationship_context` | non-empty string | The one-line story of how you know them ("I'm an investor in her company"). Distinct from the category; private context. |
+| `role_history` | `PERIOD\|ROLE\|COMPANY[\|SOURCE]` list | The role/company timeline. `title`/`company` stay the current values. Private context. |
+| `alias_history` | `KIND\|VALUE\|STATUS[\|SOURCE]` list | Typed aliases with kind, current/historical, and source. The plain contact lists stay the current values. Private context. |
 | `cadence` | `<N>d` or `never` | Keep-in-touch interval; `N` is `1..=3650`. `never` is the explicit "none, by design": never overdue, distinct from unset. |
 | `cadence_basis` | non-empty string | Why this cadence: `observed` (a rhythm derived from touch history) or `intention` (the rhythm the operator wants). Open vocabulary. |
 | `cadence_note` | non-empty string | The mode the cadence was set for, and why it changed. Free text; private context. |
@@ -110,6 +117,49 @@ dates: [anniversary:2020-06-15, graduation:--05-20]
 
 A year-less `--MM-DD` birthday or date has no year, so its next occurrence is
 the next `MM-DD` on or after `as_of`. A malformed value is `E_FRONTMATTER`.
+
+### Relationship context vs relationship (#742)
+
+`relationship` is the **category**: one noun for how the person relates to
+the operator (`friend`, `mentor`, `investor`, `former manager`).
+`relationship_context` is the **story**: one line that answers "how do I
+know them" for someone reading the record cold. Keep the category short and
+stable; let the story carry the specifics. Capture asks the story once when
+the person is added, and enrichment updates that field instead of rewriting
+the profile body.
+
+### Role and company history (#740)
+
+`title` and `company` are the current values. `role_history` is the
+timeline, one pipe-separated chapter per entry:
+
+```
+role_history: [2019-2021|Product manager|Example Co|linkedin-export, 2021-|Founder|Example Studio]
+```
+
+`PERIOD|ROLE|COMPANY[|SOURCE]`: the period is `YYYY-YYYY` or `YYYY-` for a
+chapter still open; role and company are free text without `|`; source is
+optional. Append a chapter when the person changes role or company instead
+of replacing the old one, and update `title`/`company` to match. A bad year,
+an end before the start, a missing field, or a duplicate is
+`E_FRONTMATTER`.
+
+### Typed aliases (#739)
+
+`emails`, `phones`, and `links` remain the plain current values.
+`alias_history` adds the typed ledger:
+
+```
+alias_history: [email|ada@example.test|current|email-signature, email|ada@old.example.test|historical|linkedin-export]
+```
+
+`KIND|VALUE|STATUS[|SOURCE]`: kind is `email`, `phone`, `handle`, or `name`;
+status is `current` or `historical`; source is optional. Use `historical` for
+a value kept for archaeology and `current` when you know the provenance of a
+live value. `alias resolve` matches both the plain values and the typed
+entries by kind and **prefers current over historical**, so an old address
+never shadows the live one. A malformed entry is `E_FRONTMATTER` and
+matches nothing.
 
 ### Cadence semantics (#750)
 
@@ -360,9 +410,12 @@ can act on it. This is a nudge, not a task, and it never blocks a write.
   There is no `no_ai: notes` mode for them. An uncleared place or thing
   returns no agent `context` bundle at all, not an empty one. The operator
   path still sees it with the badge.
-- **Address and the cadence note are private.** `context --exclude-private`
-  strips `address`, `tags`, `links`, and `cadence_note`; `kind`,
-  `cadence_basis`, and the derived cadence state stay.
+- **Address, the cadence note, and the person story are private.**
+  `context --exclude-private` strips `address`, `tags`, `links`,
+  `cadence_note`, `relationship_context`, `role_history`, and
+  `alias_history`; `kind`, `cadence_basis`, and the derived cadence state
+  stay. The same fields are hidden from agents by `no-ai` (deny-by-default),
+  and they never appear in the plain `context.aliases` array.
 - **Scope pack reads.** `--packs personal@0.4` limits reads to core and
   personal-owned items in a 0.4 vault; `personal@0.3` and `personal@0.2`
   remain no-op aliases.

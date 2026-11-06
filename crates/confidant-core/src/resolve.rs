@@ -25,6 +25,15 @@
 //! entry), and `name` against the display name. Matching is trimmed,
 //! case-insensitive, whole-string, and goes through the same cleared set and
 //! merge canonicalization as a name lookup.
+//!
+//! Since #739 the person record may also carry a typed `alias_history`
+//! (`KIND|VALUE|STATUS[|SOURCE]`). Those entries are matched by their kind
+//! too, and **current beats historical**: [`resolve_alias`] first looks at
+//! the plain values and the `current` entries, and only when nothing current
+//! matches does it fall back to `historical` entries. So a live address
+//! wins over an old one from the same person or another, and "kept for
+//! archaeology" never shadows "use this one now". A malformed
+//! `alias_history` matches nothing (`check` reports it as `E_FRONTMATTER`).
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -185,6 +194,10 @@ pub fn resolve_person(vault: &Vault, query: &str) -> Result<PersonMatch, PersonR
 /// - `handle` → the `handles` list, or the value half of a `links` entry;
 /// - `name` → the record's display name.
 ///
+/// #739: typed `alias_history` entries match under their own kind. Current
+/// entries are consulted with the plain values; historical entries are a
+/// fallback pass, so a live address is always preferred over an old one.
+///
 /// The match is against the §12 cleared set, exactly like a display-name
 /// lookup: a person who is `no-ai: true` is indistinguishable from an
 /// unmatched alias ([`PersonResolveError::NotFound`]), so the error never
@@ -207,12 +220,13 @@ pub fn resolve_alias(
     let merges = check_aliases_and_merges(vault, &known_ids, as_of, &mut merge_findings);
     drop(merge_findings);
 
-    let mut matches: BTreeSet<RecordId> = BTreeSet::new();
+    let mut current: BTreeSet<RecordId> = BTreeSet::new();
+    let mut historical: BTreeSet<RecordId> = BTreeSet::new();
     for record in vault.records.values() {
         if record.kind != RecordKind::Person || !cleared.contains(&record.id) {
             continue;
         }
-        let hit = match kind {
+        let plain = match kind {
             "email" => list_field_contains(record, "emails", &needle),
             "phone" => list_field_contains(record, "phones", &needle),
             "handle" => {
@@ -225,18 +239,38 @@ pub fn resolve_alias(
                 .is_some_and(|name| case_fold(name.trim()) == needle),
             _ => false,
         };
-        if !hit {
+        // #739: a typed entry matches only under its own kind. A `current`
+        // entry counts with the plain values; a `historical` entry is the
+        // fallback pass.
+        let (typed_current, typed_historical) = typed_alias_status(record, kind, &needle);
+        let current_hit = plain || typed_current;
+        let historical_hit = typed_historical && !current_hit;
+        if !current_hit && !historical_hit {
             continue;
         }
         let canonical = canonical_on(&record.id, &merges, as_of);
         // Only cleared people resolve. A cleared member merged into a
         // `no-ai: true` canonical maps to a hidden id and is dropped, so a
         // hidden person is never surfaced by an alias either.
-        if cleared.contains(&canonical) {
-            matches.insert(canonical);
+        if !cleared.contains(&canonical) {
+            continue;
+        }
+        if current_hit {
+            current.insert(canonical);
+        } else {
+            historical.insert(canonical);
         }
     }
 
+    // #739: prefer the live value. Historical entries are consulted only
+    // when no cleared person has a current match, so an old address never
+    // shadows a current one and never turns a unique live match into an
+    // ambiguity.
+    let matches = if current.is_empty() {
+        historical
+    } else {
+        current
+    };
     match matches.len() {
         0 => Err(miss(vault)),
         1 => Ok(PersonMatch {
@@ -247,6 +281,33 @@ pub fn resolve_alias(
             candidates: matches.into_iter().collect(),
         }),
     }
+}
+
+/// Whether `record`'s typed `alias_history` has a matching entry for
+/// `kind` and `needle` (already case-folded), split into current and
+/// historical. A malformed `alias_history` matches neither: the field
+/// grammar rejected it, so resolution fails closed and `check` reports
+/// `E_FRONTMATTER`.
+fn typed_alias_status(record: &crate::record::Record, kind: &str, needle: &str) -> (bool, bool) {
+    let Some(entries) = record
+        .field("alias_history")
+        .and_then(crate::packs::grammars::parse_alias_list)
+    else {
+        return (false, false);
+    };
+    let mut current = false;
+    let mut historical = false;
+    for entry in entries {
+        if entry.kind != kind || case_fold(entry.value.trim()) != needle {
+            continue;
+        }
+        match entry.status.as_str() {
+            "current" => current = true,
+            "historical" => historical = true,
+            _ => {}
+        }
+    }
+    (current, historical)
 }
 
 /// Whether a `list` front-matter field contains `needle` (already
@@ -793,6 +854,148 @@ mod tests {
         let vault = load(&root);
         assert_eq!(
             resolve_alias(&vault, "email", "ada@example.com"),
+            Err(PersonResolveError::NotFound)
+        );
+    }
+
+    /// #739: a typed `alias_history` entry resolves under its own kind,
+    /// with `current` preferred over `historical`.
+    #[test]
+    fn resolve_alias_reads_typed_alias_history() {
+        let (_tmp, root) = vault("typed-alias", |root| {
+            contact_person(
+                root,
+                ADA,
+                "Ada Example",
+                "alias_history: [email|ada@old.example|historical|linkedin-export, email|ada@example.com|current|email-signature, name|Ada Former|historical]\n",
+            );
+        });
+        let vault = load(&root);
+        let expected = PersonMatch {
+            id: RecordId::parse(ADA).unwrap(),
+            matched_by_name: false,
+        };
+        assert_eq!(
+            resolve_alias(&vault, "email", "ada@example.com"),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            resolve_alias(&vault, "email", "ADA@OLD.EXAMPLE"),
+            Ok(expected.clone())
+        );
+        // A former name is resolvable through the typed entry too.
+        assert_eq!(
+            resolve_alias(&vault, "name", "ada former"),
+            Ok(expected.clone())
+        );
+        // The kind still scopes the match.
+        assert_eq!(
+            resolve_alias(&vault, "phone", "ada@example.com"),
+            Err(PersonResolveError::NotFound)
+        );
+    }
+
+    /// #739: a current value wins over a historical one, even when the
+    /// historical value matches a different person.
+    #[test]
+    fn resolve_alias_prefers_current_over_historical() {
+        {
+            let (_tmp, root) = vault("alias-preference", |root| {
+                contact_person(
+                    root,
+                    ADA,
+                    "Ada Example",
+                    "alias_history: [email|shared@example.com|historical]\n",
+                );
+                contact_person(
+                    root,
+                    BEA,
+                    "Bea Demo",
+                    "alias_history: [email|shared@example.com|current]\n",
+                );
+            });
+            let loaded = load(&root);
+            assert_eq!(
+                resolve_alias(&loaded, "email", "shared@example.com"),
+                Ok(PersonMatch {
+                    id: RecordId::parse(BEA).unwrap(),
+                    matched_by_name: false,
+                })
+            );
+        }
+
+        // Plain `emails` values are current by definition, so they win the
+        // same way.
+        {
+            let (_tmp, root) = vault("alias-preference-plain", |root| {
+                contact_person(
+                    root,
+                    ADA,
+                    "Ada Example",
+                    "alias_history: [email|shared@example.com|historical]\n",
+                );
+                contact_person(root, BEA, "Bea Demo", "emails: shared@example.com\n");
+            });
+            let loaded = load(&root);
+            assert_eq!(
+                resolve_alias(&loaded, "email", "shared@example.com"),
+                Ok(PersonMatch {
+                    id: RecordId::parse(BEA).unwrap(),
+                    matched_by_name: false,
+                })
+            );
+        }
+
+        // With no current match at all, the historical entry still resolves.
+        {
+            let (_tmp, root) = vault("alias-only-historical", |root| {
+                contact_person(
+                    root,
+                    ADA,
+                    "Ada Example",
+                    "alias_history: [email|old@example.com|historical]\n",
+                );
+            });
+            let loaded = load(&root);
+            assert_eq!(
+                resolve_alias(&loaded, "email", "old@example.com"),
+                Ok(PersonMatch {
+                    id: RecordId::parse(ADA).unwrap(),
+                    matched_by_name: false,
+                })
+            );
+        }
+    }
+
+    /// #739: a malformed `alias_history` matches nothing (check reports it),
+    /// and a hidden person's typed aliases stay unresolvable.
+    #[test]
+    fn resolve_alias_typed_history_fails_closed() {
+        let (_tmp, root) = vault("typed-bad", |root| {
+            contact_person(
+                root,
+                ADA,
+                "Ada Example",
+                "alias_history: [email|bad@example.com|live]\n",
+            );
+            let d = root.join(format!("people/{BEA}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("profile.md"),
+                format!(
+                    "---\nid: {BEA}\ntype: person\nname: \"Hidden Person\"\nno-ai: true\n\
+                     alias_history: [email|hidden@example.com|current]\n---\n\nFake bio.\n"
+                ),
+            )
+            .unwrap();
+        });
+        let vault = load(&root);
+        assert_eq!(
+            resolve_alias(&vault, "email", "bad@example.com"),
+            Err(PersonResolveError::NotFound)
+        );
+        assert_eq!(
+            resolve_alias(&vault, "email", "hidden@example.com"),
             Err(PersonResolveError::NotFound)
         );
     }

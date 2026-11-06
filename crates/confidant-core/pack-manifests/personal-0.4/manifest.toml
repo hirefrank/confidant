@@ -72,6 +72,14 @@ grammar = "non-empty-string"
 name = "company"
 grammar = "non-empty-string"
 
+# #740: the role/company timeline, one chapter per pipe-separated entry:
+# `PERIOD|ROLE|COMPANY[|SOURCE]` with PERIOD as `YYYY-YYYY` or `YYYY-`
+# (still current). `title`/`company` stay the current values; this list is
+# the history enrichment appends to instead of overwriting.
+[[fields]]
+name = "role_history"
+grammar = "role-history"
+
 [[fields]]
 name = "location"
 grammar = "non-empty-string"
@@ -88,6 +96,14 @@ grammar = "list"
 name = "links"
 grammar = "labeled-list"
 
+# #739: the typed alias ledger, one entry per pipe-separated record:
+# `KIND|VALUE|STATUS[|SOURCE]` with KIND one of email/phone/handle/name and
+# STATUS `current` or `historical`. The plain `emails`/`phones`/links stay
+# the untyped current contract; `alias resolve` prefers current entries.
+[[fields]]
+name = "alias_history"
+grammar = "alias-list"
+
 [[fields]]
 name = "tags"
 grammar = "list"
@@ -102,6 +118,14 @@ grammar = "dates-list"
 
 [[fields]]
 name = "relationship"
+grammar = "non-empty-string"
+
+# #742: the one-line story of how the operator knows the person, distinct
+# from `relationship` (the categorical relationship, e.g. `friend`) and from
+# the free-text profile. PII: hidden by no-ai and stripped by
+# --exclude-private like the other profile fields.
+[[fields]]
+name = "relationship_context"
 grammar = "non-empty-string"
 
 [[fields]]

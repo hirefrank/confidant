@@ -816,6 +816,51 @@ fn personal_04_context_fields_and_privacy() {
     assert_eq!(operator.entity.fields["address"], "2 Example Lane");
 }
 
+/// #739, #740, #742: the checked-in 0.4 fixture carries the typed person
+/// fields, and the same privacy switch strips them.
+#[test]
+fn personal_04_person_relationship_fields_and_privacy() {
+    let vault = load_vault(&personal_04_fixture()).unwrap();
+    let person = confidant_core::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+
+    let full = build_context(&vault, &person, true, &PackScope::All, false).unwrap();
+    let personal = &full.packs["personal@0.4"];
+    assert_eq!(
+        personal["relationship_context"], "I'm an investor in her company",
+        "{personal}"
+    );
+    assert_eq!(
+        personal["role_history"],
+        json!([
+            {"period": "2019-2021", "role": "Product manager", "company": "Example Co", "source": "linkedin-export"},
+            {"period": "2021-", "role": "Founder", "company": "Example Studio", "source": "operator"},
+        ]),
+        "{personal}"
+    );
+    assert_eq!(
+        personal["alias_history"],
+        json!([
+            {"kind": "email", "value": "dana@example.test", "status": "current", "source": "email-signature"},
+            {"kind": "email", "value": "dana@old.example.test", "status": "historical", "source": "linkedin-export"},
+        ]),
+        "{personal}"
+    );
+
+    let private = build_context(&vault, &person, false, &PackScope::All, false).unwrap();
+    let personal = &private.packs["personal@0.4"];
+    for field in ["relationship_context", "role_history", "alias_history"] {
+        assert!(personal.get(field).is_none(), "{field} visible: {personal}");
+    }
+    let dumped = serde_json::to_string(&private).unwrap();
+    for leak in [
+        "investor in her company",
+        "Product manager",
+        "dana@old.example.test",
+    ] {
+        assert!(!dumped.contains(leak), "{leak} leaked in {dumped}");
+    }
+}
+
 #[test]
 fn personal_04_requires_kind_and_rejects_notes_mode() {
     let dir = personal_04_vault();

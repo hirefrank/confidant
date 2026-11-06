@@ -226,6 +226,8 @@ registry; the list itself is frozen by this spec):
 | `list` | comma-separated values, optionally wrapped in `[...]`; entries whitespace-trimmed, non-empty, and unique (no quoting, so a comma inside an entry is unsupported; `[]` is a valid empty list) | `parse_list` |
 | `labeled-list` | comma-separated `LABEL:VALUE` entries, optionally wrapped in `[...]`; each entry splits at the **first** `:`; `LABEL` matches `[a-zA-Z0-9_-]+`; `VALUE` is whitespace-trimmed, non-empty, may contain `:` but not a newline; duplicate labels rejected | `parse_labeled_list` |
 | `date` | one strict `YYYY-MM-DD` (a one-off date; `--MM-DD` is not accepted) | `parse_date` |
+| `alias-list` | comma-separated `KIND\|VALUE\|STATUS[\|SOURCE]` entries, optionally wrapped in `[...]`; `KIND` is `email`, `phone`, `handle`, or `name`; `STATUS` is `current` or `historical`; `SOURCE` is optional; a component may contain `:` but not `\|`; a repeated `(KIND, VALUE)` is rejected | `parse_alias_list` |
+| `role-history` | comma-separated `PERIOD\|ROLE\|COMPANY[\|SOURCE]` entries, optionally wrapped in `[...]`; `PERIOD` is `YYYY-YYYY` or `YYYY-` (still current), a four-digit year in `1000..=2999`, start not after end; malformed year, missing field, or duplicate rejected | `parse_role_history` |
 
 A field naming an unknown grammar is a load error. Adding a grammar is
 a spec change to this list plus a Rust parser — never a manifest-only

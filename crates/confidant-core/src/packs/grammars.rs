@@ -29,6 +29,15 @@ pub const GRAMMAR_NON_EMPTY_STRING: &str = "non-empty-string";
 pub const GRAMMAR_LIST: &str = "list";
 pub const GRAMMAR_LABELED_LIST: &str = "labeled-list";
 pub const GRAMMAR_DATE: &str = "date";
+pub const GRAMMAR_ALIAS_LIST: &str = "alias-list";
+pub const GRAMMAR_ROLE_HISTORY: &str = "role-history";
+
+/// The alias kinds an `alias-list` entry may name.
+pub const ALIAS_KINDS: &[&str] = &["email", "phone", "handle", "name"];
+
+/// The statuses an `alias-list` entry may name: the value in use now, or a
+/// former value kept for archaeology.
+pub const ALIAS_STATUSES: &[&str] = &["current", "historical"];
 
 pub const KNOWN_GRAMMARS: &[&str] = &[
     GRAMMAR_RECURRING_DATE,
@@ -38,6 +47,8 @@ pub const KNOWN_GRAMMARS: &[&str] = &[
     GRAMMAR_LIST,
     GRAMMAR_LABELED_LIST,
     GRAMMAR_DATE,
+    GRAMMAR_ALIAS_LIST,
+    GRAMMAR_ROLE_HISTORY,
 ];
 
 /// A front-matter field value parsed by one of the [`KNOWN_GRAMMARS`].
@@ -54,10 +65,43 @@ pub enum FieldValue {
     List(Vec<String>),
     /// `labeled-list`: comma-separated `LABEL:VALUE` entries.
     LabeledList(Vec<(String, String)>),
+    /// `alias-list`: comma-separated `KIND|VALUE|STATUS[|SOURCE]` entries.
+    AliasList(Vec<AliasEntry>),
+    /// `role-history`: comma-separated `PERIOD|ROLE|COMPANY[|SOURCE]`
+    /// entries.
+    RoleHistory(Vec<RoleHistoryEntry>),
     /// `date`: one strict `YYYY-MM-DD`.
     Date(NaiveDate),
     /// `non-empty-string`: whitespace-trimmed text.
     Text(String),
+}
+
+/// One typed alias (`alias-list`): a contact value, whether it is current
+/// or historical, and where it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AliasEntry {
+    /// One of [`ALIAS_KINDS`].
+    pub kind: String,
+    /// The alias value (an address, number, handle, or former name).
+    pub value: String,
+    /// One of [`ALIAS_STATUSES`].
+    pub status: String,
+    /// Optional provenance (`linkedin-export`, `email-signature`, …).
+    pub source: Option<String>,
+}
+
+/// One role/company chapter (`role-history`): what the person did, where,
+/// when, and where the fact came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoleHistoryEntry {
+    /// `YYYY-YYYY` or `YYYY-` (still current).
+    pub period: String,
+    /// The role at the time.
+    pub role: String,
+    /// The company or organization at the time.
+    pub company: String,
+    /// Optional provenance.
+    pub source: Option<String>,
 }
 
 /// A `cadence` value (spec §6): a day window, or `never`.
@@ -88,6 +132,8 @@ pub fn parse_field_grammar(
         GRAMMAR_LIST => parse_list(raw).map(FieldValue::List),
         GRAMMAR_LABELED_LIST => parse_labeled_list(raw).map(FieldValue::LabeledList),
         GRAMMAR_DATE => parse_date(raw).map(FieldValue::Date),
+        GRAMMAR_ALIAS_LIST => parse_alias_list(raw).map(FieldValue::AliasList),
+        GRAMMAR_ROLE_HISTORY => parse_role_history(raw).map(FieldValue::RoleHistory),
         GRAMMAR_NON_EMPTY_STRING => {
             let trimmed = raw.trim();
             (!trimmed.is_empty()).then(|| FieldValue::Text(trimmed.to_owned()))
@@ -284,6 +330,111 @@ pub fn parse_dates_list(raw: &str) -> Option<Vec<RecurringDate>> {
         out.push(rd);
     }
     Some(out)
+}
+
+/// Split one pipe-separated list entry into 3 or 4 trimmed, non-empty
+/// fields. Used by the structured list grammars; a component may not
+/// contain `|`, so a wrong field count fails closed (spec §6).
+fn split_pipe_fields(token: &str) -> Option<Vec<String>> {
+    if token.is_empty() || token.contains('\n') || token.contains('\r') {
+        return None;
+    }
+    let parts: Vec<String> = token.split('|').map(|p| p.trim().to_owned()).collect();
+    if !(3..=4).contains(&parts.len()) || parts.iter().any(String::is_empty) {
+        return None;
+    }
+    Some(parts)
+}
+
+/// Parse `alias_history:` (`[KIND|VALUE|STATUS|SOURCE, ...]`).
+///
+/// `KIND` is one of [`ALIAS_KINDS`], `STATUS` one of [`ALIAS_STATUSES`], and
+/// `SOURCE` is optional. Entries are comma-separated, optionally wrapped in
+/// `[...]`, and a repeated `(KIND, VALUE)` fails closed. `VALUE` is matched
+/// case-insensitively by `alias resolve`.
+pub fn parse_alias_list(raw: &str) -> Option<Vec<AliasEntry>> {
+    let inner = strip_optional_brackets(raw)?;
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out: Vec<AliasEntry> = Vec::new();
+    for item in inner.split(',') {
+        let parts = split_pipe_fields(item)?;
+        let (kind, value, status) = (parts[0].clone(), parts[1].clone(), parts[2].clone());
+        if !ALIAS_KINDS.contains(&kind.as_str()) || !ALIAS_STATUSES.contains(&status.as_str()) {
+            return None;
+        }
+        if out
+            .iter()
+            .any(|e| e.kind == kind && e.value.eq_ignore_ascii_case(&value))
+        {
+            return None;
+        }
+        out.push(AliasEntry {
+            kind,
+            value,
+            status,
+            source: parts.get(3).cloned(),
+        });
+    }
+    Some(out)
+}
+
+/// Parse `role_history:` (`[PERIOD|ROLE|COMPANY|SOURCE, ...]`).
+///
+/// `PERIOD` is `YYYY-YYYY` or `YYYY-` (still current). `SOURCE` is optional.
+/// Entries are comma-separated, optionally wrapped in `[...]`, and must be
+/// unique.
+pub fn parse_role_history(raw: &str) -> Option<Vec<RoleHistoryEntry>> {
+    let inner = strip_optional_brackets(raw)?;
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out: Vec<RoleHistoryEntry> = Vec::new();
+    for item in inner.split(',') {
+        let parts = split_pipe_fields(item)?;
+        let (period, role, company) = (parts[0].clone(), parts[1].clone(), parts[2].clone());
+        if !is_valid_role_period(&period) {
+            return None;
+        }
+        let entry = RoleHistoryEntry {
+            period,
+            role,
+            company,
+            source: parts.get(3).cloned(),
+        };
+        if out.contains(&entry) {
+            return None;
+        }
+        out.push(entry);
+    }
+    Some(out)
+}
+
+/// Whether `period` is `YYYY-YYYY` or `YYYY-` (current), with a sane year
+/// range and a start not after the end.
+fn is_valid_role_period(period: &str) -> bool {
+    let Some((start, end)) = period.split_once('-') else {
+        return false;
+    };
+    let year = |s: &str| -> Option<u32> {
+        if s.len() == 4 && s.bytes().all(|b| b.is_ascii_digit()) {
+            let year: u32 = s.parse().ok()?;
+            (1000..=2999).contains(&year).then_some(year)
+        } else {
+            None
+        }
+    };
+    let Some(start) = year(start) else {
+        return false;
+    };
+    if end.is_empty() {
+        return true;
+    }
+    let Some(end) = year(end) else {
+        return false;
+    };
+    start <= end
 }
 
 #[cfg(test)]
@@ -514,7 +665,9 @@ mod tests {
     fn known_grammars_is_the_frozen_spec_list() {
         // Adding a grammar is a spec change (spec §6); pin the list so it
         // fails loudly here too, not just in the manifest loader. The 0.2
-        // spec edit (#509) appended `list`, `labeled-list` and `date`.
+        // spec edit (#509) appended `list`, `labeled-list` and `date`; the
+        // 0.4 personal-fields edit (#739, #740) appended the two structured
+        // list grammars.
         assert_eq!(
             KNOWN_GRAMMARS,
             &[
@@ -524,7 +677,9 @@ mod tests {
                 "non-empty-string",
                 "list",
                 "labeled-list",
-                "date"
+                "date",
+                "alias-list",
+                "role-history",
             ]
         );
     }
@@ -543,7 +698,84 @@ mod tests {
                 GRAMMAR_LIST,
                 GRAMMAR_LABELED_LIST,
                 GRAMMAR_DATE,
+                GRAMMAR_ALIAS_LIST,
+                GRAMMAR_ROLE_HISTORY,
             ]
         );
+    }
+
+    #[test]
+    fn alias_list_parses_kind_value_status_and_source() {
+        let list = parse_alias_list(
+            "[email|ada@example.com|current|email-signature, \
+             email|ada@old.example|historical|linkedin-export, \
+             name|Ada Former|historical]",
+        )
+        .unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].kind, "email");
+        assert_eq!(list[0].value, "ada@example.com");
+        assert_eq!(list[0].status, "current");
+        assert_eq!(list[0].source.as_deref(), Some("email-signature"));
+        assert_eq!(list[2].kind, "name");
+        assert_eq!(list[2].source, None);
+        assert!(parse_alias_list("[]").unwrap().is_empty());
+        assert!(
+            parse_field_grammar(GRAMMAR_ALIAS_LIST, "alias_history", "phone|+1555|current")
+                .is_some_and(|v| matches!(v, FieldValue::AliasList(_)))
+        );
+    }
+
+    #[test]
+    fn alias_list_rejects_malformed_entries() {
+        for bad in [
+            // Unknown kind or status.
+            "fax|ada@example.com|current",
+            "email|ada@example.com|live",
+            // Missing fields / empty field.
+            "email|ada@example.com",
+            "email||current",
+            // Too many fields (a `|` inside a value is not supported).
+            "email|ada|example|current|source",
+            // Repeated (kind, value).
+            "[email|ada@example.com|current, email|ADA@EXAMPLE.COM|historical]",
+            // A newline can never be part of a list entry.
+            "email|ada@example.com|current\nname|x|historical",
+        ] {
+            assert!(parse_alias_list(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn role_history_parses_period_role_company_and_source() {
+        let list = parse_role_history(
+            "[2019-2021|Product manager|Example Co|linkedin-export, \
+             2021-|Founder|Example Studio]",
+        )
+        .unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].period, "2019-2021");
+        assert_eq!(list[0].role, "Product manager");
+        assert_eq!(list[0].company, "Example Co");
+        assert_eq!(list[0].source.as_deref(), Some("linkedin-export"));
+        assert_eq!(list[1].period, "2021-");
+        assert_eq!(list[1].source, None);
+        assert!(parse_role_history("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn role_history_rejects_malformed_periods_and_entries() {
+        for bad in [
+            "2019|Product manager|Example Co",
+            "2019-202|Product manager|Example Co",
+            "2021-2019|Product manager|Example Co",
+            "abcd-efgh|Product manager|Example Co",
+            "2019-2021||Example Co",
+            "2019-2021|Product manager",
+            "2019-2021|Product manager|Example Co|linkedin|export",
+            "[2019-2021|Product manager|Example Co, 2019-2021|Product manager|Example Co]",
+        ] {
+            assert!(parse_role_history(bad).is_none(), "{bad:?}");
+        }
     }
 }
