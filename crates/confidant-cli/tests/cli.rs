@@ -4030,6 +4030,57 @@ fn pack_remove_allow_unresolved_unlists_and_keeps_files() {
     assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
 }
 
+/// #857: the post-unlist hint must name the command that actually re-lists an
+/// unlisted vendored pack. Plain `pack add --from-dir … --yes` refuses in
+/// `preflight_unlisted_pack`, so the hint needs `--allow-unresolved`, and the
+/// hinted shape must work against the kept vendored copy.
+#[cfg(unix)]
+#[test]
+fn pack_remove_unlist_hint_names_a_command_that_re_lists() {
+    let vault = listed_example_pack_vault_with_data();
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("confidant pack add --from-dir <pack> --allow-unresolved --yes"),
+        "the hint must name the flag that re-lists: {stdout}"
+    );
+
+    // The old hint (without --allow-unresolved) is refused while the tree and
+    // [checks] key remain.
+    let vendored = vault.path().join("packs/example-pack@0.1");
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(&vendored)
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+
+    // The hinted shape re-lists the vendored copy and clears the orphans.
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(&vendored)
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = [\"example-pack@0.1\"]"), "{cfg}");
+    let c = check_json(vault.path());
+    assert_eq!(c["ok"], true, "{c}");
+    assert_eq!(c["summary"]["warnings"], 0, "{c}");
+}
+
 /// #699: an unrelated error still gates the unlist. The pre-check is skipped
 /// here (the pack is listed but unpinned, the repairing path), so the
 /// post-check is what rolls the write back.

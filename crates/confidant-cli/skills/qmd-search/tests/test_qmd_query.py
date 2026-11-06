@@ -453,7 +453,9 @@ class QmdIndexStagingTest(unittest.TestCase):
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=self.vault,
             capture_output=True, text=True, check=True).stdout.strip()
-        self.index.record_build_head(str(self.vault), embedded=True)
+        sampled = self.index.vault_head(str(self.vault))
+        self.assertEqual(sampled, head)
+        self.index.record_build_head(str(self.vault), sampled, embedded=True)
         marker = self.vault / ".confidant" / "qmd-build.json"
         payload = json.loads(marker.read_text(encoding="utf-8"))
         self.assertEqual(payload["commit"], head)
@@ -467,13 +469,62 @@ class QmdIndexStagingTest(unittest.TestCase):
 
     def test_build_record_without_a_commit_is_null_not_invented(self):
         # A vault with no commit yet must not claim a HEAD.
-        self.index.record_build_head(str(self.vault))
+        self.index.record_build_head(str(self.vault), None)
         payload = json.loads(
             (self.vault / ".confidant" / "qmd-build.json")
             .read_text(encoding="utf-8"))
         self.assertIsNone(payload["commit"])
         self.assertFalse(payload["embedded"])
         self.assertIn("built_at", payload)
+
+    def test_build_records_the_head_sampled_before_embed(self):
+        # #725 follow-up: a commit made while `--embed` runs is not in the
+        # corpus, so the marker must carry the HEAD sampled before staging
+        # and embedding, not the HEAD at write time.
+        commit = ["git", "-c", "user.name=Confidant Test",
+                  "-c", "user.email=test@example.com",
+                  "commit", "--allow-empty", "-qm"]
+        subprocess.run(commit + ["fixture"], cwd=self.vault, check=True)
+        sampled = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.vault,
+            capture_output=True, text=True, check=True).stdout.strip()
+
+        def fake_qmd(args, env, check=True):
+            if args == ["embed"]:
+                subprocess.run(commit + ["commit during embed"],
+                               cwd=self.vault, check=True)
+            return subprocess.CompletedProcess(["qmd"] + args, 0, "", "")
+
+        seen = {}
+
+        def fake_record(vault, commit, embedded=False):
+            seen["commit"] = commit
+            seen["embedded"] = embedded
+
+        with unittest.mock.patch.object(self.index, "ensure_store_dirs"), \
+                unittest.mock.patch.object(self.index, "migrate_default_store"), \
+                unittest.mock.patch.object(
+                    self.index, "stage_cleared_corpus",
+                    return_value=(str(self.vault), 0, 0)), \
+                unittest.mock.patch.object(self.index, "exclude_from_backups"), \
+                unittest.mock.patch.object(
+                    self.index, "run_qmd", side_effect=fake_qmd), \
+                unittest.mock.patch.object(
+                    self.index, "record_build_head", side_effect=fake_record), \
+                unittest.mock.patch.object(
+                    sys, "argv",
+                    ["qmd-index.py", "--vault", str(self.vault), "--embed",
+                     "--skip-preflight"]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.index.main()
+
+        live = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.vault,
+            capture_output=True, text=True, check=True).stdout.strip()
+        self.assertNotEqual(live, sampled, "the embed must advance HEAD")
+        self.assertEqual(seen["commit"], sampled,
+                         "the marker must keep the pre-embed HEAD")
+        self.assertTrue(seen["embedded"])
 
 
 class CorpusLineIndexTest(unittest.TestCase):
@@ -749,6 +800,8 @@ class QmdQueryConfigTest(unittest.TestCase):
                         shutil, "which", return_value="/fake/bin"), \
                     unittest.mock.patch.object(
                         subprocess, "run", side_effect=fake_run), \
+                    unittest.mock.patch.dict(
+                        os.environ, {"HF_HUB_OFFLINE": ""}), \
                     contextlib.redirect_stdout(out), \
                     contextlib.redirect_stderr(io.StringIO()):
                 code = self.query.main()

@@ -397,10 +397,10 @@ pub fn contract_schema() -> Value {
                         "description": "Mirrored `touch` ledger lines for this person (#179). The agent path returns only the effective view: a superseded line is absent. The operator path (`--for-operator`) also lists superseded lines, each marked `superseded: true`, so an operator can see what a retraction voided. The badge is operator-only and does not widen any agent-facing read. Empty for a non-person-like target.",
                         "items": {
                             "type": "object",
-                            "required": ["date"],
+                            "required": ["date", "kind"],
                             "properties": {
                                 "date": {"type": "string"},
-                                "kind": {"type": ["string", "null"]},
+                                "kind": {"type": ["string", "null"], "description": "Always present: the touchpoint kind, or null when the line carries none."},
                                 "superseded": {"type": "boolean", "description": "Operator path only: this line is superseded by a valid retraction. Absent on the agent path and on live lines."}
                             }
                         }
@@ -414,7 +414,7 @@ pub fn contract_schema() -> Value {
                             "properties": {
                                 "type": {"type": "string", "enum": ["touch", "interaction"]},
                                 "date": {"type": ["string", "null"]},
-                                "kind": {"type": ["string", "null"], "description": "Touch only: the touchpoint kind."},
+                                "kind": {"type": ["string", "null"], "description": "Touch only: the touchpoint kind, always present (null when the line carries none)."},
                                 "duration_minutes": {"type": "integer", "description": "Touch only, when the line carries a duration."},
                                 "mode": {"type": "string", "description": "Touch only: one-on-one or group, when the line carries it."},
                                 "superseded": {"type": "boolean", "description": "Operator path only: this touch is superseded by a valid retraction."},
@@ -583,6 +583,12 @@ mod tests {
         assert!(s["$defs"]["entityView"]["properties"]["fields"].is_object());
         assert!(s["$defs"]["edgeView"]["properties"]["direction"]["enum"].is_array());
         assert!(s["$defs"]["edgeView"]["properties"]["no_ai"].is_object());
+        // A kind-less touchpoint keeps `"kind": null` (ADR-7 shape), so the
+        // key is required, not optional.
+        assert_eq!(
+            context["properties"]["touchpoints"]["items"]["required"],
+            serde_json::json!(["date", "kind"])
+        );
         assert_eq!(s["properties"]["schema_version"]["const"], "1");
     }
 
