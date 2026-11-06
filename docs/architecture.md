@@ -621,11 +621,58 @@ existing bundle is unchanged. `cadence_basis`/`cadence_note` are pack
 fields, so an external pack cannot claim them and a non-personal vault
 ignores them. The frozen 0.3 pack stays in the binary and its contract in
 `packs/personal/0.3.md`. Follow-ups: a drifting-radar routine that reads
-the basis (#726) and TUI capture for the rich pairs.
+the basis (#726) and TUI capture for the rich pairs. ADR-23 adds the
+person-story fields to the same pack version.
+
+### ADR-23. `personal@0.4` adds the person-story fields (#742, #740, #739).
+
+**Door:** One-way (a vault that writes the field names and entry syntax
+commits to them).
+
+**Context.** "How do I know them" lived in the free-text profile, so capture
+and enrichment rewrote prose and context bundles could not answer it
+reliably (#742). `title`/`company` held only the current chapter, so a
+career arc survived as a sentence (#740). Aliases were an untyped union of
+`emails`/`phones`/`handles`, with no way to tell a live address from one
+kept for archaeology or where either came from (#739).
+
+**Decision.** The fields are additive on `personal@0.4`; no new pack
+version and no new spec version.
+
+- `relationship_context` is a plain `non-empty-string`: the one-line story,
+  distinct from `relationship` (the category) and from the profile body.
+- `role_history` is a new `role-history` grammar:
+  `PERIOD|ROLE|COMPANY[|SOURCE]`, periods `YYYY-YYYY` or `YYYY-` (current).
+  `title`/`company` stay the current values; enrichment appends a chapter.
+- `alias_history` is a new `alias-list` grammar:
+  `KIND|VALUE|STATUS[|SOURCE]` with kinds `email`/`phone`/`handle`/`name`
+  and statuses `current`/`historical`. The plain contact lists stay the
+  current contract; `alias resolve` reads both and prefers current entries,
+  so a historical value never shadows a live one.
+- All three are profile content: they join the `--exclude-private` list and
+  are hidden by `no-ai` under the existing deny-by-default rule. The bundle's
+  plain `aliases` array is unchanged.
+- Grammar additions are a spec change to the fixed list (`spec/pack-manifest.md`
+  §6), not a manifest-only trick.
+
+**Alternatives considered.** (a) A structured relationship object: two
+fields (`relationship`, `relationship_context`) already separate category
+from story at less cost. (b) A `date`-style `LABEL:DATE` reuse for history:
+cannot carry role, company, and source. (c) Overloading the `emails` list
+with `|status|source` suffixes: breaks every existing consumer, including
+the plain `context.aliases` contract. (d) A participant-count-style
+free-form note for the arc: not queryable.
+
+**Consequences.** Existing 0.4 vaults stay valid; the new fields are
+optional and absent by default. `context` grows keys only when data is
+present. A malformed entry is `E_FRONTMATTER` and never silently dropped.
+`alias resolve` gains a current-first preference but keeps its no-ai and
+ambiguity behavior. Follow-ups: capture/enrichment skills that ask for and
+append the fields, and a TUI editor for them.
 
 ## 8. v0 scope and milestones
 
-1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18) and edge-level `no-ai` (ADR-19), 0.4 corrections and record retirement (ADR-20), 0.4's `personal@0.3` default with places and things (ADR-21), and `personal@0.4` cadence semantics and rich touches (ADR-22); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
+1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18) and edge-level `no-ai` (ADR-19), 0.4 corrections and record retirement (ADR-20), 0.4's `personal@0.3` default with places and things (ADR-21), `personal@0.4` cadence semantics and rich touches (ADR-22), and its person-story fields (ADR-23); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
 2. **Vault safety and sync.** `confidant doctor` (git repo and identity, transport, spec, `check`, staleness, skills links), `confidant sync` as the explicit git boundary, and the §12 `no-ai` allowlist. Done when a fresh clone on a clean machine reads and writes the vault with no extra setup.
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
 4. **Import skills.** Agent skills that pull events and transcripts from outside systems into the vault, with dry runs and safe retries.
