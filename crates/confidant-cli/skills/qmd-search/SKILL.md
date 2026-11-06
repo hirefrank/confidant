@@ -11,6 +11,39 @@ QMD is **not** a dependency of the Rust CLI (ADR-6, ADR-8): this skill is the
 integration. Plain `confidant find` remains the fallback and the source of
 truth for the search allowlist.
 
+## Offer this before enabling it
+
+Semantic search is an optional layer with real costs, so present the choice
+to the operator before building it — do not install it as part of "setup
+done". Say what it buys: hybrid BM25 + vector + rerank recall for fuzzy
+questions that `confidant find` (case-insensitive substring) cannot answer.
+Then say what it costs:
+
+- **A second toolchain.** Node 20+ and a global
+  `npm install -g @tobilu/qmd` (or `bun install -g @tobilu/qmd`), next to
+  the Rust binary.
+- **Multi-GB model downloads.** The first `--embed` pulls GGUF models
+  (embeddinggemma-300M embed, a 1.7B query-expansion model, a Qwen3
+  reranker) and needs network.
+- **A plaintext index.** `<vault>/.confidant/qmd-corpus/` holds chunks and
+  embeddings of every cleared record. It is gitignored, never committed,
+  never synced, and belongs on trusted devices only — sensitive material,
+  exactly like the vault. `no-ai` records never enter it.
+- **A freshness job.** Rebuild after content changes (sync pull, edits,
+  corrections, retirements). Exact lookups (`resolve`, `context`, `find`)
+  always read the live vault; the corpus is a snapshot, and a stale one can
+  miss a hit, mislabel a line, or return an old snippet of a still-cleared
+  record. Uncleared records still fail closed.
+- **Nothing else changes.** Keyword search, writes, and the `no-ai`
+  boundary all work without this layer.
+
+If the operator declines, stop: `confidant find`, `resolve`, and `context`
+already work. `confidant doctor` reports the layer's state
+(`qmd-search`: qmd on PATH, corpus built, embeddings absent/present), and
+`confidant setup` ends with an optional-layers checklist. A `qmd` that is
+only a name on PATH (a stub or test shim) is not trusted; the checks probe
+`qmd --version`.
+
 ## Trust and safety (read first)
 
 - **Trusted devices only.** The index holds plaintext chunks and embeddings.

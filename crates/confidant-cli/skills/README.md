@@ -27,6 +27,28 @@ setup --force` to re-link).
 `setup` and `update` also remove confidant-owned links for skills that no
 longer ship. Unowned user files are left alone.
 
+## Skills or MCP?
+
+Skills carry the written workflow and guardrails and shell out to the CLI,
+which keeps the operator in the loop and works in any host that can run a
+shell. `confidant mcp` is the complement for MCP-native hosts: a thin stdio
+server over the CLI's `--json` contract (`confidant mcp`, newline-delimited
+JSON-RPC), exposing a fixed tool set (`check`, `doctor`, `find`, `context`,
+the write verbs, `schema`, `pack_skill`). It applies the same `no-ai`
+allowlist and the same pack ceiling; it never becomes a second
+implementation.
+
+- Prefer **skills** for hosts without native MCP tool support, and when you
+  want the propose → confirm → apply workflow written out, plus the
+  `pack-author` guidance (pack commands are operator-only and not exposed
+  over MCP).
+- Prefer **MCP** when the host has native tool integration and no shell.
+- Using both is fine: point the host at `confidant mcp` and keep the skills
+  installed for their workflow text.
+
+`confidant setup` names both surfaces in its completion output, with the
+`confidant mcp` invocation.
+
 ## Privacy
 
 - `qmd-search` reads the vault through the §12 allowlist: a `no-ai` record
