@@ -175,6 +175,26 @@
       .page .cli-card .hl { color: var(--gold); }
       .page .cli-card .ok { color: var(--teal); }
 
+      /* ---------- Install one-liner ---------- */
+      .page .install {
+        display: flex; align-items: center; gap: 14px; margin-top: 18px;
+        background: #120a2e; border: 1px solid rgba(157,123,255,.35);
+        border-radius: 14px; padding: 12px 12px 12px 18px; max-width: 620px;
+      }
+      .page .install code {
+        font-family: var(--mono); font-size: 13px; color: var(--ink);
+        white-space: nowrap; overflow-x: auto; flex: 1;
+        scrollbar-width: none;
+      }
+      .page .install code::-webkit-scrollbar { display: none; }
+      .page .install .copy {
+        font-family: var(--disp); font-weight: 700; font-size: 12.5px;
+        padding: 8px 16px; border-radius: 999px; border: 1px solid rgba(47,214,192,.45);
+        color: var(--teal); background: rgba(47,214,192,.08); cursor: pointer;
+        flex: none; transition: background .15s;
+      }
+      .page .install .copy:hover { background: rgba(47,214,192,.16); }
+
       /* ---------- The one contrast line ---------- */
       .page .contrast { padding: 30px 0 6px; }
       .page .contrast-inner {
@@ -319,7 +339,11 @@
                 <a class="btn solid" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">Get it on GitHub</a>
                 <a class="btn" href="#vault">What goes in the vault</a>
               </div>
-              <p class="hero-note">Free and open source — local-first, no account.</p>
+              <div class="install">
+                <code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh</code>
+                <button class="copy" type="button" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh">Copy</button>
+              </div>
+              <p class="hero-note">macOS, Linux, or WSL2 — installs to your user directory, checksums verified. Then <b>confidant setup --agent auto</b>.</p>
             </div>
             <div class="shard-stage" aria-hidden="true">
               <svg class="shard s1" style="--r:-8deg" viewBox="0 0 100 100"><polygon points="8,12 92,4 74,88 0,70" fill="#2fd6c0" opacity=".92"/></svg>
@@ -413,5 +437,16 @@
         </div>
       </footer>
     </main>
+    <script>
+      // Copy the install one-liner; graceful when clipboard access fails.
+      document.querySelectorAll("[data-copy]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          navigator.clipboard.writeText(btn.dataset.copy).catch(() => {});
+          const label = btn.textContent;
+          btn.textContent = "Copied";
+          setTimeout(() => { btn.textContent = label; }, 1500);
+        });
+      });
+    </script>
   </body>
 </html>
