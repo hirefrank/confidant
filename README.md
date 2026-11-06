@@ -469,7 +469,8 @@ contract.
 `personal@0.4`; it supplies the relationships schema this README describes —
 birthdays (full dates or year-less `--MM-DD`), recurring dates,
 `relationship`, `relationship_context`, `role_history`, typed `alias_history`,
-`cadence` with `cadence_basis`, `cadence_note`, and
+`profile_provenance`, `human_note`, `cadence` with `cadence_basis`,
+`cadence_note`, and
 `snooze_until`, contact fields, relationship edges (person↔person; core adds
 the person→org kinds), the `touch` verb with optional `duration:` and
 `mode:` (1:1 or group), and two warning-level rules (`W_CADENCE_OVERDUE`,
