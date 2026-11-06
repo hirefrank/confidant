@@ -1921,6 +1921,9 @@ fn check_edges(
                     );
                     symmetric = orphan_kind.map(|k| k.symmetric);
                 } else {
+                    // The kind is unknown, not owned by a disabled pack, so
+                    // the pack suggestion alone would mislead: list the valid
+                    // kinds for this vault, as the missing-kind fix does.
                     let mut finding = Finding::new(
                         FindingCode::UnknownEdgeKind,
                         Severity::Error,
@@ -1928,7 +1931,10 @@ fn check_edges(
                     )
                     .at_file(&rec.path)
                     .for_id(&rec.id)
-                    .with_fix("Use a core kind or enable the pack that defines it");
+                    .with_fix(format!(
+                        "Use a core kind ({}) or enable the pack that defines it",
+                        edge_kind_names(enabled_packs, spec).join(", ")
+                    ));
                     if let Some(line) = rec.field_lines.get("kind") {
                         finding = finding.at_line(*line);
                     }

@@ -144,9 +144,12 @@ export CONFIDANT_VAULT="$HOME/vault"
 confidant init --create --no-input
 ```
 
-Before this, make sure git has an identity (`git config --global user.name`
-and `user.email`); the skeleton commit needs one. When git has no identity
-at all, `init` sets a repo-local fallback so the commit works. The command:
+No global git identity is needed first: the skeleton commit uses a neutral
+repo-local identity (`Confidant Operator <operator@confidant.local>`) that
+`init` writes into `<vault>/.git/config`. To put your own name in the
+vault's history instead, set it per vault (`git config --local user.name`
+and `user.email`, run inside the vault) before or after `init` — that
+override survives re-runs. The command:
 
 1. creates the directory and runs `git init` with branch `main` (no manual
    `master` → `main` rename), then reports the branch it created;
