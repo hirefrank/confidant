@@ -140,7 +140,7 @@ the skeleton. There is no secret to store and no enrollment step. Without
 `--remote` it adds no git remote. It never pushes.
 
 Packs are optional. `packs = []` is clean: the active personal pack is built
-in and implicit — `personal@0.3` on a 0.4 vault, `personal@0.2` on 0.1–0.3 —
+in and implicit — `personal@0.4` on a 0.4 vault, `personal@0.2` on 0.1–0.3 —
 so `check` starts with birthdays, cadence, the `touch` verb, and (on 0.4)
 places and things. To add another pack after init:
 

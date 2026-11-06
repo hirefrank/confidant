@@ -23,7 +23,7 @@ quickstart](#first-five-minutes-the-people-in-your-life).
 
 Starting over, or adopting Confidant in stages? See
 [Starting fresh, and adopting in stages](docs/starting-fresh.md) — personal
-relationships first (the active personal pack is built in: `personal@0.3`
+relationships first (the active personal pack is built in: `personal@0.4`
 on spec 0.4, `personal@0.2` on older vaults), extra packs later, in the same
 vault.
 
@@ -335,7 +335,7 @@ declare their own endpoint types with `from` / `to` in the pack manifest.
 
 ### Places, things, and pack-declared types
 
-Spec 0.4 is current. In a 0.4 vault the default `personal@0.3` pack declares
+Spec 0.4 is current. In a 0.4 vault the default `personal@0.4` pack declares
 `place` and `thing`; a 0.3 vault can get the same shape from an external v3
 pack. A v3 pack manifest declares a record type with `[[record_types]]`: its
 name, two-letter ID prefix, collection directory, main file,
@@ -466,15 +466,17 @@ metrics, and check rules; its manifest
 contract.
 
 **The personal pack is built in and always on.** Spec 0.4 selects
-`personal@0.3`; it supplies the relationships schema this README describes —
+`personal@0.4`; it supplies the relationships schema this README describes —
 birthdays (full dates or year-less `--MM-DD`), recurring dates,
-`relationship`, `cadence` with `snooze_until`, contact fields, relationship
-edges (person↔person; core adds the person→org kinds), the `touch` verb, and
-two warning-level rules (`W_CADENCE_OVERDUE`, `W_DATE_UPCOMING`) that never
-block a write — plus built-in `place` and `thing` types with `kind`,
-`address`, `tags`, `links`, and the `visited` / `lives_at` / `owns` /
-`located_at` edges. Contract:
-[`packs/personal/0.3.md`](packs/personal/0.3.md). Vaults on spec 0.1–0.3
+`relationship`, `cadence` with `cadence_basis`, `cadence_note`, and
+`snooze_until`, contact fields, relationship edges (person↔person; core adds
+the person→org kinds), the `touch` verb with optional `duration:` and
+`mode:` (1:1 or group), and two warning-level rules (`W_CADENCE_OVERDUE`,
+`W_DATE_UPCOMING`) that never block a write — plus built-in `place` and
+`thing` types with `kind`, `address`, `tags`, `links`, and the `visited` /
+`lives_at` / `owns` / `located_at` edges. `cadence: never` is the explicit
+"none, by design" state, distinct from an unset cadence. Contract:
+[`packs/personal/0.4.md`](packs/personal/0.4.md). Vaults on spec 0.1–0.3
 keep the frozen `personal@0.2`, which is person-only
 ([`packs/personal/0.2.md`](packs/personal/0.2.md)). A vault needs no other
 pack to be useful, and a `personal@…` entry in `packs` is a no-op; the vault
@@ -612,7 +614,7 @@ rollup. Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 
 The roadmap is the open issues on GitHub. The current themes:
 
-- **Domain model** — spec 0.4 adds the built-in `personal@0.3` places/things schema; richer cross-pack domains remain ([#796](https://github.com/hirefrank/confidant/issues/796)).
+- **Domain model** — spec 0.4 adds the built-in `personal@0.4` places/things, cadence-basis, and rich-touch schema; richer cross-pack domains remain ([#796](https://github.com/hirefrank/confidant/issues/796)).
 - **Agent ergonomics** — cheaper reads across MCP calls ([#543](https://github.com/hirefrank/confidant/issues/543)).
 - **TUI** — a new-person modal ([#621](https://github.com/hirefrank/confidant/issues/621)).
 - **First-run setup** — pack selection on `init --create` ([#639](https://github.com/hirefrank/confidant/issues/639)), a safer `init` on a non-empty directory ([#640](https://github.com/hirefrank/confidant/issues/640)).
