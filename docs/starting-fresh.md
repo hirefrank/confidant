@@ -15,7 +15,8 @@ with a checklist you can run against the new vault.
 Since #795 that machine state is small. A vault holds no key material, there
 is no trust anchor, no OS credential store to clear, and no `confidant reset`
 command: the machine-side state is a config file that can point at an old
-vault, a shell export that overrides discovery, and git remotes and clones.
+vault, a shell export that overrides discovery, the system-of-record block in
+each agent's instruction file, and git remotes and clones.
 
 ## 1. What "starting fresh" actually resets
 
@@ -27,7 +28,7 @@ Everything a vault needs to be read and written is inside the vault directory:
 |---|---|
 | `confidant.toml` | `spec`, `packs`, `vault_id` |
 | `ledger/YYYY/MM.cfd` | dated ledger lines |
-| `people/`, `orgs/`, `deals/`, `interactions/`, `notes/`, `edges/` | records; YAML front matter plus a Markdown body |
+| `people/`, `orgs/`, `deals/`, `interactions/`, `notes/`, `edges/` | records; YAML front matter plus a Markdown body (`places/` and `things/` too on a 0.4 vault) |
 | `confidant.lock`, `packs/<name>@<version>/` | vendored packs and their pins |
 | `.confidant/` | local index/cache, gitignored, rebuildable |
 
@@ -43,6 +44,7 @@ pushed history and other clones are separate copies (ADR-5).
 | Default vault | `~/.config/confidant/config.toml` `default_vault` | Points discovery at the old vault. If the path is gone, `E_VAULT_NOT_FOUND`; if it still exists, commands silently operate on the old vault. | Edit the file (below). |
 | Named vaults | `config.toml` `[vaults]` | `CONFIDANT_VAULT=<name>` keeps resolving to the old vault. | Edit the file. |
 | Shell/agent env | `CONFIDANT_VAULT` | It wins over `default_vault` and directory walk-up, so a stale export keeps every command on the old vault. | `unset CONFIDANT_VAULT`, and remove it from your shell rc and agent runtime. |
+| Agent instructions | each agent's always-on file (`.claude/CLAUDE.md`, `.codex/AGENTS.md`, …) between the `confidant:system-of-record` markers | Keeps telling agents to read the old vault path, even after the config is rewritten. | Re-run `confidant setup --agent auto` once the new vault exists (or `--no-instructions` to skip the files), then `confidant doctor`. |
 | Skills | `~/.local/share/confidant`, agent skill dirs | Nothing vault-specific; links are versioned to the CLI. | Leave them. `confidant setup` refreshes links. |
 | Git remotes / clones | the vault's `.git`, plus other checkouts | Deleting the local directory does not delete pushed history or other clones. | See §2.2. |
 
@@ -164,6 +166,12 @@ is implicit and already enabled (§3.1) — `personal@0.4` on a 0.4 vault,
 `personal@0.2` on 0.1–0.3 — and `check` is clean without packs. Install a
 pack later with `confidant pack add <https-url> --yes`.
 
+Once the new vault exists, re-run `confidant setup --agent auto` so each
+agent's always-on system-of-record block points at it. Setup rewrites only
+the text between its own markers and leaves the rest of the file alone;
+without this step the instruction files keep the old vault path even though
+`config.toml` is clean.
+
 ### 2.5 A second device needs no ceremony
 
 `confidant init` always creates a **new** vault. To use the vault you already
@@ -190,8 +198,10 @@ it, whether or not `packs` lists it. `packs = []` still enables it, and a
 `personal@0.4` on 0.4, the frozen `personal@0.2` on 0.1–0.3.
 
 On 0.4 that gives you the person schema — birthdays, relationship edges,
-keep-in-touch cadence, upcoming dates, and the `touch` ledger verb — plus
-`place` and `thing` records with `kind`, `address`, `tags`, `links`, and
+keep-in-touch cadence (with a basis and an optional note), upcoming dates,
+rich touches (duration and 1:1/group mode), role and alias history, the
+operator's `human_note`, per-fact provenance, and the `touch` ledger verb —
+plus `place` and `thing` records with `kind`, `address`, `tags`, `links`, and
 the `visited` / `lives_at` / `owns` / `located_at` edges:
 
 ```sh
@@ -204,6 +214,12 @@ Quote display names with spaces. A `no-ai: true` person is addressed by
 `p-<ULID>` only. A place or thing is addressed by its opaque id too; add one
 from a file with `confidant record add --file place.md`, and attach a dated
 note with `confidant note add --entity pl-<ULID> --body-file note.md`.
+
+Spec 0.4 also adds corrections: `confidant retract` and `confidant correct`
+supersede a ledger line with a new attributed line, and `confidant record
+retire` / `unretire` retires a record without deleting it. Agent reads use
+the effective view; the operator can still see superseded lines and retired
+records (`--for-operator`, `record show --for-edit`).
 
 ### 3.2 Add a pack later
 

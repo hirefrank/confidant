@@ -221,7 +221,11 @@ tokens. Near-ULID bare runs are not IDs.
 - Name-only prose.
 - `check`'s location field still shows the paths of invalid files.
 
-`context` honours `no-ai` on the same terms as `find`; a non-person-like pack entity that is uncleared gets no agent bundle at all.
+`context` honours `no-ai` on the same terms as `find`; a non-person-like pack
+entity that is uncleared gets no agent bundle at all. It also returns a
+top-level `timeline` that merges `touchpoints` and `interactions` in date
+order; the timeline is built from those filtered arrays, so a hidden or
+retired entry stays absent.
 
 ## Pack scoping (issue #178)
 

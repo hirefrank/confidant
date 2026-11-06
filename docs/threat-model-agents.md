@@ -47,7 +47,7 @@ server configured) works through one fixed tool list.
 | Can | Cannot | Enforced by |
 |---|---|---|
 | Call 9 tools: `check`, `find`, `context`, `log_touch`, `import_ledger`, `note_add`, `schema`, `doctor`, `pack_skill` | Call any other tool (including retract/correct/retire), or grant itself a new capability | `tools()` in `crates/confidant-cli/src/mcp.rs` — the list is a literal in the binary |
-| Read a person's or org's context bundle, with private data stripped by default | Read private data silently — it must pass `exclude_private: false`, which is visible in its own tool call | `context_strips_private()` in `crates/confidant-cli/src/mcp.rs` |
+| Read a person's, org's, or declared pack entity's context bundle, with private data stripped by default | Read private data silently — it must pass `exclude_private: false`, which is visible in its own tool call | `context_strips_private()` in `crates/confidant-cli/src/mcp.rs` |
 | Append a touchpoint line, bulk-append ledger lines (including a pack's own verb such as `session`), or add a note — one commit each, gated by `check` | Write without `check`, or skip the commit | `crates/confidant-core/src/write.rs` — change → `check` → one `git add` + `git commit`; a failing check rolls the files back |
 | Pass `exclude_private: false` and read private data | Be stopped from doing so by any vault setting — no vault config removes the opt-out | Current behavior; see Known gaps |
 
