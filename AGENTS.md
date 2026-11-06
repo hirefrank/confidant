@@ -76,6 +76,7 @@ Read before changing behaviour:
 | `testdata/vaults/corrections-0.4/` | Checked-in 0.4 fixture for retractions, superseded lines, and retirement |
 | `testdata/golden/` | Golden `check --json` outputs |
 | `docs/` | Architecture, privacy, sync, benchmarks, research |
+| `site/` | Static landing page (`site/public/index.html`) deployed as the `confidant-landing` Worker via Cloudflare Workers Builds; version pill checked by `.github/scripts/check-site-version.py` |
 | `contrib/` | Opt-in systemd/launchd timer templates for `confidant sync` (#665) |
 | `.github/workflows/ci.yml` | The CI gate. Source of truth for the commands below |
 
@@ -96,6 +97,7 @@ cargo +1.88 check --workspace --locked   # MSRV job
 cargo deny check                          # deny.toml sets all-features
 cargo audit
 python3 .github/scripts/check-crate-paths.py   # crate path check job
+python3 .github/scripts/check-site-version.py  # landing page pill vs Cargo.toml
 ```
 
 CI runs the test job on both `ubuntu-24.04` and `macos-latest` for every
