@@ -422,18 +422,18 @@
           <div class="story-copy">
             <p>Your email agent knows one part of Robin's story. Your planning agent knows another. A third is new.</p>
             <p>When every agent keeps its own notes, you repeat yourself and details drift. Add the relationship to Confidant and each connected agent can read the same person-centered record, within the boundaries you set.</p>
-            <p class="last-line">Keep one record for each person. Let every agent start there.</p>
+            <p class="last-line">Keep the relationship in one place. Let connected agents read what you choose to share.</p>
           </div>
         </div>
         <div class="portability-grid">
-          <article><b>One source for many agents</b><p>Each agent still needs a connection and instructions. You don't have to rebuild every relationship inside its private memory.</p></article>
+          <article><b>One source for many agents</b><p>Connect your agents to the same vault instead of maintaining a separate copy of each relationship for every tool.</p></article>
           <article><b>People, not accounts</b><p>A person has a story, shared places, and a history with you. They aren't a deal in a sales pipeline.</p></article>
           <article><b>Portable by design</b><p>The working record is plain text in your Git repo. Read it, diff it, back it up, or move it to another machine.</p></article>
         </div>
       </div></section>
 
       <section class="block" id="example"><div class="wrap">
-        <div class="sec-head"><p class="sec-tag">People first</p><h2>Remember the person, <span class="co">not just the task.</span></h2><p class="sec-sub">A relationship is more than a contact field. Confidant keeps how you know someone, what matters to them, and your history together in one record your connected agents can use.</p></div>
+        <div class="sec-head"><p class="sec-tag">People first</p><h2>Remember where you <span class="co">left off with someone.</span></h2><p class="sec-sub">Confidant keeps how you know a person, what matters to them, and your history together, so a connected agent can find the details you need.</p></div>
         <div class="example">
           <div class="message you"><span class="speaker">You</span>I'm grabbing coffee with Robin tomorrow. What should I remember?</div>
           <div class="message agent"><span class="speaker">Your agent, using Confidant</span>You last caught up over coffee. Robin mentioned a new climbing project, and you usually climb together on Thursdays.<br /><br />Afterward, I can propose an update to Robin's record for you to approve.</div>
@@ -448,11 +448,11 @@
       </div></section>
 
       <section class="block story" id="packs"><div class="wrap">
-        <div class="sec-head pack-intro"><p class="sec-tag">Packs</p><h2>A vocabulary for <span class="t">your life.</span></h2><p class="sec-sub">Confidant starts with a built-in personal pack: people, places, things, and the moments that connect them. Packs define the kinds of records, fields, and checks a vault understands.</p></div>
+        <div class="sec-head pack-intro"><p class="sec-tag">Packs</p><h2>Start with relationships. <span class="t">Add what you need.</span></h2><p class="sec-sub">The built-in personal pack covers people, places, things, and the moments that connect them. Packs give your vault additional record types, fields, and checks when you need them.</p></div>
         <div class="pack-grid">
           <article class="pack-card c-core"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Built in</p><h3>Personal</h3><p>Remember relationships, shared places and projects, dates, and when you last connected.</p></article>
-          <article class="pack-card c-draft"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Extend it</p><h3>Your vocabulary</h3><p>Add a pack when your work or life needs different kinds of records and rules.</p></article>
-          <article class="pack-card c-yours"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Still yours</p><h3>Readable files</h3><p>Packs describe your vault; they don't move its data into a service. The files remain in your Git repo.</p></article>
+          <article class="pack-card c-draft"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Extend it</p><h3>Your vocabulary</h3><p>Add a pack when the personal model doesn't cover a part of your life or work.</p></article>
+          <article class="pack-card c-yours"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Keep it consistent</p><h3>Packs travel with the vault</h3><p>Optional packs live in the vault and are hash-pinned. Clone the vault and its vocabulary comes along.</p></article>
         </div>
         <a class="dev-link" href="https://github.com/hirefrank/confidant#packs" target="_blank" rel="noopener">How schema packs work ↗</a>
       </div></section>
@@ -463,7 +463,7 @@
           <div>
             <p class="big">Some things are just for you.</p>
             <p>Mark a record <code>no-ai</code> and Confidant leaves it out of agent-facing reads. This boundary is enforced by Confidant's tools; it does not prevent an agent or person with direct file access from reading the underlying plaintext.</p>
-            <p>Your agents can propose changes for you to review. The files and Git history live in a vault you control, on a trusted, encrypted device. There is no Confidant server or account.</p>
+            <p>Your agents can propose changes for you to review. Keep the vault and its Git history on a trusted, encrypted device. There is no Confidant server or account.</p>
           </div>
           <ul class="pieces">
             <li><i></i><div>Read with boundaries<span><code>no-ai</code> keeps marked records out of agent-facing output.</span></div></li>
@@ -476,8 +476,8 @@
       <section class="block" id="start"><div class="wrap">
         <div class="start-grid">
           <div>
-            <p class="sec-tag">Get started</p><h2>Your relationships. <span class="t">Your memory.</span></h2>
-            <p class="sec-sub">Confidant is free, open source, and built for one person and their agents. Install it, create a vault, then connect an agent.</p>
+            <p class="sec-tag">Get started</p><h2>Start with <span class="t">your own vault.</span></h2>
+            <p class="sec-sub">Confidant is free and open source. Install it, create a vault, then connect the agents you use.</p>
             <div class="install">
               <code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh</code>
               <button class="copy" type="button" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh">Copy</button>
@@ -504,7 +504,7 @@
         <div class="wrap">
           <div class="cta-card">
             <h2>People stay. <span class="co">Tools change.</span></h2>
-            <p>Your relationships belong in a record you own. Start with the personal pack, connect an agent, and keep the history as your tools change.</p>
+            <p>Your relationships belong in a record you own. The personal pack is already there. Connect your agents and keep the history as your tools change.</p>
             <div class="cta-row">
               <a class="btn solid" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">Get Confidant on GitHub ↗</a>
             </div>
