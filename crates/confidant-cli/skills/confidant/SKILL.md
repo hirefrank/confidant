@@ -414,7 +414,7 @@ to this register when you return to the operator.
 | "Set up Confidant", "install it", "link my agents", "why is this not ready?" | No separate skill: follow the setup flow directly | `confidant setup --agent auto`, then `doctor`/`status`; `docs/agent-setup.md` in the repo is the long form |
 | "Teach Confidant about X" — a new field, verb, record type, or check | `pack-author` | Scaffold with `confidant pack init`; review claims and skill text with the operator before installing |
 | "Search across my notes", semantic or hybrid search, index freshness | `qmd-search` | Optional; improve on plain `confidant find` with a local index |
-| "This is broken", "file a bug", "report this" | `report-a-problem` (ships soon) | Until it ships, gather the CLI/TUI version, the exact command, the output, and the vault state, and hand them to the operator to file |
+| "This is broken", "file a bug", "report this" | `report-a-problem` | Draft from the conversation with structural diagnostics, search for a duplicate, and post only after the exact title, body, and destination are confirmed |
 
 Handoff notes:
 
@@ -441,8 +441,11 @@ Handoff notes:
   vault-changing event in the session — writes you applied, or a pull that
   brought new commits — re-run the index/embed step and verify it with one
   query before reporting done; `doctor` warns when the index is behind.
-- **Problem reports**: never paste vault content into an issue. Use sizes,
-  finding codes, and redacted snippets.
+- **Problem reports**: never paste vault content into an issue. Load
+  `report-a-problem`: it drafts from the conversation, collects structural
+  diagnostics only, redacts paths, contacts, and secrets, searches for a
+  duplicate, and posts nothing until the operator confirms the exact title,
+  body, destination, and labels.
 
 ## Never
 

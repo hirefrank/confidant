@@ -384,7 +384,7 @@ fn doctor_skills_links_after_setup_is_ok() {
     let c = check(&v, "skills-links").expect("skills-links check missing");
     assert_eq!(c["status"], "ok", "{v}");
     let msg = c["message"].as_str().unwrap();
-    assert!(msg.contains("3/3"), "expected 3/3 linked: {msg}");
+    assert!(msg.contains("4/4"), "expected 4/4 linked: {msg}");
     assert!(msg.contains("claude-code"), "expected agent name: {msg}");
     assert_eq!(v["ok"], true, "{v}");
 }
@@ -447,8 +447,8 @@ fn doctor_skills_links_missing_warns() {
 
 #[test]
 fn doctor_skills_links_from_vault_cwd_agrees_with_agents() {
-    // #681: setup and agents report 3/3, then doctor run from inside the
-    // vault must not flip to 0/3. Skill dirs live under $HOME, not the vault.
+    // #681: setup and agents report 4/4, then doctor run from inside the
+    // vault must not flip to 0/4. Skill dirs live under $HOME, not the vault.
     let home = tempfile::tempdir().unwrap();
     let home_str = home.path().to_str().unwrap().to_owned();
     let share = home.path().join("share");
@@ -476,8 +476,8 @@ fn doctor_skills_links_from_vault_cwd_agrees_with_agents() {
         .iter()
         .find(|a| a["name"] == "claude-code")
         .expect("claude-code row");
-    assert_eq!(claude["linked"], 3, "{agents_v}");
-    assert_eq!(claude["total"], 3, "{agents_v}");
+    assert_eq!(claude["linked"], 4, "{agents_v}");
+    assert_eq!(claude["total"], 4, "{agents_v}");
 
     let vault = demo();
     let v = run_doctor_env(
@@ -492,7 +492,7 @@ fn doctor_skills_links_from_vault_cwd_agrees_with_agents() {
     let c = check(&v, "skills-links").expect("skills-links check missing");
     assert_eq!(c["status"], "ok", "{v}");
     let msg = c["message"].as_str().unwrap();
-    assert!(msg.contains("3/3"), "doctor disagreed with agents: {msg}");
+    assert!(msg.contains("4/4"), "doctor disagreed with agents: {msg}");
     assert!(msg.contains("claude-code"), "{msg}");
 }
 
@@ -508,7 +508,7 @@ fn doctor_skills_links_relative_symlinks_from_other_cwd() {
 
     let version = env!("CARGO_PKG_VERSION");
     let skills_parent = home.path().join(".claude/skills");
-    for skill in ["confidant", "pack-author", "qmd-search"] {
+    for skill in ["confidant", "pack-author", "qmd-search", "report-a-problem"] {
         let dest = skills_parent.join(skill);
         std::fs::remove_file(&dest).unwrap();
         let target = PathBuf::from("../../share/skills")
@@ -531,7 +531,7 @@ fn doctor_skills_links_relative_symlinks_from_other_cwd() {
     assert_eq!(c["status"], "ok", "{v}");
     let msg = c["message"].as_str().unwrap();
     assert!(
-        msg.contains("3/3"),
+        msg.contains("4/4"),
         "relative skill links missed from vault cwd: {msg}"
     );
 }
@@ -591,8 +591,8 @@ fn doctor_skills_links_reporter_sequence_absolute_home_default_share() {
         .iter()
         .find(|a| a["name"] == "claude-code")
         .expect("claude-code row");
-    assert_eq!(claude["linked"], 3, "{agents_v}");
-    assert_eq!(claude["total"], 3, "{agents_v}");
+    assert_eq!(claude["linked"], 4, "{agents_v}");
+    assert_eq!(claude["total"], 4, "{agents_v}");
 
     let mut doctor = Command::new(bin());
     give_child_git_identity(&mut doctor);
@@ -617,7 +617,7 @@ fn doctor_skills_links_reporter_sequence_absolute_home_default_share() {
     assert_eq!(c["status"], "ok", "{v}");
     let msg = c["message"].as_str().unwrap();
     assert!(
-        msg.contains("3/3"),
+        msg.contains("4/4"),
         "doctor disagreed with agents on the reporter sequence: {msg}"
     );
     assert!(msg.contains("claude-code"), "{msg}");
