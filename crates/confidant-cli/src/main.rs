@@ -2881,18 +2881,25 @@ fn qmd_hint_for_find(root: &Path) -> Option<String> {
     Some("qmd index available; use the qmd-search skill for ranked results".to_owned())
 }
 
-/// #386: optional `setup` note when `qmd` is not on PATH. Informational
-/// only: no prompt, no failure, no exit-status change. Search falls back
-/// to `confidant find` without qmd.
+/// #386/#715: optional `setup` note when qmd is missing or not working.
+/// Informational only: no prompt, no failure, no exit-status change.
+/// Search falls back to `confidant find` without a working qmd.
 fn qmd_setup_note() -> Option<String> {
-    if find_on_path("qmd").is_some() {
-        return None;
+    match qmd_state() {
+        QmdState::Working { .. } => None,
+        QmdState::Missing => Some(
+            "Note: `qmd` not found on PATH — search falls back to `confidant find`. \
+             For ranked search, install with `npm install -g @tobilu/qmd` (optional)."
+                .to_owned(),
+        ),
+        // #715: a shim named `qmd` is not a working qmd. Say so instead of
+        // silently treating semantic search as available.
+        QmdState::NotWorking { path } => Some(format!(
+            "Note: `qmd` at {} did not report a version — search falls back to \
+             `confidant find`. Reinstall with `npm install -g @tobilu/qmd` (optional).",
+            path.display()
+        )),
     }
-    Some(
-        "Note: `qmd` not found on PATH — search falls back to `confidant find`. \
-         For ranked search, install with `npm install -g @tobilu/qmd` (optional)."
-            .to_owned(),
-    )
 }
 
 /// `<vault>/.confidant/qmd-corpus/` — the QMD search corpus (ADR-6).
@@ -6281,6 +6288,121 @@ fn skills_links_check() -> DoctorCheck {
     }
 }
 
+/// What a `qmd` presence check actually found (#715). A name on PATH is not
+/// proof: the field report had a test shim named `qmd` that returned canned
+/// query results, so presence means "answers `--version`/`--help` like a CLI".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QmdState {
+    /// No `qmd` on PATH.
+    Missing,
+    /// A file named `qmd` is on PATH but did not report a version or usage.
+    NotWorking { path: PathBuf },
+    /// A `qmd` that answered a probe; `version` is its first output line.
+    Working { path: PathBuf, version: String },
+}
+
+/// Probe a binary's `--version` (falling back to `--help`) with the same
+/// bounded spawn `tui_binary_version` uses: 2s, 64 KiB per pipe. A broken
+/// shim must not hang `doctor` or `setup`.
+fn probe_binary_text(bin: &Path, arg: &str) -> Option<String> {
+    use std::io::Read as _;
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX_OUTPUT: u64 = 64 * 1024;
+
+    let mut child = std::process::Command::new(bin)
+        .arg(arg)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stdout_thread = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut out).take(MAX_OUTPUT).read_to_end(&mut buf);
+            buf
+        })
+    });
+    let mut stderr_thread = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut err).take(MAX_OUTPUT).read_to_end(&mut buf);
+            buf
+        })
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None => {
+                if start.elapsed() >= PROBE_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Do not join the drain threads: a wrapper script can
+                    // leave a grandchild holding the pipes after the direct
+                    // child is killed (#659).
+                    let _ = stdout_thread.take();
+                    let _ = stderr_thread.take();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+    let stdout = stdout_thread
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = stderr_thread
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    if !status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&stdout).trim().to_owned();
+    let text = if text.is_empty() {
+        String::from_utf8_lossy(&stderr).trim().to_owned()
+    } else {
+        text
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// True when probe output looks like a version/usage banner rather than a
+/// canned query result. `qmd` in the text, or a `major.minor`-style token,
+/// is enough; anything else (a fixed result payload) is not trusted.
+fn looks_like_version_or_usage(output: &str) -> bool {
+    output.lines().any(|line| {
+        let line = line.trim();
+        line.to_ascii_lowercase().contains("qmd")
+            || line.split_whitespace().any(|token| {
+                let mut parts = token.split('.');
+                parts.next().is_some_and(|first| {
+                    !first.is_empty() && first.chars().all(|c| c.is_ascii_digit())
+                }) && parts.next().is_some_and(|second| {
+                    !second.is_empty() && second.chars().all(|c| c.is_ascii_digit())
+                })
+            })
+    })
+}
+
+/// Detect a *working* qmd (#715), not just a name on PATH.
+fn qmd_state() -> QmdState {
+    let Some(path) = find_on_path("qmd") else {
+        return QmdState::Missing;
+    };
+    let banner = probe_binary_text(&path, "--version")
+        .filter(|text| looks_like_version_or_usage(text))
+        .or_else(|| {
+            probe_binary_text(&path, "--help").filter(|text| looks_like_version_or_usage(text))
+        });
+    match banner {
+        Some(text) => QmdState::Working {
+            path,
+            version: text.lines().next().unwrap_or_default().trim().to_owned(),
+        },
+        None => QmdState::NotWorking { path },
+    }
+}
+
 /// #386: informational `qmd` search-availability check. qmd is optional,
 /// so a missing qmd is `ok` — the same rule as the offline staleness check:
 /// it just means search falls back to `confidant find` (see
@@ -6303,11 +6425,32 @@ fn qmd_search_check(root: &Path) -> DoctorCheck {
         fix: None,
     };
 
-    let Some(qmd) = find_on_path("qmd") else {
-        return ok(format!(
-            "qmd not found on PATH; search falls back to `confidant find` \
-             (install with `{INSTALL_HINT}` to enable semantic search)"
-        ));
+    let qmd = match qmd_state() {
+        QmdState::Missing => {
+            return ok(format!(
+                "qmd not found on PATH; search falls back to `confidant find` \
+                 (install with `{INSTALL_HINT}` to enable semantic search)"
+            ));
+        }
+        // #715: a shim or broken install is present but cannot answer a
+        // version probe. That is not "search is ready", so warn instead of
+        // reporting the keyword fallback as ok.
+        QmdState::NotWorking { path } => {
+            return DoctorCheck {
+                id: ID,
+                status: "warning",
+                message: format!(
+                    "qmd at {} did not report a version (a stub or broken install?); \
+                     search falls back to `confidant find`",
+                    path.display()
+                ),
+                fix: Some(format!(
+                    "Reinstall with `{INSTALL_HINT}`, or remove the broken binary at {}",
+                    path.display()
+                )),
+            };
+        }
+        QmdState::Working { path, .. } => path,
     };
     if !root.join(QMD_CORPUS_REL).is_dir() {
         return DoctorCheck {
@@ -7644,7 +7787,7 @@ fn readiness_checks(cli: &Cli, vault: Option<&Path>) -> Vec<ReadinessCheck> {
             }
         }
     }
-    if vault.is_some() && find_on_path("qmd").is_none() {
+    if vault.is_some() && matches!(qmd_state(), QmdState::Missing) {
         for check in &mut checks {
             if check.id == "qmd-search" {
                 check.status = "absent";
@@ -7812,6 +7955,191 @@ fn print_completion_brief(cli: &Cli, vault: Option<&Path>) {
     println!("Jumping-off routines");
     for (index, routine) in brief.routines.iter().enumerate() {
         println!("  {}. {routine}", index + 1);
+    }
+}
+
+/// One row of the #715 optional-layers checklist. `state` is a short word
+/// (`present`, `absent`, `unknown`, `not working`); nothing here is
+/// required, so the checklist only reports and leaves the choice to the
+/// operator.
+struct OptionalLayer {
+    id: &'static str,
+    state: &'static str,
+    detail: String,
+    tradeoff: &'static str,
+}
+
+/// The optional layers `setup` ends with (#715): vault present, skills
+/// linked, qmd installed, corpus built, embeddings present. States are
+/// structural only (paths, counts, versions) — no record content is read.
+fn optional_layers(vault: Option<&Path>) -> Vec<OptionalLayer> {
+    let mut layers = Vec::new();
+
+    // Vault.
+    let (vault_state, vault_detail) = match vault {
+        Some(root) => {
+            let state = if load_vault(root).is_ok() {
+                "present"
+            } else {
+                "unknown"
+            };
+            (state, root.display().to_string())
+        }
+        None => (
+            "absent",
+            "no vault configured; set CONFIDANT_VAULT or pass --vault".to_owned(),
+        ),
+    };
+    layers.push(OptionalLayer {
+        id: "vault",
+        state: vault_state,
+        detail: vault_detail,
+        tradeoff: "Plaintext records in a private git repo on this disk; back it up and keep full-disk encryption on.",
+    });
+
+    // Skills.
+    let skills = match setup::home_dir() {
+        Ok(home) => {
+            let health = match setup::skills_dir_override() {
+                Some(dir) => vec![setup::agent_health_for_dir("custom", &dir)],
+                None => setup::agents_health(&home),
+            };
+            let mut seen: Vec<PathBuf> = Vec::new();
+            let mut targeted: Vec<setup::AgentHealth> = Vec::new();
+            for entry in health {
+                if entry.detected && entry.targeted && !seen.iter().any(|d| d == &entry.dir) {
+                    seen.push(entry.dir.clone());
+                    targeted.push(entry);
+                }
+            }
+            if targeted.is_empty() {
+                (
+                    "absent",
+                    "no agent skills dir linked; run `confidant setup --agent auto`".to_owned(),
+                )
+            } else {
+                let linked: usize = targeted.iter().map(|entry| entry.linked).sum();
+                let total: usize = targeted.iter().map(|entry| entry.total).sum();
+                let names: Vec<&str> = targeted.iter().map(|entry| entry.name.as_str()).collect();
+                let state = if linked == total { "present" } else { "absent" };
+                (
+                    state,
+                    format!("linked {linked}/{total} for {}", names.join(", ")),
+                )
+            }
+        }
+        Err(err) => (
+            "unknown",
+            format!("cannot determine home directory: {err:#}"),
+        ),
+    };
+    layers.push(OptionalLayer {
+        id: "skills",
+        state: skills.0,
+        detail: skills.1,
+        tradeoff: "Workflow guidance and guardrails for agents that shell out to the CLI; `confidant setup` re-links them.",
+    });
+
+    // QMD binary (#715: presence means a working probe, not a name on PATH).
+    let qmd = qmd_state();
+    let (qmd_state, qmd_detail) = match &qmd {
+        QmdState::Working { path, version } => {
+            ("present", format!("{} ({})", path.display(), version))
+        }
+        QmdState::Missing => (
+            "absent",
+            "optional; install with `npm install -g @tobilu/qmd`".to_owned(),
+        ),
+        QmdState::NotWorking { path } => (
+            "not working",
+            format!("{} did not report a version", path.display()),
+        ),
+    };
+    layers.push(OptionalLayer {
+        id: "qmd",
+        state: qmd_state,
+        detail: qmd_detail,
+        tradeoff: "A second toolchain (Node 20+ and a global npm install); adds hybrid BM25 + vector + rerank recall beyond `confidant find`.",
+    });
+
+    // Corpus.
+    let corpus = vault.map(|root| root.join(QMD_CORPUS_REL));
+    let corpus_built = corpus
+        .as_deref()
+        .filter(|path| path.is_dir())
+        .map(std::path::Path::to_path_buf);
+    let (corpus_state, corpus_detail) = match (&corpus_built, vault) {
+        (Some(path), _) => ("present", path.display().to_string()),
+        (None, Some(_)) => (
+            "absent",
+            "not built; run the qmd-search skill's `qmd-index.py`".to_owned(),
+        ),
+        (None, None) => ("absent", "no vault to build a corpus from".to_owned()),
+    };
+    layers.push(OptionalLayer {
+        id: "corpus",
+        state: corpus_state,
+        detail: corpus_detail,
+        tradeoff: "Plaintext chunks and embeddings of cleared records under `<vault>/.confidant/`; gitignored, never synced, rebuild after content changes.",
+    });
+
+    // Embeddings.
+    let (embed_state, embed_detail) = match (&corpus_built, &qmd) {
+        (None, _) => ("absent", "no corpus to embed".to_owned()),
+        (Some(_), QmdState::Working { path, .. }) => {
+            let root = vault.expect("a corpus implies a vault");
+            match qmd_embedded_vectors(root, path) {
+                Some(n) if n > 0 => ("present", format!("{n} embedded vectors")),
+                Some(_) => (
+                    "absent",
+                    "none yet; keyword (BM25) search works without them".to_owned(),
+                ),
+                None => (
+                    "unknown",
+                    "`qmd status` did not report an embedding count".to_owned(),
+                ),
+            }
+        }
+        (Some(_), QmdState::NotWorking { .. }) => (
+            "unknown",
+            "qmd did not answer, so the embedding count is unknown".to_owned(),
+        ),
+        (Some(_), QmdState::Missing) => (
+            "absent",
+            "qmd is not installed, so nothing can be embedded".to_owned(),
+        ),
+    };
+    layers.push(OptionalLayer {
+        id: "embeddings",
+        state: embed_state,
+        detail: embed_detail,
+        tradeoff: "First embed downloads multi-GB GGUF models; enables semantic/hybrid ranking.",
+    });
+
+    layers
+}
+
+fn optional_layers_json(vault: Option<&Path>) -> Value {
+    Value::Array(
+        optional_layers(vault)
+            .into_iter()
+            .map(|layer| {
+                serde_json::json!({
+                    "id": layer.id,
+                    "state": layer.state,
+                    "detail": layer.detail,
+                    "tradeoff": layer.tradeoff,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn print_optional_layers(vault: Option<&Path>) {
+    println!("Optional layers (each is independent; nothing above requires them)");
+    for layer in optional_layers(vault) {
+        println!("  {:<11} {:<12} {}", layer.id, layer.state, layer.detail);
+        println!("  {:<11} {:<12} tradeoff: {}", "", "", layer.tradeoff);
     }
 }
 
@@ -8096,7 +8424,7 @@ fn completion_brief(cli: &Cli, vault: Option<&Path>) -> CompletionBrief {
     });
 
     // 6. Search state and its upkeep truth.
-    let qmd_available = find_on_path("qmd").is_some();
+    let qmd = qmd_state();
     let corpus_path = vault.map(|root| root.join(QMD_CORPUS_REL));
     let corpus = corpus_path
         .as_deref()
@@ -8108,11 +8436,18 @@ fn completion_brief(cli: &Cli, vault: Option<&Path>) -> CompletionBrief {
             "No vault, so there is no corpus. `confidant find` becomes available once a vault is configured."
                 .to_owned(),
         );
-    } else if !qmd_available {
+    } else if matches!(qmd, QmdState::Missing) {
         search_lines.push(
             "QMD is not installed; semantic search is off. `confidant find` reads the live vault."
                 .to_owned(),
         );
+    } else if let QmdState::NotWorking { path } = &qmd {
+        // #715: presence is not availability. A stub on PATH must not read
+        // as a working semantic-search layer.
+        search_lines.push(format!(
+            "QMD at {} did not report a version; semantic search is off. `confidant find` reads the live vault.",
+            path.display()
+        ));
     } else if let Some(path) = &corpus {
         let modified = std::fs::metadata(path)
             .and_then(|meta| meta.modified())
@@ -9004,6 +9339,19 @@ fn setup_result_json(
             })).collect::<Vec<_>>(),
         });
     }
+    // #720: name both agent-integration surfaces, whether or not this run
+    // wrote anything. Additive to the ADR-7 envelope.
+    value["integrations"] = serde_json::json!({
+        "skills": {
+            "dir": result.skills_dir.display().to_string(),
+            "agents": result.agent_labels(),
+        },
+        "mcp": {
+            "command": "confidant mcp",
+            "transport": "stdio",
+            "note": "direct tool access for MCP-native hosts",
+        },
+    });
     value
 }
 
@@ -9047,6 +9395,7 @@ fn cmd_setup(
                 if let Value::Object(ref mut obj) = value {
                     obj.insert("next_steps".to_owned(), setup_next_steps_json(cli));
                     obj.insert("brief".to_owned(), completion_brief_json(cli, vault));
+                    obj.insert("optional_layers".to_owned(), optional_layers_json(vault));
                 }
                 print_json(&ok_envelope(None, value))?;
             } else {
@@ -9090,6 +9439,18 @@ fn cmd_setup(
                         result.removed_stale.len()
                     );
                 }
+                // #720: both agent-integration surfaces, named the same way
+                // skill links are. Skills carry workflow text; `mcp` is the
+                // direct-tool surface for MCP-native hosts.
+                println!();
+                println!("Agent integrations:");
+                println!(
+                    "  skills   {} → {labels} (workflow guidance; agents shell out to `confidant`)",
+                    result.skills_dir.display()
+                );
+                println!(
+                    "  mcp      confidant mcp (MCP over stdio; direct tool access for MCP-native hosts)"
+                );
                 if no_instructions {
                     println!();
                     println!("System-of-record rule skipped (--no-instructions).");
@@ -9136,6 +9497,10 @@ fn cmd_setup(
                     println!();
                     print_completion_brief(cli, vault);
                 }
+                // #715: setup ends with the optional-layers checklist, so
+                // "done" does not silently mean "keyword search only".
+                println!();
+                print_optional_layers(vault);
             }
             Ok(ExitCode::SUCCESS)
         }
