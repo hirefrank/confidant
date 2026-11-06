@@ -55,6 +55,11 @@ retraction voided; pack state (such as `recent_touches`) stays effective-only.
 The agent path never sends a superseded line, and the TUI never re-adds one
 it did not receive.
 
+The context pane also renders the personal pack view's `human_note` as a
+`human <first line>` row under the agent-maintained profile. That field is
+the operator's own words and agents never edit it; it is absent on the agent
+path when private data is stripped, so nothing renders there.
+
 Places and things are not in the People workspace yet: the TUI stays
 person-only, and `entity.fields` is additive CLI JSON it ignores. Use
 `confidant record list --kind place|thing` (operator path) and

@@ -170,8 +170,10 @@ case — a touch-heavy ledger over 2,400 records — stays around **338 ms for
 
 Recommendation: no cache or index is justified. A third of a second worst
 case is inside interactive range, and QMD (local BM25 + vectors, index never
-in git) remains the long-term plan. This closes the #188 re-measurement
-ask.
+in git) now ships as an optional skill layer rather than a core dependency
+(see [`docs/agent-setup.md`](agent-setup.md#optional-search-backend-qmd));
+plain `confidant find` remains the default. This closes the #188
+re-measurement ask.
 
 ## Section 9b item 4
 
@@ -189,8 +191,11 @@ before seeding the ULID index from every prefixed name; Review #14 was
 ~214 ms English / ~274 ms CJK after seeding from every prefixed vault
 name.
 
-QMD (local BM25 + vectors, index never in git) is still the plan after
-v0. These numbers are the whole cost of a read: the vault is plaintext, so
+QMD (local BM25 + vectors, index never in git) ships today as an optional
+embedded skill layer (see
+[`docs/agent-setup.md`](agent-setup.md#optional-search-backend-qmd)), not a
+CLI dependency; plain `confidant find` remains the default scan measured
+here. These numbers are the whole cost of a read: the vault is plaintext, so
 there is no per-file step between the filesystem and the parser. The
 issue-#2 follow-up above re-measured after the perf work: ~110 ms English
 `find`, ~60 ms `check` on the Ryzen machine.

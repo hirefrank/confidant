@@ -24,9 +24,9 @@ retry. Put `~/.cargo/bin` on `PATH` first
 (`export PATH="$HOME/.cargo/bin:$PATH"`), or the next step fails with
 `confidant: command not found`.
 
-Prebuilt binaries for macOS and Linux (x86_64) are on
-[GitHub Releases](https://github.com/hirefrank/confidant/releases); take
-both from the same release and verify the archive against the published
+Prebuilt binaries for macOS (x86_64 and Apple silicon) and Linux (x86_64)
+are on [GitHub Releases](https://github.com/hirefrank/confidant/releases);
+take both from the same release and verify the archive against the published
 `.sha256` (or `gh attestation verify <archive> --repo hirefrank/confidant`).
 Windows users run under WSL2.
 
@@ -89,10 +89,10 @@ URL is known instead. This is the long form of step 3 of the install prompt in
 ## What a vault is on disk
 
 A vault is a directory of plain text: `confidant.toml`, `ledger/`, and one
-Markdown record per person, org, deal, interaction, note, and edge. There is
-one kind of vault, and no mode to choose. `examples/demo-vault` is the same
-kind of vault, filled with fake people, an org, and the relationships
-between them.
+Markdown record per person, org, deal, interaction, note, and edge (plus
+`places/` and `things/` on a 0.4 vault). There is one kind of vault, and no
+mode to choose. `examples/demo-vault` is the same kind of vault, filled with
+fake people, an org, and the relationships between them.
 
 The privacy perimeter is the operator's own machines and a **private** git
 remote, with full-disk encryption on (LUKS, FileVault): see
@@ -113,9 +113,10 @@ remote, with full-disk encryption on (LUKS, FileVault): see
 `confidant init --create` only scaffolds an absent or empty directory (a
 directory holding just `.git` and/or `.gitignore` also counts as empty). A
 non-empty directory is refused, so a stray `--create` cannot turn a project
-checkout into a vault. Git needs an identity first, because init commits — check first and
-set only if unset, as in [Git first](#git-first-required-before-any-vault-step)
-§2 (the identity block lives there, not here).
+checkout into a vault. Git is required for `init`, but a global identity is
+not: init writes the neutral repo-local identity described in
+[Git first](#git-first-required-before-any-vault-step) §2, and setting a
+per-vault name and email is optional.
 
 Then create the vault. `--remote <url>` is optional and only sets `origin`
 (it does not push):
@@ -307,6 +308,18 @@ orders live; the work discipline; and 3–5 routines grounded in the vault's
 actual contents. `confidant status` reprints that brief with the readiness
 rollup.
 
+Setup also has a conversation half that the CLI cannot print. Before it
+closes, the agent asks the operator's three **bar** moments — what a page
+must contain before an important meeting, who is worth a page after meeting
+someone new, and whether a quiet relationship should prompt a nudge or stay
+silent — reflects the answers back, and keeps them, with the date, in its
+own operator memory (not in the vault). The bar decides what may be offered
+next: if the operator chose silence, no drift routine appears. Then comes
+the **jumping-off point**: three to five routines grounded in this vault and
+the sources the agent can actually read, as one structured choice with a
+marked recommendation. A declined routine is not offered again; "not now"
+is a deferral. The full discipline is in the embedded `confidant` skill.
+
 The last block is the optional-layers checklist (#715): vault present,
 skills linked, `qmd` installed, corpus built, embeddings present. Each row
 carries its state and a one-line tradeoff, and nothing there is required —
@@ -330,10 +343,13 @@ not block readiness. `confidant status --json` returns the same data under
 Confidant has two agent-integration surfaces, and `setup` names both in its
 completion output:
 
-- **Skills** (installed by `confidant setup`): workflow guidance and
+- **Skills** (installed by `confidant setup`): four embedded skills. The
+  meta `confidant` skill holds the register and standing rules every session
+  loads first; `qmd-search`, `pack-author`, and `report-a-problem` are the
+  task skills it routes to. Together they carry workflow guidance and
   guardrails — read routing, propose → confirm → apply, the `no-ai`
   boundary — executed by shelling out to the CLI. They work in any host that
-  can run a shell, and they carry the `pack-author` workflow.
+  can run a shell.
 - **MCP server** (`confidant mcp`): a thin stdio JSON-RPC wrapper over the
   same CLI commands, for MCP-native hosts that would rather have tools than
   a shell. It exposes a fixed tool whitelist (`check`, `doctor`, `find`,
@@ -493,7 +509,8 @@ built from (and whether `--embed` ran) in
 commits behind or was last built without `--embed` (a missing or unreadable
 record is `unknown`, never a silent `ok`).
 
-On a CPU-only host, prefer bm25 or `--mode hybrid --no-rerank`: the LLM
+On a CPU-only host, BM25 is the default mode and the safe choice at any
+vault size; prefer it or `--mode hybrid --no-rerank`: the LLM
 rerank stage can stall (`Reranking N chunks`) on hosts with few cores, while
 BM25 stays fast and vector/no-rerank hybrid are the ~15–17s-warm semantic
 fallback. The `qmd-search` skill's "CPU-only hosts" section carries the full

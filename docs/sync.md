@@ -171,6 +171,23 @@ If you are not sure whether to pull, `confidant sync --dry-run` shows the
 counts from the last fetch without touching the network. Run
 `confidant sync` when you want a fresh fetch.
 
+## How an agent runs it
+
+The rhythm follows from how many writers exist, not from a frequency
+preference: a local-only vault has nothing to fetch or push; a single writer
+pushes after each applied batch; two writers fetch and fast-forward before
+any read that matters and before every write batch, then push immediately;
+multi-agent adds a one-time `--request-id` (at least 22 characters, e.g. a
+ULID) to every write, so a retry after a failed push replays instead of
+duplicating the line.
+
+Hook sync onto events that already exist — the start and end of a batch, or
+the operator's daily routine — and treat a timer as a backstop, not the
+mechanism; install one only if the operator chooses it. If the branch
+diverged or the tree is dirty, stop the batch, show both sides, and name the
+recovery step. Never merge, rebase, or force-push around it, and never write
+on a stale base.
+
 ## Opt-in continuous sync
 
 There is no daemon in the CLI. If you want the remote to receive commits
