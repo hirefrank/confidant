@@ -11,10 +11,11 @@ relationship no single employee could hold alone.
 
 That condition — *many hands on one set of relationships* — is no longer
 unique to businesses. AI agents give a single person many hands. But agents
-often keep their own memories. Tell one how you know a friend, switch
-tools, and you may have to tell the story again. Repeating that onboarding
-discourages trying another agent and gives the current one an accidental
-hold on your history.
+often keep their own memories. With several agents, you may tell each one
+how you know a friend, then repeat the details as that relationship changes.
+Separate onboarding makes the agents harder to use together. Switching
+tools adds another round and gives the current one an accidental hold on
+your history.
 
 Confidant keeps the record with you. Each agent you connect can work from
 the same account of the people in your life, subject to the boundaries you
