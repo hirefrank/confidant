@@ -4,10 +4,11 @@ Agent-facing skill text that ships inside the `confidant` binary (ADR-8).
 There is no plugin system in v0: the agent runs a skill, and the skill calls
 the CLI's agent contract (ADR-7).
 
-Two skills ship today:
+Three skills ship today:
 
 | Skill | What it does |
 |---|---|
+| `confidant/` | Standing register for every interaction: plain English, structured choices with a recommendation, propose → confirm → apply, and routing to the task skills |
 | `qmd-search/` | Optional QMD-backed search over a local index; falls back to `confidant find` |
 | `pack-author/` | Scaffold and refine a local schema pack with `confidant pack init` |
 
@@ -32,5 +33,6 @@ longer ship. Unowned user files are left alone.
   never reaches the index or a query result.
 - Indexes and caches live in `<vault>/.confidant/` (gitignored), stay on
   trusted devices, and never go in git (ADR-6).
-- Skills propose nothing and write nothing themselves: `pack-author` edits
-  a directory outside the vault; `qmd-search` only reads.
+- Skills propose nothing and write nothing themselves: `confidant` is text
+  only, `pack-author` edits a directory outside the vault; `qmd-search` only
+  reads.
