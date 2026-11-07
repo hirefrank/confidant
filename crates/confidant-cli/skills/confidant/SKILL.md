@@ -1,6 +1,6 @@
 ---
 name: "confidant"
-description: "Standing rules for every Confidant interaction: plain English before internal vocabulary, every operator decision as a structured choice with a marked recommendation and rationale, propose → confirm → apply, status stated as outcomes, routing to setup, pack-author, qmd-search, or report-a-problem, setup's closing jumping-off point with the discipline that keeps opportunities surfacing later, the inferred sync posture that keeps multiple writers safe, and the operator's own bar for completeness, capture, and cadence. Load this before any other Confidant skill."
+description: "Standing rules for every Confidant interaction: plain English before internal vocabulary, every operator decision as a structured choice with a marked recommendation and rationale, propose → confirm → apply, status stated as outcomes, routing to setup, pack-author, qmd-search, reconcile, or report-a-problem, setup's closing jumping-off point with the discipline that keeps opportunities surfacing later, the inferred sync posture that keeps multiple writers safe, and the operator's own bar for completeness, capture, and cadence. Load this before any other Confidant skill."
 ---
 
 # Working with the operator
@@ -467,6 +467,7 @@ to this register when you return to the operator.
 | "Set up Confidant", "install it", "link my agents", "why is this not ready?" | No separate skill: follow the setup flow directly | `confidant setup --agent auto`, then `doctor`/`status`; `docs/agent-setup.md` in the repo is the long form |
 | "Teach Confidant about X" — a new field, verb, record type, or check | `pack-author` | Scaffold with `confidant pack init`; review claims and skill text with the operator before installing |
 | "Search across my notes", semantic or hybrid search, index freshness | `qmd-search` | Optional; improve on plain `confidant find` with a local index |
+| "Is this still true?", "clean up my notes", a scheduled maintenance pass | `reconcile` | Surface stale facts, verify them with the operator (the ground truth), and correct only what they confirm; never bulk-delete |
 | "This is broken", "file a bug", "report this" | `report-a-problem` | Draft from the conversation with structural diagnostics, search for a duplicate, and post only after the exact title, body, and destination are confirmed |
 
 Handoff notes:
@@ -496,7 +497,14 @@ Handoff notes:
 - **Derived state**: the search index is derived from the vault. After any
   vault-changing event in the session — writes you applied, or a pull that
   brought new commits — re-run the index/embed step and verify it with one
-  query before reporting done; `doctor` warns when the index is behind.
+  query before reporting done; `doctor` warns when the index is behind. The
+  reconcile pass keeps its own last-verified notebook in
+  `.confidant/reconcile-state.json`: local, gitignored, rebuildable, and
+  never a vault file.
+- **Maintenance**: the reconcile pass starts from `check` findings, the
+  operator's own bar, and its local last-verified state; it verifies one
+  record at a time, proposes only `retract`/`record retire` with a dry run
+  first, and never batches or bulk-deletes.
 - **Problem reports**: never paste vault content into an issue. Load
   `report-a-problem`: it drafts from the conversation, collects structural
   diagnostics only, redacts paths, contacts, and secrets, searches for a

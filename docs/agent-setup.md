@@ -351,13 +351,13 @@ not block readiness. `confidant status --json` returns the same data under
 Confidant has two agent-integration surfaces, and `setup` names both in its
 completion output:
 
-- **Skills** (installed by `confidant setup`): four embedded skills. The
+- **Skills** (installed by `confidant setup`): five embedded skills. The
   meta `confidant` skill holds the register and standing rules every session
-  loads first; `qmd-search`, `pack-author`, and `report-a-problem` are the
-  task skills it routes to. Together they carry workflow guidance and
-  guardrails — read routing, propose → confirm → apply, the `no-ai`
-  boundary — executed by shelling out to the CLI. They work in any host that
-  can run a shell.
+  loads first; `qmd-search`, `pack-author`, `reconcile`, and
+  `report-a-problem` are the task skills it routes to. Together they carry
+  workflow guidance and guardrails — read routing, propose → confirm →
+  apply, the `no-ai` boundary — executed by shelling out to the CLI. They
+  work in any host that can run a shell.
 - **MCP server** (`confidant mcp`): a thin stdio JSON-RPC wrapper over the
   same CLI commands, for MCP-native hosts that would rather have tools than
   a shell. It exposes a fixed tool whitelist (`check`, `doctor`, `find`,
