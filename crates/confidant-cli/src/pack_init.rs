@@ -153,7 +153,7 @@ fn validate_version(version: &str) -> anyhow::Result<()> {
         && parts
             .iter()
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        && crate::is_safe_version_part(version);
+        && crate::commands::pack::is_safe_version_part(version);
     if !valid {
         return Err(anyhow::Error::new(DomainError::invalid(format!(
             "pack version '{escaped}' is not major.minor"
