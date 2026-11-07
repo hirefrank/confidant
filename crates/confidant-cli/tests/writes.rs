@@ -117,6 +117,28 @@ fn run_json(args: &[&str]) -> (bool, Value) {
     (out.status.success(), v)
 }
 
+/// Like [`run_json`], but the write runs as an agent (`CONFIDANT_AGENT_ID`
+/// set), which is what arms the destructive-batch cap (#883).
+fn run_json_as_agent(args: &[&str], agent: &str) -> (bool, Value) {
+    let tmp_home = tempfile::tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(args)
+        .env("HOME", tmp_home.path())
+        .env("CONFIDANT_AGENT_ID", agent)
+        .output()
+        .unwrap();
+    let v: Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(e) => panic!(
+            "stdout is not JSON ({e}); status={}; stdout={}; stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    };
+    (out.status.success(), v)
+}
+
 fn vault_arg(root: &Path) -> String {
     root.display().to_string()
 }
@@ -4495,6 +4517,218 @@ fn bulk_retract_clears_a_duplicate_batch_in_one_commit() {
     assert!(ok, "{check}");
     assert_eq!(check["summary"]["warnings"], 0, "{check}");
     assert_eq!(find_refs(root, "call").len(), 1);
+}
+
+// #883: the destructive-batch cap. 40 live records put the cap at
+// floor(40 × 15%) = 6, above the floor of 3.
+const CAP_AGENT: &str = "agent-01J9Z3K4QH0000000000000999";
+const CAP_PERSON_BASE: &str = "p-01J9Z3K4QH00000000000000";
+
+fn cap_person(index: usize) -> String {
+    format!("{CAP_PERSON_BASE}{index:02}")
+}
+
+/// A committed spec-0.4 vault with `live_people` live person records and
+/// `touch_lines` identical touch lines for the first person.
+fn make_capped_vault(live_people: usize, touch_lines: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.4\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-11-02\"\n",
+    )
+    .unwrap();
+    for index in 0..live_people {
+        let id = cap_person(index);
+        std::fs::create_dir_all(root.join(format!("people/{id}"))).unwrap();
+        std::fs::write(
+            root.join(format!("people/{id}/profile.md")),
+            format!("---\nid: {id}\ntype: person\nname: \"Capped Person {index:02}\"\n---\n\nFake bio.\n"),
+        )
+        .unwrap();
+    }
+    std::fs::create_dir_all(root.join("ledger/2026")).unwrap();
+    let mut lines = String::new();
+    for _ in 0..touch_lines {
+        lines.push_str(&format!("2026-10-01 touch {} call\n", cap_person(0)));
+    }
+    std::fs::write(root.join("ledger/2026/10.cfd"), lines).unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    dir
+}
+
+fn bulk_retract_args<'a>(subject: &'a str, vroot: &'a str, keep: &'a str) -> Vec<&'a str> {
+    vec![
+        "retract",
+        subject,
+        "--verb",
+        "touch",
+        "--match-date",
+        "2026-10-01",
+        "--keep",
+        keep,
+        "--reason",
+        "duplicate",
+        "--date",
+        CP_DATE,
+        "--json",
+        "--vault",
+        vroot,
+    ]
+}
+
+#[test]
+fn agent_retract_batch_under_and_at_the_cap_is_allowed() {
+    // 40 live records → cap 6. Five is under, six is exactly at it.
+    for (keep, expected) in [("4", 5), ("3", 6)] {
+        let dir = make_capped_vault(40, 9);
+        let root = dir.path();
+        let vroot = vault_arg(root);
+        let subject = cap_person(0);
+        let before = commits(root);
+        let (ok, out) = run_json_as_agent(&bulk_retract_args(&subject, &vroot, keep), CAP_AGENT);
+        assert!(ok, "keep={keep}: {out}");
+        assert_eq!(out["targets"].as_array().unwrap().len(), expected, "{out}");
+        assert_eq!(commits(root), before + 1, "keep={keep}");
+    }
+}
+
+#[test]
+fn agent_retract_batch_over_the_cap_is_refused_until_forced() {
+    let dir = make_capped_vault(40, 9);
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let subject = cap_person(0);
+    let before = commits(root);
+
+    // Seven is one over the cap of six.
+    let (ok, out) = run_json_as_agent(&bulk_retract_args(&subject, &vroot, "2"), CAP_AGENT);
+    assert!(!ok, "an over-cap agent batch must be refused: {out}");
+    assert_eq!(out["error"]["code"], "E_DESTRUCTIVE_BATCH_CAP", "{out}");
+    let message = out["error"]["message"].as_str().unwrap();
+    assert!(message.contains("operator approval required"), "{out}");
+    assert!(message.contains("7"), "the count must be explicit: {out}");
+    assert!(
+        out["error"]["fix"].as_str().unwrap().contains("--force"),
+        "{out}"
+    );
+    // Nothing was written: no commit and no new month file.
+    assert_eq!(commits(root), before);
+    assert!(!root.join("ledger/2026/11.cfd").exists());
+
+    // The operator's explicit approval lets the same batch through.
+    let mut args = bulk_retract_args(&subject, &vroot, "2");
+    args.push("--force");
+    let (ok, approved) = run_json_as_agent(&args, CAP_AGENT);
+    assert!(ok, "{approved}");
+    assert_eq!(
+        approved["targets"].as_array().unwrap().len(),
+        7,
+        "{approved}"
+    );
+    assert_eq!(commits(root), before + 1);
+}
+
+#[test]
+fn human_retract_batch_over_the_cap_is_not_capped() {
+    let dir = make_capped_vault(40, 9);
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let subject = cap_person(0);
+    let before = commits(root);
+    // Same seven-line batch, no CONFIDANT_AGENT_ID: a human write is never
+    // capped.
+    let (ok, out) = run_json(&bulk_retract_args(&subject, &vroot, "2"));
+    assert!(ok, "{out}");
+    assert_eq!(out["targets"].as_array().unwrap().len(), 7, "{out}");
+    assert_eq!(commits(root), before + 1);
+}
+
+fn import_retract_line(subject: &str, reference: &str) -> String {
+    let (hash, occurrence) = match reference.split_once('#') {
+        Some((hash, n)) => (hash, Some(n)),
+        None => (reference, None),
+    };
+    let hex = hash
+        .strip_prefix("line:")
+        .expect("a find ref is line:<hex>");
+    match occurrence {
+        Some(n) => {
+            format!("{CP_DATE} retract {subject} line:{hex} occurrence:{n} reason:duplicate")
+        }
+        None => format!("{CP_DATE} retract {subject} line:{hex} reason:duplicate"),
+    }
+}
+
+#[test]
+fn agent_import_of_retract_lines_is_capped_and_force_approves_it() {
+    let dir = make_capped_vault(40, 9);
+    let root = dir.path();
+    let refs = find_refs(root, "call");
+    assert_eq!(refs.len(), 9, "{refs:?}");
+    let scratch = tempfile::tempdir().unwrap();
+    let batch = scratch.path().join("batch.cfd");
+    let lines: Vec<String> = refs
+        .iter()
+        .take(7)
+        .map(|reference| import_retract_line(&cap_person(0), reference))
+        .collect();
+    std::fs::write(&batch, format!("{}\n", lines.join("\n"))).unwrap();
+    let file = batch.display().to_string();
+    let vroot = vault_arg(root);
+    let before = commits(root);
+    let args = |force: bool| {
+        let mut args = vec![
+            "import",
+            "--file",
+            file.as_str(),
+            "--json",
+            "--vault",
+            &vroot,
+        ];
+        if force {
+            args.push("--force");
+        }
+        args
+    };
+
+    let (ok, out) = run_json_as_agent(&args(false), CAP_AGENT);
+    assert!(!ok, "a 7-retraction import must be refused: {out}");
+    assert_eq!(out["error"]["code"], "E_DESTRUCTIVE_BATCH_CAP", "{out}");
+    assert_eq!(commits(root), before);
+    assert!(!root.join("ledger/2026/11.cfd").exists());
+
+    let (ok, approved) = run_json_as_agent(&args(true), CAP_AGENT);
+    assert!(ok, "{approved}");
+    assert_eq!(commits(root), before + 1);
+    let ledger = std::fs::read_to_string(root.join("ledger/2026/11.cfd")).unwrap();
+    assert_eq!(ledger.matches("retract ").count(), 7, "{ledger}");
+}
+
+#[test]
+fn agent_single_record_retire_is_under_the_cap() {
+    let dir = make_capped_vault(40, 1);
+    let root = dir.path();
+    let id = cap_person(0);
+    let before = commits(root);
+    let (ok, out) = run_json_as_agent(
+        &[
+            "record",
+            "retire",
+            &id,
+            "--json",
+            "--vault",
+            &vault_arg(root),
+        ],
+        CAP_AGENT,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["retired"], true, "{out}");
+    assert_eq!(commits(root), before + 1);
 }
 
 #[test]
