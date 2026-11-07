@@ -5,8 +5,9 @@ Run from the repo root:
 
     python3 crates/confidant-cli/skills/reconcile/tests/test_reconcile_state.py
 
-The helper never reads the vault, so this suite needs no built CLI. It uses
-throwaway directories for state and fake opaque ids only. Fake data only.
+The helper reads the vault only through `confidant allowlist --json` (the
+§12 cleared set), so this suite uses a fake CLI that prints a canned cleared
+set. No real vault or built binary is needed. Fake data only.
 """
 from __future__ import annotations
 
@@ -30,17 +31,23 @@ PERSON = "p-01M3TC5H00MPJG000000000101"
 OTHER = "p-01M3TC5H00MPJG000000000102"
 THIRD = "p-01M3TC5H00MPJG000000000103"
 FOURTH = "p-01M3TC5H00MPJG000000000104"
+HIDDEN = "p-01M3TC5H00MPJG001248000002"
 
 # Built by concatenation so this test file, which is itself embedded in the
 # binary's skills tree, does not carry the literal operator-only names that
 # embedded.rs's #559 drift test forbids.
 FORBIDDEN = ("record" + " list", "--for" + "-operator", "for" + "_operator")
 
-
-def run(vault, *args, stdin=None):
-    cmd = [sys.executable, str(SCRIPT), "--vault", str(vault)]
-    cmd.extend(args)
-    return subprocess.run(cmd, capture_output=True, text=True, input=stdin)
+# A stand-in for `confidant allowlist --json`: the helper only needs the
+# cleared record paths, and the ids are what the state must filter against.
+FAKE_CLI = '''#!/usr/bin/env python3
+import json, os, sys
+ids = [i for i in os.environ.get("FAKE_CLEARED", "").split(",") if i]
+if os.environ.get("FAKE_CLI_OK", "1") != "1":
+    sys.exit("fake confidant failure")
+paths = ["people/%s/profile.md" % i for i in ids]
+print(json.dumps({"ok": True, "cleared_files": paths}))
+'''
 
 
 def make_vault(root: Path, gitignored: bool = True) -> Path:
@@ -54,11 +61,7 @@ def make_vault(root: Path, gitignored: bool = True) -> Path:
             check=True,
             capture_output=True,
         )
-        if gitignored:
-            (vault / ".gitignore").write_text(".confidant/\n", encoding="utf-8")
-    elif gitignored:
-        # No git on this host: the helper only warns, so write the file
-        # anyway so the test still reflects a properly-ignored vault.
+    if gitignored:
         (vault / ".gitignore").write_text(".confidant/\n", encoding="utf-8")
     return vault
 
@@ -93,6 +96,15 @@ class SkillTextTests(unittest.TestCase):
             for needle in FORBIDDEN:
                 self.assertNotIn(needle, text, f"{path} mentions {needle!r}")
 
+    def test_skill_documents_the_show_unverified_key(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("`show --json`", text)
+        self.assertIn("`unverified`", text)
+        # The stale name was the bug: `show` never emitted it, and treating
+        # it as a `show` key dropped loose ends from the candidate set.
+        self.assertNotIn("`open_unverified` id from `show", text)
+        self.assertIn("`open_unverified`", text)
+
 
 class StateHelperTests(unittest.TestCase):
     def setUp(self):
@@ -100,14 +112,52 @@ class StateHelperTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.vault = make_vault(self.root)
         self.state = state_path(self.vault)
+        self.fake_cli = self.root / "fake-confidant"
+        self.fake_cli.write_text(FAKE_CLI, encoding="utf-8")
+        self.fake_cli.chmod(0o755)
+        self.cleared = [PERSON, OTHER, THIRD, FOURTH]
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def show(self):
-        out = run(self.vault, "show", "--json")
+    def helper(self, *args, stdin=None, cleared=None, vault=None, cli_ok=True):
+        cmd = [
+            sys.executable,
+            str(SCRIPT),
+            "--vault",
+            str(vault or self.vault),
+            "--cli",
+            str(self.fake_cli),
+        ]
+        cmd.extend(args)
+        env = dict(os.environ)
+        env["FAKE_CLEARED"] = ",".join(
+            self.cleared if cleared is None else cleared
+        )
+        env["FAKE_CLI_OK"] = "1" if cli_ok else "0"
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            input=stdin,
+            env=env,
+        )
+
+    def show(self, cleared=None):
+        out = self.helper("show", "--json", cleared=cleared)
         self.assertEqual(out.returncode, 0, out.stderr)
         return json.loads(out.stdout)
+
+    def seed_state(self, records=None, unverified=None):
+        self.state.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": "1",
+            "updated": "2026-11-07",
+            "records": records or {},
+            "unverified": unverified or {},
+            "runs": [],
+        }
+        self.state.write_text(json.dumps(payload), encoding="utf-8")
 
     def test_show_with_no_state_is_empty(self):
         data = self.show()
@@ -115,16 +165,16 @@ class StateHelperTests(unittest.TestCase):
         self.assertEqual(data["records"], {})
         self.assertEqual(data["unverified"], {})
         self.assertEqual(data["runs"], [])
+        self.assertEqual(data["hidden_uncleared"], 0)
         self.assertFalse(self.state.exists())
 
     def test_mark_verified_round_trip_and_permissions(self):
-        out = run(self.vault, "mark-verified", PERSON, "--date", "2026-11-07")
+        out = self.helper("mark-verified", PERSON, "--date", "2026-11-07")
         self.assertEqual(out.returncode, 0, out.stderr)
         data = self.show()
         self.assertEqual(
             data["records"][PERSON], {"last_verified": "2026-11-07"}
         )
-        self.assertEqual(data["updated"], data["updated"])
         if os.name == "posix":
             self.assertEqual(self.state.stat().st_mode & 0o777, 0o600)
             self.assertEqual(self.state.parent.stat().st_mode & 0o777, 0o700)
@@ -138,13 +188,12 @@ class StateHelperTests(unittest.TestCase):
             "note-01M3TC5H00MPJG0000000001",
             "",
         ):
-            out = run(self.vault, "mark-verified", bad, "--date", "2026-11-07")
+            out = self.helper("mark-verified", bad, "--date", "2026-11-07")
             self.assertNotEqual(out.returncode, 0, f"{bad!r} was accepted")
         self.assertFalse(self.state.exists(), "a rejected id still wrote state")
 
     def test_unverified_then_verified_clears(self):
-        out = run(
-            self.vault,
+        out = self.helper(
             "mark-unverified",
             PERSON,
             "--reason",
@@ -158,7 +207,7 @@ class StateHelperTests(unittest.TestCase):
             data["unverified"][PERSON],
             {"since": "2026-11-01", "reason": "no-answer"},
         )
-        out = run(self.vault, "mark-verified", PERSON, "--date", "2026-11-07")
+        out = self.helper("mark-verified", PERSON, "--date", "2026-11-07")
         self.assertEqual(out.returncode, 0, out.stderr)
         data = self.show()
         self.assertNotIn(PERSON, data["unverified"])
@@ -167,8 +216,7 @@ class StateHelperTests(unittest.TestCase):
         )
 
     def test_unverified_keeps_first_since_date(self):
-        run(
-            self.vault,
+        self.helper(
             "mark-unverified",
             PERSON,
             "--reason",
@@ -176,8 +224,7 @@ class StateHelperTests(unittest.TestCase):
             "--date",
             "2026-11-01",
         )
-        run(
-            self.vault,
+        self.helper(
             "mark-unverified",
             PERSON,
             "--reason",
@@ -192,10 +239,9 @@ class StateHelperTests(unittest.TestCase):
         )
 
     def test_plan_orders_changed_never_checked_stalest(self):
-        run(self.vault, "mark-verified", PERSON, "--date", "2026-01-01")
-        run(self.vault, "mark-verified", OTHER, "--date", "2026-10-01")
-        run(
-            self.vault,
+        self.helper("mark-verified", PERSON, "--date", "2026-01-01")
+        self.helper("mark-verified", OTHER, "--date", "2026-10-01")
+        self.helper(
             "mark-unverified",
             FOURTH,
             "--reason",
@@ -210,12 +256,14 @@ class StateHelperTests(unittest.TestCase):
                 {"id": THIRD, "dates": ["2026-10"]},
             ]
         }
-        out = run(self.vault, "plan", stdin=json.dumps(payload))
+        out = self.helper("plan", stdin=json.dumps(payload))
         self.assertEqual(out.returncode, 0, out.stderr)
         data = json.loads(out.stdout)
         groups = {g["priority"]: g["records"] for g in data["groups"]}
-        self.assertEqual([g["priority"] for g in data["groups"]],
-                         ["changed", "never-checked", "stalest"])
+        self.assertEqual(
+            [g["priority"] for g in data["groups"]],
+            ["changed", "never-checked", "stalest"],
+        )
         self.assertEqual([r["id"] for r in groups["changed"]], [PERSON])
         self.assertEqual([r["id"] for r in groups["never-checked"]], [THIRD])
         self.assertEqual([r["id"] for r in groups["stalest"]], [OTHER])
@@ -223,17 +271,30 @@ class StateHelperTests(unittest.TestCase):
             data["open_unverified"],
             [{"id": FOURTH, "since": "2026-11-01", "reason": "conflict"}],
         )
+        self.assertEqual(data["skipped_uncleared"], 0)
+
+    def test_plan_keeps_open_unverified_even_when_listed(self):
+        # Finding 1: an unverified id that is also a candidate must not
+        # vanish from `open_unverified`, or the cap could skip it.
+        self.helper("mark-unverified", PERSON, "--reason", "no-answer")
+        payload = {"records": [{"id": PERSON, "dates": []}]}
+        out = self.helper("plan", stdin=json.dumps(payload))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        data = json.loads(out.stdout)
+        self.assertEqual(len(data["open_unverified"]), 1)
+        self.assertEqual(data["open_unverified"][0]["id"], PERSON)
+        self.assertEqual(data["open_unverified"][0]["reason"], "no-answer")
 
     def test_plan_month_only_dates_compare_conservatively(self):
-        run(self.vault, "mark-verified", PERSON, "--date", "2026-03-31")
-        run(self.vault, "mark-verified", OTHER, "--date", "2026-02-28")
+        self.helper("mark-verified", PERSON, "--date", "2026-03-31")
+        self.helper("mark-verified", OTHER, "--date", "2026-02-28")
         payload = {
             "records": [
                 {"id": PERSON, "dates": ["2026-03"]},
                 {"id": OTHER, "dates": ["2026-03"]},
             ]
         }
-        out = run(self.vault, "plan", stdin=json.dumps(payload))
+        out = self.helper("plan", stdin=json.dumps(payload))
         self.assertEqual(out.returncode, 0, out.stderr)
         data = json.loads(out.stdout)
         groups = {g["priority"]: g["records"] for g in data["groups"]}
@@ -247,14 +308,66 @@ class StateHelperTests(unittest.TestCase):
             '{"records": [{"id": "%s", "dates": ["2026-13-01"]}]}' % PERSON,
             '{"records": [{"id": "%s"}, {"id": "%s"}]}' % (PERSON, PERSON),
         ):
-            out = run(self.vault, "plan", stdin=payload)
+            out = self.helper("plan", stdin=payload)
             self.assertNotEqual(out.returncode, 0, payload)
+
+    def test_no_ai_id_cannot_enter_the_state_file(self):
+        # Finding 2: a no-ai id is absent from the cleared set, and that —
+        # not an E_NOT_FOUND from `context` — is the fail-closed signal.
+        out = self.helper("mark-verified", HIDDEN, "--date", "2026-11-07")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("cleared set", out.stderr)
+        self.assertFalse(self.state.exists(), "an uncleared id wrote state")
+
+    def test_plan_drops_uncleared_candidates_and_never_names_them(self):
+        payload = {
+            "records": [
+                {"id": HIDDEN, "dates": ["2026-10-01"]},
+                {"id": PERSON, "dates": ["2026-10-01"]},
+            ]
+        }
+        out = self.helper("plan", stdin=json.dumps(payload))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn(HIDDEN, out.stdout)
+        data = json.loads(out.stdout)
+        self.assertEqual(data["skipped_uncleared"], 1)
+        listed = [
+            record["id"]
+            for group in data["groups"]
+            for record in group["records"]
+        ]
+        self.assertEqual(listed, [PERSON])
+
+    def test_show_hides_uncleared_state_entries(self):
+        # A record can become no-ai after being verified; `show` must not
+        # put its id back into agent-facing output, and `prune` must remove
+        # it from the local state.
+        self.seed_state(records={HIDDEN: {"last_verified": "2026-10-01"}})
+        data = self.show()
+        self.assertNotIn(HIDDEN, json.dumps(data))
+        self.assertEqual(data["hidden_uncleared"], 1)
+        self.assertEqual(data["records"], {})
+
+        out = self.helper("prune")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn(HIDDEN, out.stdout)
+        self.assertEqual(self.show()["hidden_uncleared"], 0)
+
+    def test_show_and_mark_fail_closed_without_the_cleared_set(self):
+        self.seed_state(records={PERSON: {"last_verified": "2026-10-01"}})
+        out = self.helper("show", "--json", cli_ok=False)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("cleared set", out.stderr)
+        out = self.helper("mark-verified", PERSON, "--date", "2026-11-07",
+                       cli_ok=False)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("cleared set", out.stderr)
 
     def test_rejects_invalid_or_unknown_state(self):
         self.state.parent.mkdir(parents=True)
         for text in ("not json", '{"schema_version": "9"}'):
             self.state.write_text(text, encoding="utf-8")
-            out = run(self.vault, "mark-verified", PERSON, "--date", "2026-11-07")
+            out = self.helper("mark-verified", PERSON, "--date", "2026-11-07")
             self.assertNotEqual(out.returncode, 0, text)
             self.assertIn("move it aside", out.stderr)
 
@@ -262,7 +375,8 @@ class StateHelperTests(unittest.TestCase):
         if not shutil.which("git"):
             self.skipTest("git not installed")
         vault = make_vault(self.root / "nogit", gitignored=False)
-        out = run(vault, "mark-verified", PERSON, "--date", "2026-11-07")
+        out = self.helper("mark-verified", PERSON, "--date", "2026-11-07",
+                       vault=vault)
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("git-ignored", out.stderr)
         self.assertFalse(state_path(vault).exists())
@@ -271,8 +385,7 @@ class StateHelperTests(unittest.TestCase):
         start = datetime.date(2026, 1, 1)
         for offset in range(35):
             day = (start + datetime.timedelta(days=offset)).isoformat()
-            out = run(
-                self.vault,
+            out = self.helper(
                 "record-run",
                 "--checked",
                 "1",
@@ -299,14 +412,12 @@ class StateHelperTests(unittest.TestCase):
             ["--checked", "2", "--proposed", "1", "--applied", "2"],
             ["--checked", "1", "--skipped", "2"],
         ):
-            out = run(
-                self.vault, "record-run", *args, "--date", "2026-11-07"
-            )
+            out = self.helper("record-run", *args, "--date", "2026-11-07")
             self.assertNotEqual(out.returncode, 0, args)
 
     def test_forget_and_clear_are_no_ops_when_absent(self):
         for args in (("forget", PERSON), ("clear-unverified", PERSON)):
-            out = run(self.vault, *args)
+            out = self.helper(*args)
             self.assertEqual(out.returncode, 0, out.stderr)
         self.assertFalse(self.state.exists())
 

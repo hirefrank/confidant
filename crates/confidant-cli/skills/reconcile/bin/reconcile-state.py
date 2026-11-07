@@ -5,6 +5,7 @@ Usage: reconcile-state.py [--vault PATH] [--state PATH] <command> ...
 
 Commands:
   show [--json]
+  prune
   mark-verified ID [--date YYYY-MM-DD]
   mark-unverified ID --reason REASON [--date YYYY-MM-DD]
   clear-unverified ID
@@ -18,10 +19,15 @@ gitignored, rebuildable, and holding only opaque record IDs, dates, and a
 closed set of reasons. It never holds a name, note text, or any other vault
 content. It is derived workflow state (ADR-6), not a vault file.
 
-This script never reads the vault. The agent gathers candidates through the
-CLI (`check`, `find`, `context`, `status`) and passes only opaque IDs and
-dates here. `plan` orders a candidate list the way the skill describes:
-changed since the last pass, then never checked, then stalest.
+The only vault read is `confidant allowlist --json` (the §12 cleared set),
+through the CLI. No vault file is opened here. An agent-facing pass must
+never record an id that is not cleared: `no-ai: true`, retired, merged-away,
+and out-of-scope records fail closed. `show` hides uncleared entries (with a
+count), `plan` drops uncleared candidates (with a count), and `prune`
+removes them from the state. The agent gathers candidates through the CLI
+(`check`, `find`, `context`, `status`) and passes only opaque IDs and dates
+here. `plan` orders a candidate list the way the skill describes: changed
+since the last pass, then never checked, then stalest.
 
 Refuses to write unless `.confidant/` is git-ignored in the vault repo (the
 same guardrail the qmd-search corpus uses). Warns instead of refusing when
@@ -38,6 +44,7 @@ import subprocess
 import sys
 import tempfile
 from datetime import date, datetime
+from pathlib import PurePosixPath
 
 SCHEMA_VERSION = "1"
 STATE_REL = os.path.join(".confidant", "reconcile-state.json")
@@ -71,6 +78,89 @@ def resolve_state(vault, explicit):
     if explicit:
         return os.path.abspath(os.path.expanduser(explicit))
     return os.path.join(vault, STATE_REL)
+
+
+def resolve_cli(explicit):
+    return explicit or os.environ.get("CONFIDANT_CLI") or "confidant"
+
+
+def record_id_from_path(rel):
+    """The opaque record id in a vault-relative cleared path.
+
+    Record layouts vary (`<collection>/<id>/<main_file>` in 0.4,
+    `people/<id>/notes/<note-id>.md` in 0.2), so check the parent directory
+    and the file stem and accept one opaque id. Returns None for a path with
+    no id (ledger lines are not records).
+    """
+    path = PurePosixPath(rel)
+    for candidate in (path.parent.name, path.stem):
+        if ID_RE.match(candidate):
+            return candidate
+    return None
+
+
+def cleared_ids(vault, cli):
+    """Record ids in the §12 cleared set, via `confidant allowlist --json`.
+
+    This is the only vault read the helper makes, and it is deliberately the
+    CLI's own cleared-set computation: `no-ai: true`, retired, merged-away,
+    and out-of-scope records are absent by construction. Fail closed when the
+    set cannot be read.
+    """
+    try:
+        out = subprocess.run(
+            [cli, "allowlist", "--json", "--no-input", "--vault", vault],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        fail(
+            f"cannot read the cleared set with {cli!r}: {e}; "
+            "refusing to guess which records are agent-visible"
+        )
+    if out.returncode != 0:
+        detail = out.stderr.strip() or out.stdout.strip() or "no detail"
+        fail(
+            f"cannot read the cleared set: `{cli} allowlist` failed "
+            f"({out.returncode}): {detail}"
+        )
+    try:
+        payload = json.loads(out.stdout)
+    except json.JSONDecodeError as e:
+        fail(f"cannot read the cleared set: not JSON: {e}")
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        fail(f"cannot read the cleared set: `{cli} allowlist` did not report ok")
+    files = payload.get("cleared_files")
+    if not isinstance(files, list):
+        fail("cannot read the cleared set: no cleared_files list")
+    ids = set()
+    for rel in files:
+        if not isinstance(rel, str):
+            fail(f"`{cli} allowlist` returned a non-string path")
+        rid = record_id_from_path(rel)
+        if rid is not None:
+            ids.add(rid)
+    return ids
+
+
+def filter_state(state, cleared):
+    """A copy of the state with uncleared ids removed, plus a count.
+
+    The count is deliberately the only trace of a hidden entry: an id that
+    is not in the cleared set (including a `no-ai: true` record) must never
+    reach agent-facing output.
+    """
+    hidden = (set(state["records"]) | set(state["unverified"])) - cleared
+    shown = dict(state)
+    shown["records"] = {
+        rid: entry for rid, entry in state["records"].items() if rid in cleared
+    }
+    shown["unverified"] = {
+        rid: entry for rid, entry in state["unverified"].items() if rid in cleared
+    }
+    shown["hidden_uncleared"] = len(hidden)
+    return shown
 
 
 def today():
@@ -247,6 +337,12 @@ def human_show(vault, path, state):
     for rid in sorted(state["unverified"]):
         entry = state["unverified"][rid]
         print(f"  {rid}  since {entry['since']} ({entry['reason']})")
+    hidden = state.get("hidden_uncleared", 0)
+    if hidden:
+        print(
+            f"Hidden (not in the cleared set): {hidden} record(s); "
+            "run `prune` to drop them"
+        )
     runs = state["runs"]
     print(f"Runs recorded: {len(runs)}")
     if runs:
@@ -258,19 +354,47 @@ def human_show(vault, path, state):
 
 
 def cmd_show(vault, path, state, args):
+    if state["records"] or state["unverified"]:
+        cleared = cleared_ids(vault, args.cli)
+        shown = filter_state(state, cleared)
+    else:
+        shown = filter_state(state, set())
     if args.json:
-        out = dict(state)
+        out = dict(shown)
         out["vault"] = vault
         out["state"] = path
         print(json.dumps(out, indent=2, sort_keys=True))
     else:
-        human_show(vault, path, state)
+        human_show(vault, path, shown)
     return 0
+
+
+def cmd_prune(vault, path, state, args):
+    cleared = cleared_ids(vault, args.cli)
+    stale = (set(state["records"]) | set(state["unverified"])) - cleared
+    for rid in stale:
+        state["records"].pop(rid, None)
+        state["unverified"].pop(rid, None)
+    if stale:
+        save_state(vault, path, state)
+    print(f"pruned {len(stale)} record(s) not in the cleared set")
+    return 0
+
+
+def require_cleared(vault, cli, rid):
+    cleared = cleared_ids(vault, cli)
+    if rid not in cleared:
+        fail(
+            f"{rid} is not in the cleared set (no-ai, retired, merged away, "
+            "or out of scope); its id must not enter the state file"
+        )
+    return cleared
 
 
 def cmd_mark_verified(vault, path, state, args):
     check_id(args.id)
     check_day(args.date)
+    require_cleared(vault, args.cli, args.id)
     state["records"][args.id] = {"last_verified": args.date}
     state["unverified"].pop(args.id, None)
     save_state(vault, path, state)
@@ -283,6 +407,7 @@ def cmd_mark_unverified(vault, path, state, args):
     check_day(args.date)
     if args.reason not in REASONS:
         fail("reason must be one of " + ", ".join(REASONS))
+    require_cleared(vault, args.cli, args.id)
     previous = state["unverified"].get(args.id)
     since = previous["since"] if previous else args.date
     state["unverified"][args.id] = {"since": since, "reason": args.reason}
@@ -345,7 +470,10 @@ def read_candidates():
 
 
 def cmd_plan(vault, path, state, args):
-    candidates = read_candidates()
+    cleared = cleared_ids(vault, args.cli)
+    all_candidates = read_candidates()
+    candidates = [item for item in all_candidates if item["id"] in cleared]
+    skipped_uncleared = len(all_candidates) - len(candidates)
     groups = {"changed": [], "never-checked": [], "stalest": []}
     for item in candidates:
         rid = item["id"]
@@ -372,12 +500,14 @@ def cmd_plan(vault, path, state, args):
     groups["never-checked"].sort(key=lambda r: r["id"])
     groups["stalest"].sort(key=lambda r: (r["last_verified"], r["id"]))
 
-    listed = {item["id"] for item in candidates}
     open_unverified = [
         {"id": rid, **state["unverified"][rid]}
         for rid in sorted(state["unverified"])
-        if rid not in listed
+        if rid in cleared
     ]
+    hidden_unverified = sum(
+        1 for rid in state["unverified"] if rid not in cleared
+    )
     result = {
         "schema_version": SCHEMA_VERSION,
         "vault": vault,
@@ -387,6 +517,8 @@ def cmd_plan(vault, path, state, args):
             for priority in ("changed", "never-checked", "stalest")
         ],
         "open_unverified": open_unverified,
+        "skipped_uncleared": skipped_uncleared,
+        "hidden_unverified": hidden_unverified,
     }
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
@@ -428,11 +560,19 @@ def build_parser():
     parser.add_argument(
         "--state", help="override the state file path (default: <vault>/.confidant/reconcile-state.json)"
     )
+    parser.add_argument(
+        "--cli", help="confidant binary used for `allowlist --json` (default: CONFIDANT_CLI or `confidant`)"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     show = sub.add_parser("show", help="print the state")
     show.add_argument("--json", action="store_true", help="machine-readable output")
     show.set_defaults(func=cmd_show)
+
+    prune = sub.add_parser(
+        "prune", help="drop state entries that are no longer in the cleared set"
+    )
+    prune.set_defaults(func=cmd_prune)
 
     verified = sub.add_parser("mark-verified", help="record a verified pass")
     verified.add_argument("id")
@@ -473,6 +613,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    args.cli = resolve_cli(args.cli)
     vault = resolve_vault(args.vault)
     path = resolve_state(vault, args.state)
     state = load_state(path)
