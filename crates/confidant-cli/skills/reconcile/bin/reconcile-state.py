@@ -113,6 +113,11 @@ def cleared_ids(vault, cli):
             capture_output=True,
             text=True,
             timeout=120,
+            # `plan` reads candidate JSON from this process's stdin. A child
+            # must never inherit that pipe: a CLI wrapper that reads stdin
+            # would consume the candidates and the pass would silently do
+            # nothing. Each subprocess here gets an empty stdin instead.
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         fail(
@@ -278,6 +283,7 @@ def ensure_confidant_gitignored(vault):
         [git, "-C", vault, "rev-parse", "--git-dir"],
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
     )
     if repo.returncode != 0:
         print(
@@ -290,6 +296,7 @@ def ensure_confidant_gitignored(vault):
     probe = subprocess.run(
         [git, "-C", vault, "check-ignore", "-q", ".confidant/.probe"],
         capture_output=True,
+        stdin=subprocess.DEVNULL,
     )
     if probe.returncode == 0:
         return

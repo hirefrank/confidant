@@ -42,6 +42,10 @@ FORBIDDEN = ("record" + " list", "--for" + "-operator", "for" + "_operator")
 # cleared record paths, and the ids are what the state must filter against.
 FAKE_CLI = '''#!/usr/bin/env python3
 import json, os, sys
+# Optional: prove `plan` detaches candidate stdin. A wrapper that reads
+# stdin must not eat the JSON the parent is about to parse.
+if os.environ.get("FAKE_CLI_READ_STDIN") == "1":
+    sys.stdin.read()
 ids = [i for i in os.environ.get("FAKE_CLEARED", "").split(",") if i]
 if os.environ.get("FAKE_CLI_OK", "1") != "1":
     sys.exit("fake confidant failure")
@@ -120,7 +124,10 @@ class StateHelperTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def helper(self, *args, stdin=None, cleared=None, vault=None, cli_ok=True):
+    def helper(
+        self, *args, stdin=None, cleared=None, vault=None, cli_ok=True,
+        read_stdin=False,
+    ):
         cmd = [
             sys.executable,
             str(SCRIPT),
@@ -135,6 +142,7 @@ class StateHelperTests(unittest.TestCase):
             self.cleared if cleared is None else cleared
         )
         env["FAKE_CLI_OK"] = "1" if cli_ok else "0"
+        env["FAKE_CLI_READ_STDIN"] = "1" if read_stdin else "0"
         return subprocess.run(
             cmd,
             capture_output=True,
@@ -271,6 +279,25 @@ class StateHelperTests(unittest.TestCase):
             data["open_unverified"],
             [{"id": FOURTH, "since": "2026-11-01", "reason": "conflict"}],
         )
+        self.assertEqual(data["skipped_uncleared"], 0)
+
+    def test_plan_reads_candidates_even_when_cli_reads_stdin(self):
+        # Finding 3: `plan` calls the cleared-set CLI before reading the
+        # candidate JSON from its own stdin. The child must not inherit that
+        # pipe; a wrapper that reads stdin would otherwise eat the candidates
+        # and the plan would silently come back empty.
+        payload = {"records": [{"id": PERSON, "dates": ["2026-10-01"]}]}
+        out = self.helper(
+            "plan", stdin=json.dumps(payload), read_stdin=True
+        )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        data = json.loads(out.stdout)
+        listed = [
+            record["id"]
+            for group in data["groups"]
+            for record in group["records"]
+        ]
+        self.assertEqual(listed, [PERSON])
         self.assertEqual(data["skipped_uncleared"], 0)
 
     def test_plan_keeps_open_unverified_even_when_listed(self):
