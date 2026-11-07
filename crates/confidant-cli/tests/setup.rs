@@ -58,7 +58,13 @@ fn run(args: &[&str], env: &Env, extra: &[(&str, &str)]) -> (bool, Value, String
 }
 
 fn skill_ids() -> Vec<&'static str> {
-    vec!["confidant", "pack-author", "qmd-search", "report-a-problem"]
+    vec![
+        "confidant",
+        "pack-author",
+        "qmd-search",
+        "reconcile",
+        "report-a-problem",
+    ]
 }
 
 #[test]
@@ -66,7 +72,7 @@ fn setup_links_all_skills_as_symlinks() {
     let env = fresh_env();
     let (ok, v, _) = run(&["setup", "--agent", "all", "--json"], &env, &[]);
     assert!(ok, "{v}");
-    assert_eq!(v["linked"], 4, "{v}");
+    assert_eq!(v["linked"], 5, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     for id in skill_ids() {
@@ -979,7 +985,7 @@ fn update_offline_relinks_without_network() {
         &[("CONFIDANT_OFFLINE", "1")],
     );
     assert!(ok, "{v}");
-    assert_eq!(v["linked"], 4, "{v}");
+    assert_eq!(v["linked"], 5, "{v}");
     assert_eq!(v["update"]["status"], "disabled", "{v}");
 }
 
@@ -2079,7 +2085,7 @@ fn setup_json_next_steps_are_additive() {
     assert_eq!(v["next_steps"]["vault_set"], true, "{v}");
     assert!(v["next_steps"]["vault_export"].is_null(), "{v}");
     // Existing contract intact.
-    assert_eq!(v["linked"], 4, "{v}");
+    assert_eq!(v["linked"], 5, "{v}");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"), "{v}");
 }
 
@@ -2157,7 +2163,7 @@ fn setup_json_reports_qmd_availability_additively() {
     assert_eq!(v["next_steps"]["qmd_available"], false, "{v}");
     let note = v["next_steps"]["qmd_note"].as_str().expect("qmd_note");
     assert!(note.contains("confidant find"), "{v}");
-    assert_eq!(v["linked"], 4, "{v}");
+    assert_eq!(v["linked"], 5, "{v}");
 }
 
 // #720: setup reports both agent-integration surfaces, not just skill links.
@@ -2384,7 +2390,7 @@ fn setup_dry_run_json_reports_planned_counts() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v["dry_run"], true, "{v}");
-    assert_eq!(v["linked"], 32, "{v}");
+    assert_eq!(v["linked"], 40, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     // Nothing materialized or linked.
     assert!(
@@ -2408,8 +2414,8 @@ fn setup_counts_shared_agent_dir_once() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
 
-    // 9 agent entries, 8 distinct dirs, 4 skills each.
-    assert_eq!(v["linked"], 32, "{v}");
+    // 9 agent entries, 8 distinct dirs, 5 skills each.
+    assert_eq!(v["linked"], 40, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     assert!(
         v["agents"]
@@ -2423,7 +2429,7 @@ fn setup_counts_shared_agent_dir_once() {
     // The shared dir got one link per skill, not one per label.
     let shared = std::path::Path::new(&env.home).join(".agents/skills");
     let entries: Vec<_> = std::fs::read_dir(&shared).unwrap().flatten().collect();
-    assert_eq!(entries.len(), 4, "shared dir linked twice: {v}");
+    assert_eq!(entries.len(), 5, "shared dir linked twice: {v}");
     for entry in entries {
         assert!(entry.path().is_symlink(), "{:?}", entry.path());
     }
@@ -2472,7 +2478,7 @@ fn agents_human_lists_all_nine_before_setup() {
             r.stdout
         );
     }
-    assert!(r.stdout.contains("0/4"), "{}", r.stdout);
+    assert!(r.stdout.contains("0/5"), "{}", r.stdout);
     assert!(
         r.stdout
             .contains("`confidant setup --agent <name>` or `confidant setup --agent auto`"),
@@ -2531,7 +2537,7 @@ fn update_dry_run_writes_nothing() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v["dry_run"], true, "{v}");
-    assert_eq!(v["linked"], 32, "{v}");
+    assert_eq!(v["linked"], 40, "{v}");
     assert_eq!(v["update"]["status"], "disabled", "{v}");
 
     assert!(
@@ -2558,7 +2564,7 @@ fn update_dry_run_human_reports_planned_relink() {
     );
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     assert!(
-        r.stdout.contains("would re-link 32 skills"),
+        r.stdout.contains("would re-link 40 skills"),
         "planned relink not reported:\n{}",
         r.stdout
     );

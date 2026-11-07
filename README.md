@@ -417,9 +417,10 @@ confidant check --json --no-input --vault testdata/vaults/place-0.3
 
 ## How your agents use it
 
-`confidant setup --agent auto` links the four embedded skills — `confidant`
+`confidant setup --agent auto` links the five embedded skills — `confidant`
 (standing interaction rules), `qmd-search` (optional semantic search),
-`pack-author` (build a local pack), and `report-a-problem` (file an issue
+`pack-author` (build a local pack), `reconcile` (a maintenance pass that
+verifies stale facts with you), and `report-a-problem` (file an issue
 without vault content) — and ends with an optional-layers checklist, so it
 offers QMD rather than installing it. Agents use the CLI — or `confidant
 mcp`, a thin stdio wrapper over the same commands — and follow one workflow:
@@ -673,9 +674,10 @@ No issue is open right now; the themes the recent releases close out:
 - **Corrections** — `retract`, `correct`, and record `retire`/`unretire` fix
   a mistake without rewriting the ledger; superseded lines and retired
   records stay on disk and out of agent reads.
-- **Agent surface** — four embedded skills (`confidant`, `qmd-search`,
-  `pack-author`, `report-a-problem`), the fixed nine-tool `confidant mcp`
-  server, and the optional QMD search layer with a CPU-only fallback.
+- **Agent surface** — five embedded skills (`confidant`, `qmd-search`,
+  `pack-author`, `reconcile`, `report-a-problem`), the fixed nine-tool
+  `confidant mcp` server, and the optional QMD search layer with a CPU-only
+  fallback.
 - **Plaintext first-run** — 0.8 shipped plaintext-only, and `status` plus
   the project page make the perimeter and the install state clear from the
   first session.

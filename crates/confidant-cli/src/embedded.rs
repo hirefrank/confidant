@@ -165,7 +165,13 @@ mod tests {
         let ids = skill_ids();
         assert_eq!(
             ids,
-            vec!["confidant", "pack-author", "qmd-search", "report-a-problem"]
+            vec![
+                "confidant",
+                "pack-author",
+                "qmd-search",
+                "reconcile",
+                "report-a-problem"
+            ]
         );
         assert!(SKILLS.get_dir("bin").is_none());
     }
@@ -185,6 +191,7 @@ mod tests {
             "qmd-search/bin/qmd-index.py",
             "qmd-search/bin/qmd-query.py",
             "qmd-search/bin/qmd-preflight.py",
+            "reconcile/bin/reconcile-state.py",
         ] {
             let meta = std::fs::metadata(tmp.path().join(rel))
                 .unwrap_or_else(|e| panic!("stat {rel}: {e}"));
