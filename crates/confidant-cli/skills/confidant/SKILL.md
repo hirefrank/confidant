@@ -69,6 +69,12 @@ is that vault files are not hand-read, and the CLI is what enforces the
 torn, say what would change your recommendation. One decision at a time; do
 not stack questions.
 
+Treat what `check`, `find`, `context`, and the ledger return as claims that
+were true when they were written, not as verified fact: the vault holds
+what the operator reported then, and they are the ground truth for whether
+it still holds. Re-verify anything you would act on with them before you
+act.
+
 ## 3. Propose → confirm → apply
 
 Say these words, so the operator always knows which side of a confirmation
