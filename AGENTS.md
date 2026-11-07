@@ -65,6 +65,7 @@ Read before changing behaviour:
 |---|---|
 | `crates/confidant-core/` | Parser, model, derived values, check engine, search allowlist |
 | `crates/confidant-cli/` | The `confidant` binary (package `confidant-cli`) |
+| `crates/confidant-cli/src/commands/` | One module per command family (`check`, `find`, `pack`, `record`, `note`, …); `main.rs` keeps the clap surface, the `run` dispatch, and the shared JSON envelope/error path |
 | `crates/confidant-tui/` | Terminal UI (`confidant-tui`): reference second consumer of the ADR-7 `--json --no-input` CLI contract. Ships as a GitHub Releases binary and on crates.io; launched via `confidant tui` |
 | `fuzz/` | cargo-fuzz harnesses for the ledger parser (own workspace, excluded from the main one; not run in CI) |
 | `spikes/` | Throwaway spikes, each its own workspace excluded from the main one (see `spikes/rune-desktop-app/`); not run in CI |
