@@ -3,10 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="color-scheme" content="light dark" />
-    <meta name="description" content="Confidant is relationship memory you own — a local-first, git-backed memory for the people in your life. Open source, Apache-2.0." />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Confidant keeps your history with people in Git-backed text files you own, so every connected AI agent can start from the same record." />
+    <link rel="canonical" href="https://hirefrank.com/confidant/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Confidant" />
+    <meta property="og:url" content="https://hirefrank.com/confidant/" />
+    <meta property="og:title" content="Confidant — Relationship memory for you and your AI agents" />
+    <meta property="og:description" content="Keep your history with people in Git-backed text files you own, so every connected AI agent can start from the same record." />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Confidant — Relationship memory for you and your AI agents" />
+    <meta name="twitter:description" content="Keep your history with people in Git-backed text files you own, so every connected AI agent can start from the same record." />
     <link rel="icon" href="data:," />
-    <title>Confidant — Relationship memory you own</title>
+    <title>Confidant — Relationship memory for you and your AI agents</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -175,6 +184,26 @@
       .page .cli-card .hl { color: var(--gold); }
       .page .cli-card .ok { color: var(--teal); }
 
+      /* ---------- Install one-liner ---------- */
+      .page .install {
+        display: flex; align-items: center; gap: 14px; margin-top: 18px;
+        background: #120a2e; border: 1px solid rgba(157,123,255,.35);
+        border-radius: 14px; padding: 12px 12px 12px 18px; max-width: 620px;
+      }
+      .page .install code {
+        font-family: var(--mono); font-size: 13px; color: var(--ink);
+        white-space: nowrap; overflow-x: auto; flex: 1;
+        scrollbar-width: none;
+      }
+      .page .install code::-webkit-scrollbar { display: none; }
+      .page .install .copy {
+        font-family: var(--disp); font-weight: 700; font-size: 12.5px;
+        padding: 8px 16px; border-radius: 999px; border: 1px solid rgba(47,214,192,.45);
+        color: var(--teal); background: rgba(47,214,192,.08); cursor: pointer;
+        flex: none; transition: background .15s;
+      }
+      .page .install .copy:hover { background: rgba(47,214,192,.16); }
+
       /* ---------- The one contrast line ---------- */
       .page .contrast { padding: 30px 0 6px; }
       .page .contrast-inner {
@@ -191,7 +220,7 @@
       .page .contrast .line-b .co { color: var(--coral); }
 
       /* ---------- Features ---------- */
-      .page .feat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+      .page .feat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
       .page .feat {
         background: var(--panel); border: 1px solid rgba(245,242,255,.09); border-radius: 22px;
         padding: 28px 26px 30px; transition: transform .18s ease, border-color .18s ease;
@@ -227,22 +256,6 @@
       .page .step p { margin: 0 0 16px; color: var(--dim); font-size: 15px; line-height: 1.65; }
       .page .step code { font-family: var(--mono); font-size: 12.5px; background: rgba(0,0,0,.3); color: var(--teal); padding: 4px 10px; border-radius: 8px; }
 
-      /* ---------- Privacy ---------- */
-      .page .trust-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 52px; align-items: start; }
-      .page .trust-grid .big { font-family: var(--disp); font-size: 24px; font-weight: 600; line-height: 1.45; margin: 0 0 18px; }
-      .page .trust-grid p { color: var(--dim); font-size: 16.5px; line-height: 1.7; margin: 0 0 16px; }
-      .page .pieces { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
-      .page .pieces li {
-        background: var(--panel); border: 1px solid rgba(245,242,255,.09); border-radius: 16px;
-        padding: 18px 20px; font-size: 15.5px; font-weight: 700; display: flex; gap: 14px; align-items: center;
-      }
-      .page .pieces li i { width: 16px; height: 16px; flex: none; clip-path: polygon(15% 0, 100% 20%, 80% 100%, 0 80%); }
-      .page .pieces li:nth-child(4n+1) i { background: var(--teal); }
-      .page .pieces li:nth-child(4n+2) i { background: var(--coral); }
-      .page .pieces li:nth-child(4n+3) i { background: var(--gold); }
-      .page .pieces li:nth-child(4n) i { background: var(--violet); }
-      .page .pieces li span { display: block; font-weight: 600; color: var(--dim); font-size: 13.5px; margin-top: 2px; line-height: 1.5; }
-
       /* ---------- CTA / footer ---------- */
       .page .cta-band { padding: 40px 0 96px; }
       .page .cta-card {
@@ -265,9 +278,34 @@
       .page footer a:hover { color: var(--teal); }
       .page footer .spacer { flex: 1; }
 
+      /* The story: people stay as agents change. */
+      .page .hero { padding: 62px 0 82px; }
+      .page .hero-grid { grid-template-columns: 1fr 1fr; gap: 56px; }
+      .page .hero h1 { font-size: clamp(42px, 5vw, 60px); }
+      .page .hero-eyebrow { color: var(--teal); font: 700 12px var(--disp); letter-spacing: .14em; text-transform: uppercase; margin: 0 0 18px; }
+      .page .hero-note { margin-top: 20px; }
+      .page .story { border-top: 1px solid rgba(245,242,255,.12); }
+      .page .story-grid { display: grid; grid-template-columns: 1fr 1.1fr; gap: 48px; align-items: start; }
+      .page .story-copy { padding-top: 32px; }
+      .page .story-copy p { margin: 0 0 16px; color: var(--dim); font-size: 18px; line-height: 1.7; }
+      .page .start-intro { max-width: 800px; }
+      .page .start-intro .install { margin-top: 20px; }
+      .page .start-steps { margin-top: 36px; }
+      .page .start-steps .step p { margin-bottom: 0; }
+      .page .dev-link { display: inline-block; margin-top: 20px; color: var(--teal); font-weight: 700; text-underline-offset: 4px; }
+      .page .dev-detail { margin-top: 22px; }
+      .page .dev-detail summary { color: var(--dim); cursor: pointer; font-weight: 700; }
+      .page .dev-detail .cli-card { margin-top: 16px; }
+      .page .portability-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 34px; }
+      .page .portability-grid article { padding: 22px; border-radius: 18px; background: var(--panel); border: 1px solid rgba(245,242,255,.11); }
+      .page .portability-grid b { display: block; font: 700 17px var(--disp); margin-bottom: 8px; }
+      .page .portability-grid p { margin: 0; color: var(--dim); font-size: 14px; line-height: 1.6; }
+      .page .pack-intro { max-width: 690px; }
+      .page .pack-grid { margin-top: 30px; }
+
       @media (max-width: 900px) {
-        .page .hero-grid, .page .trust-grid { grid-template-columns: 1fr; }
-        .page .feat-grid, .page .steps, .page .pack-grid { grid-template-columns: 1fr; }
+        .page .hero-grid, .page .story-grid { grid-template-columns: 1fr; }
+        .page .feat-grid, .page .steps, .page .pack-grid, .page .portability-grid { grid-template-columns: 1fr; }
         .page .shard-stage { min-height: 380px; }
         .page nav { gap: 14px; }
         .page nav .links { display: none; }
@@ -276,6 +314,8 @@
         .page .cli-card { padding: 24px 20px 26px; }
         .page .cli-card pre { white-space: pre-wrap; word-break: break-word; }
         .page .contrast-inner { padding: 48px 20px; }
+        .page .hero-grid, .page .story-grid { gap: 36px; }
+        .page .story-copy { padding-top: 0; }
       }
 
       @media (max-width: 560px) {
@@ -298,10 +338,9 @@
         <nav>
           <div class="wordmark"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>confidant</div>
           <div class="links">
+            <a href="#why">Why Confidant</a>
             <a href="#packs">Packs</a>
-            <a href="#features">Features</a>
-            <a href="#how">How it works</a>
-            <a href="#privacy">Privacy</a>
+            <a href="#start">Get started</a>
           </div>
           <span class="pill">v0.9.0 · Apache-2.0</span>
           <a class="btn teal" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">GitHub ↗</a>
@@ -312,14 +351,14 @@
         <div class="wrap">
           <div class="hero-grid">
             <div>
-              <span class="pill">● Open source · Apache-2.0 · Local-first</span>
-              <h1>Relationship memory <span class="co">you</span> <span class="t">own</span>.</h1>
-              <p class="lede">Remember the people who matter: the friend you meant to call, a birthday coming up, the details you want to carry into the next conversation. Confidant keeps that memory in <strong>plain files you own</strong>, ready for you and your AI agents.</p>
+              <p class="hero-eyebrow">Relationship memory you own</p>
+              <h1>Don't start over with <span class="t">every agent.</span></h1>
+              <p class="lede">You work with several AI agents. Tell one about a friend, and the others still don't know them. Confidant keeps your history with people in <strong>Git-backed text files you own</strong>, so every connected agent can start from the same record.</p>
               <div class="cta-row">
-                <a class="btn solid" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">Get it on GitHub</a>
-                <a class="btn" href="#packs">Meet the packs</a>
+                <a class="btn solid" href="#start">Get started with Confidant</a>
+                <a class="btn" href="#packs">See what's in the vault</a>
               </div>
-              <p class="hero-note">Free forever — it's open source. Runs anywhere the <b>confidant</b> CLI runs.</p>
+              <p class="hero-note">Open source · Local-first · Git-backed text files · No account</p>
             </div>
             <div class="shard-stage" aria-hidden="true">
               <svg class="shard s1" style="--r:-8deg" viewBox="0 0 100 100"><polygon points="8,12 92,4 74,88 0,70" fill="#2fd6c0" opacity=".92"/></svg>
@@ -343,59 +382,62 @@
         </div>
       </section>
 
-      <section class="block" id="packs">
-        <div class="wrap">
-          <div class="sec-head"><p class="sec-tag">Built for real life</p><h2>The little things <span class="t">add up</span>.</h2><p class="sec-sub">Start with your personal relationships. Confidant keeps people, dates, and a history of touchpoints together, so caring for your relationships doesn't depend on remembering everything.</p></div>
-          <div class="pack-grid">
-            <article class="pack-card c-core"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Remember</p><h3>A place for each person</h3><p>Keep notes, birthdays, and the details you want to remember in a readable Markdown file.</p></article>
-            <article class="pack-card c-draft"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Reconnect</p><h3>Notice what needs attention</h3><p>Set a cadence, log a call or a visit, and let <code>confidant check</code> surface overdue connections and upcoming dates.</p></article>
-            <article class="pack-card c-yours"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Make it yours</p><h3>Grow with packs</h3><p>The personal pack is built in. When you need a different vocabulary, optional packs extend your vault; the pack-author skill can help draft one for your review.</p></article>
+      <section class="block story" id="why"><div class="wrap">
+        <div class="story-grid">
+          <div><p class="sec-tag">Why Confidant?</p><h2>Stop spending your time keeping <span class="t">every agent up to date.</span></h2></div>
+          <div class="story-copy">
+            <p>When every agent keeps its own notes, you repeat yourself and details drift. Businesses have CRMs. People need a Confidant.</p>
+            <p>Keep each relationship in one place. The agents you connect can read what you choose to share.</p>
           </div>
         </div>
-      </section>
-
-      <section class="contrast" aria-label="What Confidant is not">
-        <div class="wrap">
-          <div class="contrast-inner">
-            <p><span class="line-a">Businesses need CRMs.</span><span class="line-b">Humans need to <span class="co">remember</span>.</span></p>
-          </div>
+        <div class="portability-grid">
+          <article><b>One source for many agents</b><p>Connect your agents to one vault. Keep one record per person.</p></article>
+          <article><b>People, not accounts</b><p>Remember how you know them, shared places, and moments.</p></article>
+          <article><b>Portable by design</b><p>Plain text in Git. Read it, diff it, back it up, or move it to another device.</p></article>
         </div>
-      </section>
+      </div></section>
 
-      <section class="block" id="features"><div class="wrap">
-        <div class="sec-head"><p class="sec-tag">Why Confidant</p><h2>A memory that <span class="t">stays yours</span>.</h2><p class="sec-sub">A simple home for relationship context, with useful tools for you and your agents.</p></div>
-        <div class="feat-grid">
-          <article class="feat"><div class="chip">1</div><h3>Plain files</h3><p>Your vault is a Git repository of readable records and a dated ledger. Inspect it, back it up, and take it with you.</p></article>
-          <article class="feat"><div class="chip">2</div><h3>Thoughtful reminders</h3><p>Find overdue touchpoints and upcoming dates with a local check, based on the details you choose to keep.</p></article>
-          <article class="feat"><div class="chip">3</div><h3>Agents that can help</h3><p>Embedded skills help your AI agent work with your vault, with a propose, confirm, and apply workflow.</p></article>
-          <article class="feat"><div class="chip">4</div><h3>Your boundaries</h3><p>Mark a record <code>no-ai</code> to keep it out of agent-facing reads. The files themselves remain readable on disk.</p></article>
-          <article class="feat"><div class="chip">5</div><h3>Use it your way</h3><p>Work from the command line, the terminal interface, or an agent. Sync through a private Git remote if you choose.</p></article>
-          <article class="feat"><div class="chip">6</div><h3>Open source</h3><p>Built in Rust and available under Apache-2.0. Confidant has no server holding your vault.</p></article>
-        </div></div></section>
-      <section class="block" id="how"><div class="wrap">
-        <div class="sec-head"><p class="sec-tag">How it works</p><h2>Make room to <span class="co">remember</span>.</h2></div>
-        <div class="steps">
-          <article class="step"><div class="snum">1</div><h3>Set up Confidant</h3><p>Install the CLI and terminal UI yourself, or let your agent help with the setup.</p><code>confidant setup --agent auto</code></article>
-          <article class="step"><div class="snum">2</div><h3>Make a vault</h3><p>Create a local Git repository for your records. Keep it on an encrypted device and use a private remote if you sync.</p><code>confidant init --create</code></article>
-          <article class="step"><div class="snum">3</div><h3>Keep in touch</h3><p>Add people and log touchpoints as life happens. Check for the connections and dates that need attention.</p><code>confidant check</code></article>
-        </div></div></section>
-      <section class="block" id="cli"><div class="wrap"><div class="sec-head"><p class="sec-tag">A little help, right when you need it</p><h2>Make the next <span class="t">connection</span>.</h2><p class="sec-sub">A check can bring the people you care about back to mind.</p></div>
-        <div class="cli-card"><div class="cap"><i></i><i></i><i></i><span>confidant — your terminal</span></div><pre><span class="cm"># See who might appreciate a hello</span>
-<span class="p">$</span> confidant check
-<span class="hl">A touchpoint is overdue · a birthday is coming up</span>
+      <section class="block story" id="packs"><div class="wrap">
+        <div class="sec-head pack-intro"><p class="sec-tag">Packs</p><h2>Start with relationships. <span class="t">Extend as needed.</span></h2><p class="sec-sub">The built-in personal pack covers people, places, things, and the moments that connect them. Packs add record types, fields, and checks when you need them.</p></div>
+        <div class="pack-grid">
+          <article class="pack-card c-core"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Built in</p><h3>Personal</h3><p>Remember past conversations. Flag upcoming dates and overdue check-ins.</p></article>
+          <article class="pack-card c-draft"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Extend it</p><h3>Your vocabulary</h3><p>Ask your agent to build a pack for a new part of your life or work.</p></article>
+          <article class="pack-card c-yours"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Keep it consistent</p><h3>Packs travel with the vault</h3><p>Optional packs are hash-pinned in your vault, so its vocabulary travels with it.</p></article>
+        </div>
+        <a class="dev-link" href="https://github.com/hirefrank/confidant#packs" target="_blank" rel="noopener">How schema packs work ↗</a>
+      </div></section>
 
-<span class="cm"># Keep a record after you reach out</span>
-<span class="p">$</span> confidant log touch "Robin Example" text</pre></div></div></section>
-      <section class="block" id="privacy"><div class="wrap"><div class="sec-head"><p class="sec-tag">Privacy, in plain language</p><h2>Know where your <span class="co">memory</span> lives.</h2></div><div class="trust-grid"><div><p class="big">Your vault is yours to keep. It is also readable by anyone who can access its files.</p><p>Confidant stores records as plaintext in a Git repository, including its history. Use full-disk encryption on trusted devices and a private remote if you sync. Confidant does not add its own encryption layer.</p><p>There is no Confidant server storing your vault. You can inspect the open-source code and the files yourself.</p></div><ul class="pieces"><li><i></i><div>On your device<span>Keep your vault on a trusted, encrypted machine.</span></div></li><li><i></i><div>Private remote<span>Anyone with access to your Git repo can read its records and history.</span></div></li><li><i></i><div>Agent boundaries<span><code>no-ai</code> excludes marked records from agent-facing reads; it does not encrypt them.</span></div></li><li><i></i><div>Files you own<span>Plain text and Git make your memory portable and inspectable.</span></div></li></ul></div></div></section>
+      <section class="block" id="start"><div class="wrap">
+        <div class="start-intro">
+          <p class="sec-tag">Get started</p><h2>Start with <span class="t">your own vault.</span></h2>
+          <p class="sec-sub">Confidant is free and open source. Install it, create a vault, then connect the agents you use.</p>
+          <div class="install">
+            <code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh</code>
+            <button class="copy" type="button" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh">Copy</button>
+          </div>
+          <a class="dev-link" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">Installation options and documentation on GitHub ↗</a>
+        </div>
+        <div class="steps start-steps">
+          <article class="step"><div class="snum">1</div><h3>Install Confidant</h3><p>Install the CLI, then link agent skills. MCP is optional.</p></article>
+          <article class="step"><div class="snum">2</div><h3>Create your vault</h3><p>Keep your records in a local Git repository on an encrypted device.</p></article>
+          <article class="step"><div class="snum">3</div><h3>Connect an agent</h3><p>Build relationship memory together. Use <code>no-ai</code> to limit agent reads.</p></article>
+        </div>
+        <details class="dev-detail"><summary>For developers: see a write in the CLI</summary>
+          <div class="cli-card"><div class="cap"><i></i><i></i><i></i><span>confidant — your terminal</span></div><pre><span class="cm"># Preview a call on Robin's record</span>
+<span class="p">$</span> confidant log touch "Robin Example" call --date 2026-09-14 --dry-run
+
+<span class="cm"># Apply after review</span>
+<span class="p">$</span> confidant log touch "Robin Example" call --date 2026-09-14</pre></div>
+        </details>
+      </div></section>
 
       <section class="cta-band">
         <div class="wrap">
           <div class="cta-card">
-            <h2>Ready to hold all the pieces yourself?</h2>
-            <p>Confidant is free and open source. Grab it from GitHub, spin up a vault, and keep your network in the one pair of hands it belongs in — yours.</p>
+            <h2>Your relationships. <span class="co">Your record.</span></h2>
+            <p>Keep your history with people in Git-backed text files you own. Connect the agents you use, and bring your record with you when your tools change.</p>
             <div class="cta-row">
-              <a class="btn solid" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">github.com/hirefrank/confidant</a>
-              <a class="btn teal" href="#how">How it works</a>
+              <a class="btn solid" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">Get Confidant on GitHub ↗</a>
             </div>
           </div>
         </div>
@@ -405,7 +447,7 @@
         <div class="wrap">
           <div class="frow">
             <span>confidant</span>
-            <span>Relationship memory you own — local-first, git-backed, open source.</span>
+            <span>People first · Git-backed text files · Yours across agents.</span>
             <span class="spacer"></span>
             <a href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">GitHub</a>
             <span>Apache-2.0</span>
@@ -413,5 +455,16 @@
         </div>
       </footer>
     </main>
+    <script>
+      // Copy the install one-liner; graceful when clipboard access fails.
+      document.querySelectorAll("[data-copy]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          navigator.clipboard.writeText(btn.dataset.copy).catch(() => {});
+          const label = btn.textContent;
+          btn.textContent = "Copied";
+          setTimeout(() => { btn.textContent = label; }, 1500);
+        });
+      });
+    </script>
   </body>
 </html>

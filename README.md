@@ -33,7 +33,7 @@ vault.
 
 **The preferred path: let your agent install it.** Paste this into Muse,
 Grok Bot, Claude Code, Cursor, Codex, or any agent that can run commands; it
-installs the CLI and TUI, links the embedded skills, and asks where your
+installs the CLI, links the embedded skills, and asks where your
 vault is. This README is the canonical home for the prompt;
 [`docs/agent-setup.md`](docs/agent-setup.md) covers headless hosts,
 environment variables, and updates.
@@ -41,21 +41,14 @@ environment variables, and updates.
 ```text
 Set up Confidant (relationship memory you own — a CLI plus embedded agent skills) on this machine:
 
-1. Install the CLI and TUI together: `cargo install confidant-cli
-   confidant-tui` (needs a Rust toolchain 1.88+; check with
-   `rustc --version` — if it says "no default is configured", run
-   `rustup default stable` first). The CLI provides the `confidant`
-   binary. Make sure `~/.cargo/bin` is on PATH first
+1. Install the CLI:
+   `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh`.
+   Make sure `~/.cargo/bin` is on PATH
    (`export PATH="$HOME/.cargo/bin:$PATH"`) or the next step fails with
    `confidant: command not found`. Verify with `confidant --help`.
-   (No Rust toolchain? Download both binaries + the installer from the
-   latest GitHub Release at
-   https://github.com/hirefrank/confidant/releases instead — install them
-   from the same release so their versions match — and verify the
-   downloaded `.tar.xz`/`.zip` first: check the published `.sha256`
-   checksum file (that's what it covers), or run
-   `gh attestation verify <archive> --repo hirefrank/confidant` for build
-   provenance.)
+   If I want the TUI too, install it from the same GitHub Release as the
+   CLI so their versions match. Alternatively, install both with
+   `cargo install confidant-cli confidant-tui` (requires Rust 1.88+).
 2. Install the skills (they ship inside the binary — no repo checkout):
    `confidant setup --agent auto`. This materializes the skills to a
    versioned share dir and links each skill into the detected agent's
