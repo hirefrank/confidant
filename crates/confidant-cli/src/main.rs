@@ -10464,10 +10464,15 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                     }
                     return Ok(ExitCode::SUCCESS);
                 }
-                if cli.dry_run {
-                    println!("confidant {local} is current (latest: {tag}). Would re-link skills…");
+                let version_status = if behind == Some(false) {
+                    format!("confidant {local} is current (latest: {tag})")
                 } else {
-                    println!("confidant {local} is current (latest: {tag}). Re-linking skills…");
+                    format!("cannot compare confidant {local} with release tag {tag}")
+                };
+                if cli.dry_run {
+                    println!("{version_status}. Would re-link skills from this binary…");
+                } else {
+                    println!("{version_status}. Re-linking skills from this binary…");
                 }
             }
         }

@@ -1622,6 +1622,30 @@ fn update_cargo_dist_json_does_not_call_an_unknown_version_current() {
     assert_eq!(v["update"]["self_update"], "unknown", "{v}");
 }
 
+#[cfg(feature = "test-overrides")]
+#[test]
+fn update_cargo_dist_human_does_not_call_an_unknown_version_current() {
+    let env = fresh_env();
+    let dir = tempfile::tempdir().unwrap();
+    let (receipt, exe) = fake_dist_install(dir.path(), &dir.path().join("bin"));
+    let port = stub_release_server("not-a-version");
+    let url = format!("http://127.0.0.1:{port}/");
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
+            ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("cannot compare"), "{}", r.stdout);
+    assert!(!r.stdout.contains(" is current"), "{}", r.stdout);
+}
+
 #[cfg(all(feature = "test-overrides", not(windows)))]
 #[test]
 fn update_cargo_dist_failure_is_a_typed_error() {
