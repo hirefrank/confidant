@@ -1465,55 +1465,62 @@ fn stub_download_base(port: u16) -> String {
 #[test]
 fn update_cargo_dist_self_updates_in_place() {
     // #876: a one-liner install replaces itself without a prompt, reports
-    // the new version, and does not re-link skills from the old binary.
-    let sums = test_sums(TEST_ARCHIVE_HASH);
-    let installer = test_installer(TEST_ARCHIVE_HASH);
-    let port = stub_release_server_with_assets("v999.0.0", Some(&sums), Some(&installer));
-    let env = fresh_env();
-    let recorder = recorder_path(&env);
-    let dir = tempfile::tempdir().unwrap();
-    let bin = dir.path().join("bin");
-    let (receipt, exe) = fake_dist_install(dir.path(), &bin);
-    let url = format!("http://127.0.0.1:{port}/");
-    let download = stub_download_base(port);
-    let r = run_raw(
-        &["update", "--agent", "all"],
-        &env,
-        &[
-            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
-            ("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL", download.as_str()),
-            ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
-            ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
-            (
-                "CONFIDANT_TEST_COMMAND_RECORDER",
-                recorder.to_str().unwrap(),
-            ),
-        ],
-        &[],
-        true,
-    );
-    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
-    assert!(r.stdout.contains("updating in place"), "{}", r.stdout);
-    assert!(r.stdout.contains("updated to 999.0.0"), "{}", r.stdout);
-    assert!(
-        r.stdout.contains("Run `confidant setup`"),
-        "the new binary must re-link skills: {}",
-        r.stdout
-    );
-    assert!(!r.stderr.contains("[y/N]"), "{}", r.stderr);
-    let recorded = std::fs::read_to_string(&recorder).unwrap();
-    assert!(
-        recorded.contains("CONFIDANT_CLI_INSTALL_DIR="),
-        "installer run did not pin the receipt prefix: {recorded}"
-    );
-    assert!(
-        recorded.contains(bin.to_str().unwrap()),
-        "installer run named the wrong prefix: {recorded}"
-    );
-    assert!(
-        !PathBuf::from(&env.share).join("skills").exists(),
-        "update re-linked skills from the old binary"
-    );
+    // the new version, and does not re-link skills from the old binary. Both
+    // receipt shapes must resolve to the same Cargo home, not bin/bin.
+    for prefix_is_bin in [true, false] {
+        let sums = test_sums(TEST_ARCHIVE_HASH);
+        let installer = test_installer(TEST_ARCHIVE_HASH);
+        let port = stub_release_server_with_assets("v999.0.0", Some(&sums), Some(&installer));
+        let env = fresh_env();
+        let recorder = recorder_path(&env);
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let prefix = if prefix_is_bin { &bin } else { dir.path() };
+        let (receipt, exe) = fake_dist_install(dir.path(), prefix);
+        let url = format!("http://127.0.0.1:{port}/");
+        let download = stub_download_base(port);
+        let r = run_raw(
+            &["update", "--agent", "all"],
+            &env,
+            &[
+                ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+                ("CONFIDANT_TEST_RELEASE_DOWNLOAD_URL", download.as_str()),
+                ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
+                ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
+                (
+                    "CONFIDANT_TEST_COMMAND_RECORDER",
+                    recorder.to_str().unwrap(),
+                ),
+            ],
+            &[],
+            true,
+        );
+        assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+        assert!(r.stdout.contains("updating in place"), "{}", r.stdout);
+        assert!(r.stdout.contains("updated to 999.0.0"), "{}", r.stdout);
+        assert!(
+            r.stdout.contains("Run `confidant setup`"),
+            "the new binary must re-link skills: {}",
+            r.stdout
+        );
+        assert!(!r.stderr.contains("[y/N]"), "{}", r.stderr);
+        let recorded = std::fs::read_to_string(&recorder).unwrap();
+        assert!(
+            recorded.contains("CONFIDANT_CLI_INSTALL_DIR="),
+            "installer run did not pin the receipt prefix: {recorded}"
+        );
+        assert!(
+            recorded.contains(&format!(
+                "CONFIDANT_CLI_INSTALL_DIR={}",
+                dir.path().display()
+            )),
+            "installer must receive the Cargo home, not its bin directory: {recorded}"
+        );
+        assert!(
+            !PathBuf::from(&env.share).join("skills").exists(),
+            "update re-linked skills from the old binary"
+        );
+    }
 }
 
 #[cfg(all(feature = "test-overrides", not(windows)))]
@@ -1590,6 +1597,53 @@ fn update_cargo_dist_json_reports_without_self_updating() {
     );
     assert_eq!(v["update"]["behind"], true, "{v}");
     assert!(!recorder.exists(), "JSON path self-updated the binary");
+}
+
+#[cfg(feature = "test-overrides")]
+#[test]
+fn update_cargo_dist_json_does_not_call_an_unknown_version_current() {
+    let env = fresh_env();
+    let dir = tempfile::tempdir().unwrap();
+    let (receipt, exe) = fake_dist_install(dir.path(), &dir.path().join("bin"));
+    let port = stub_release_server("not-a-version");
+    let url = format!("http://127.0.0.1:{port}/");
+    let (ok, v, _) = run(
+        &["update", "--agent", "all", "--json"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
+            ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
+        ],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["update"]["status"], "unknown", "{v}");
+    assert!(v["update"]["behind"].is_null(), "{v}");
+    assert_eq!(v["update"]["self_update"], "unknown", "{v}");
+}
+
+#[cfg(feature = "test-overrides")]
+#[test]
+fn update_cargo_dist_human_does_not_call_an_unknown_version_current() {
+    let env = fresh_env();
+    let dir = tempfile::tempdir().unwrap();
+    let (receipt, exe) = fake_dist_install(dir.path(), &dir.path().join("bin"));
+    let port = stub_release_server("not-a-version");
+    let url = format!("http://127.0.0.1:{port}/");
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            ("CONFIDANT_TEST_EXE_PATH", exe.to_str().unwrap()),
+            ("CONFIDANT_TEST_RECEIPT_PATH", receipt.to_str().unwrap()),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("cannot compare"), "{}", r.stdout);
+    assert!(!r.stdout.contains(" is current"), "{}", r.stdout);
 }
 
 #[cfg(all(feature = "test-overrides", not(windows)))]
