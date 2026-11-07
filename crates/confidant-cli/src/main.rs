@@ -10336,10 +10336,12 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
         "unavailable"
     } else if offline {
         "disabled"
-    } else if behind == Some(true) {
-        "available"
     } else {
-        "current"
+        match behind {
+            Some(true) => "available",
+            Some(false) => "current",
+            None => "unknown",
+        }
     };
     if cli.json {
         // The JSON path never prompts and never runs anything (#376); the
@@ -10351,8 +10353,11 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
             None => {
                 serde_json::json!({"status": "unknown", "message": STALENESS_UNKNOWN, "behind": Value::Null})
             }
-            Some(tag) => {
+            Some(tag) if behind.is_some() => {
                 serde_json::json!({"status": "fetched", "latest": tag, "local": local, "behind": behind})
+            }
+            Some(tag) => {
+                serde_json::json!({"status": "unknown", "latest": tag, "local": local, "behind": Value::Null})
             }
         };
         if let Value::Object(ref mut obj) = update_info {
@@ -10411,7 +10416,7 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                             println!("confidant {local} is behind the latest release {tag}; run `{DIST_INSTALLER_ONELINER}`, then re-run `confidant setup`.");
                         } else {
                             println!("confidant {local} is behind the latest release {tag}; updating in place…");
-                            let new_version = self_update_cargo_dist(install_prefix, tag)?;
+                            let new_version = self_update_cargo_dist(install_prefix, &exe, tag)?;
                             println!(
                                 "updated to {new_version}. Run `confidant setup` to re-link skills from the new binary."
                             );
@@ -10697,12 +10702,35 @@ fn run_release_installer(installer: &[u8], install_prefix: &Path) -> anyhow::Res
     }
 }
 
+/// The installer treats its forced directory as a Cargo home and appends
+/// `/bin`. Older receipts can name that bin directory instead of its root.
+/// Require an exact match with the running binary before choosing the root.
+fn cargo_dist_install_root(install_prefix: &Path, exe: &Path) -> Option<PathBuf> {
+    let bin = exe.parent()?;
+    if normalized_path(bin) == normalized_path(&install_prefix.join("bin")) {
+        return Some(install_prefix.to_path_buf());
+    }
+    if bin.file_name().is_some_and(|name| name == "bin")
+        && normalized_path(bin) == normalized_path(install_prefix)
+    {
+        return bin.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
 /// Replace a cargo-dist install in place (#876) without an updater
 /// framework: fetch the release's `sha256.sum` and installer, verify the
 /// installer against those checksums, then run it with the receipt prefix
 /// pinned. The installer verifies the platform archive before installing it,
 /// so the binary that lands is the one the release checksums cover.
-fn self_update_cargo_dist(install_prefix: &Path, tag: &str) -> anyhow::Result<String> {
+fn self_update_cargo_dist(install_prefix: &Path, exe: &Path, tag: &str) -> anyhow::Result<String> {
+    let install_root = cargo_dist_install_root(install_prefix, exe).ok_or_else(|| {
+        update_failed(format!(
+            "the install receipt prefix {} does not match the running binary {}; refusing to install into a different directory",
+            install_prefix.display(),
+            exe.display(),
+        ))
+    })?;
     let base = release_download_base();
     let archive = release_target_archive().ok_or_else(|| {
         update_failed(format!(
@@ -10715,7 +10743,7 @@ fn self_update_cargo_dist(install_prefix: &Path, tag: &str) -> anyhow::Result<St
     let sums = parse_sha256_sum(&String::from_utf8_lossy(&sums_body));
     let installer = fetch_release_bytes(&format!("{base}/{tag}/confidant-cli-installer.sh"))?;
     verify_installer(tag, &installer, &sums, archive)?;
-    run_release_installer(&installer, install_prefix)?;
+    run_release_installer(&installer, &install_root)?;
     // The installer installed the release the tag names; report that tag
     // without its `v` so it reads like `confidant --version`.
     Ok(tag.trim_start_matches('v').to_owned())
@@ -12226,6 +12254,23 @@ origin\tssh://git@host.example/org/repo.git (push)
             path: PathBuf::from(path),
             install_prefix: PathBuf::from(prefix),
         }
+    }
+
+    #[test]
+    fn installer_root_uses_the_running_binarys_bin_directory() {
+        use super::cargo_dist_install_root;
+
+        let exe = Path::new("/home/ada/.cargo/bin/confidant");
+        let root = PathBuf::from("/home/ada/.cargo");
+        assert_eq!(cargo_dist_install_root(&root, exe), Some(root.clone()));
+        assert_eq!(cargo_dist_install_root(&root.join("bin"), exe), Some(root));
+        assert_eq!(
+            cargo_dist_install_root(
+                Path::new("/home/ada/.cargo"),
+                Path::new("/home/ada/.cargo/other/confidant")
+            ),
+            None,
+        );
     }
 
     #[test]
