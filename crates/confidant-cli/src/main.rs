@@ -180,6 +180,11 @@ enum Command {
         /// File of ledger lines, one per line.
         #[arg(long)]
         file: PathBuf,
+        /// Approve an agent-initiated batch above the retraction/retirement
+        /// safety cap (15% of live records, minimum 3). Operator approval;
+        /// ignored for a human write.
+        #[arg(long)]
+        force: bool,
     },
     /// Retract a ledger line without editing or deleting it (#746).
     ///
@@ -222,6 +227,11 @@ enum Command {
         /// Retraction date YYYY-MM-DD (default today).
         #[arg(long)]
         date: Option<String>,
+        /// Approve an agent-initiated batch above the retraction/retirement
+        /// safety cap (15% of live records, minimum 3). Operator approval;
+        /// ignored for a human write.
+        #[arg(long)]
+        force: bool,
     },
     /// Correct a ledger line: append a replacement and retract the original.
     ///
@@ -1042,9 +1052,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 ),
             }
         }
-        Command::Import { file } => {
+        Command::Import { file, force } => {
             let root = vault_root.unwrap();
-            cmd_import(&cli, &root, file)
+            cmd_import(&cli, &root, file, *force)
         }
         Command::Note { action } => {
             let root = vault_root.unwrap();
@@ -1136,6 +1146,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             kind,
             keep,
             date,
+            force,
         } => {
             let root = vault_root.unwrap();
             cmd_retract(
@@ -1151,6 +1162,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 kind.as_deref(),
                 *keep,
                 date.as_deref(),
+                *force,
             )
         }
         Command::Correct {
@@ -3238,6 +3250,9 @@ fn write_options(cli: &Cli) -> WriteOptions {
             .ok()
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty()),
+        // Per-command opt-in: only the batch-capable commands (`retract`,
+        // `import`) carry an explicit `--force` for this (#883).
+        allow_destructive_batch: false,
     }
 }
 
@@ -4209,6 +4224,7 @@ fn apply_ledger_correction(
     summary: String,
     canonical_request: String,
     extra: serde_json::Value,
+    force: bool,
 ) -> anyhow::Result<ExitCode> {
     // #611/#770: an append commits the whole target file, so a target with
     // uncommitted changes is refused. `apply_write` runs that read-only gate
@@ -4221,7 +4237,9 @@ fn apply_ledger_correction(
         summary,
         canonical_request,
     };
-    let outcome = apply_write_repairing(root, pending, &write_options(cli))?;
+    let mut opts = write_options(cli);
+    opts.allow_destructive_batch = force;
+    let outcome = apply_write_repairing(root, pending, &opts)?;
     finish_write(
         cli,
         root,
@@ -4247,6 +4265,7 @@ fn cmd_retract_bulk(
     kind: Option<&str>,
     keep: Option<usize>,
     date_raw: Option<&str>,
+    force: bool,
 ) -> anyhow::Result<ExitCode> {
     let Some(match_date_raw) = match_date else {
         return Err(anyhow::Error::new(DomainError::usage(
@@ -4348,6 +4367,7 @@ fn cmd_retract_bulk(
             "date": date.to_string(),
             "bulk": true,
         }),
+        force,
     )
 }
 
@@ -4365,6 +4385,7 @@ fn cmd_retract(
     kind: Option<&str>,
     keep: Option<usize>,
     date_raw: Option<&str>,
+    force: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     require_spec_04(&vault, "retract")?;
@@ -4386,6 +4407,7 @@ fn cmd_retract(
             kind,
             keep,
             date_raw,
+            force,
         );
     };
     if match_date.is_some() || verb.is_some() || kind.is_some() || keep.is_some() {
@@ -4494,6 +4516,7 @@ fn cmd_retract(
             "lines": [retraction],
             "date": date.to_string(),
         }),
+        force,
     )
 }
 
@@ -4635,6 +4658,7 @@ fn cmd_correct(
             "lines": [replacement_text, retraction],
             "date": date.to_string(),
         }),
+        false,
     )
 }
 
@@ -4743,7 +4767,7 @@ fn cmd_record_retire(
     )
 }
 
-fn cmd_import(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
+fn cmd_import(cli: &Cli, root: &Path, file: &Path, force: bool) -> anyhow::Result<ExitCode> {
     let text = std::fs::read_to_string(file).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
             "cannot read {}: {e}",
@@ -4806,6 +4830,8 @@ fn cmd_import(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
         })
         .collect();
 
+    let mut opts = write_options(cli);
+    opts.allow_destructive_batch = force;
     let outcome = apply_write(
         root,
         PendingWrite {
@@ -4813,7 +4839,7 @@ fn cmd_import(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
             summary: format!("import {total} ledger lines"),
             canonical_request: format!("import/v1\n{text}"),
         },
-        &write_options(cli),
+        &opts,
     )?;
     finish_write(
         cli,

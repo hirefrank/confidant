@@ -14,15 +14,19 @@
 //! 4. `check` runs before the change and fails fast on an already-broken
 //!    vault (skipped for a repairing write). A dry run runs this same
 //!    read-only pre-check.
-//! 5. `--dry-run` shows the LOGICAL change (ledger lines / file content) and
+//! 5. An agent write that would retract or retire more than the safety cap
+//!    ([`destructive_batch_cap`]) is refused before anything is written
+//!    (#883). The operator's explicit `--force` on the same command bypasses
+//!    the refusal; a human write never sees it.
+//! 6. `--dry-run` shows the LOGICAL change (ledger lines / file content) and
 //!    stops. It cannot run the post-write check without writing, so its
-//!    outcome says explicitly which checks ran ([`DryRunChecks`]). Steps 1-4
+//!    outcome says explicitly which checks ran ([`DryRunChecks`]). Steps 1-5
 //!    have already run, so a preview that passes means apply would pass the
 //!    same gates.
-//! 6. Files are applied atomically ([`crate::paths::write_replace`]).
-//! 7. `check` runs after the change; a failing check rolls the files back and
+//! 7. Files are applied atomically ([`crate::paths::write_replace`]).
+//! 8. `check` runs after the change; a failing check rolls the files back and
 //!    blocks the commit.
-//! 8. One `git add` + `git commit`. The message and trailers carry ONLY opaque
+//! 9. One `git add` + `git commit`. The message and trailers carry ONLY opaque
 //!    IDs, verbs, and hashes. Free-text reasons/intent are never in the
 //!    commit message.
 //!
@@ -35,7 +39,7 @@ use sha2::{Digest, Sha256};
 
 use crate::check::{run as check_vault, CheckOptions, CheckReport};
 use crate::error::{DomainError, ErrorKind};
-use crate::vault::load_vault;
+use crate::vault::{load_vault, Vault};
 /// Options shared by every write command.
 #[derive(Clone, Debug, Default)]
 pub struct WriteOptions {
@@ -47,6 +51,30 @@ pub struct WriteOptions {
     pub request_id: Option<String>,
     /// Opaque agent identity for the `Agent:` commit trailer (#49).
     pub agent_id: Option<String>,
+    /// The operator's explicit approval of an agent write that removes more
+    /// than [`destructive_batch_cap`] retractions/retirements in one request
+    /// (#883). Only meaningful together with `agent_id`; a human write is
+    /// never capped.
+    pub allow_destructive_batch: bool,
+}
+
+/// The safety cap on retract/retire operations in one agent request (#883).
+///
+/// 15% of the vault's live records, with a floor of [`MIN_DESTRUCTIVE_BATCH_CAP`]
+/// so an ordinary correction in a tiny vault is never refused. A request at
+/// the cap is allowed; one operation over it is refused.
+pub const DESTRUCTIVE_BATCH_PERCENT: usize = 15;
+
+/// The floor under [`destructive_batch_cap`] (#883). A vault with fewer than
+/// 20 live records still allows three retract/retire operations per request.
+pub const MIN_DESTRUCTIVE_BATCH_CAP: usize = 3;
+
+/// The per-request cap for `live_records` live (non-retired) records (#883).
+pub fn destructive_batch_cap(live_records: usize) -> usize {
+    std::cmp::max(
+        MIN_DESTRUCTIVE_BATCH_CAP,
+        live_records * DESTRUCTIVE_BATCH_PERCENT / 100,
+    )
 }
 
 /// One file mutation inside a pending write. Paths are vault-relative.
@@ -595,6 +623,105 @@ fn refuse_conflicted_targets(root: &Path, changes: &[FileChange]) -> anyhow::Res
     Ok(())
 }
 
+/// Whether a record file's front matter carries `retired: true`.
+///
+/// This matches [`crate::record::Record::is_retired`]'s value semantics
+/// (unquoted `true`), reading only the front-matter region so a body line
+/// that happens to say `retired: true` is never counted (#883).
+fn frontmatter_retired(text: &str) -> bool {
+    crate::record::frontmatter_region(text).lines().any(|line| {
+        line.split_once(':')
+            .is_some_and(|(key, value)| key.trim() == "retired" && value.trim() == "true")
+    })
+}
+
+/// Count the retraction and retirement operations a write would perform
+/// (#883).
+///
+/// A retraction is an appended `retract` ledger line, whichever command
+/// produced it (`retract`, `correct`, or `import` with hand-written lines).
+/// A retirement is a record file that flips from live to `retired: true`
+/// (`record retire`, or an edit that adds the field). Returns
+/// `(retracted, retired)`.
+fn destructive_operations(changes: &[FileChange], vault: &Vault) -> (usize, usize) {
+    let mut retracted = 0usize;
+    let mut retired = 0usize;
+    for change in changes {
+        match change {
+            FileChange::AppendLines { lines, .. } => {
+                for line in lines {
+                    if let Ok(Some(entry)) = crate::ledger::parse_line(line) {
+                        if entry.verb == "retract" {
+                            retracted += 1;
+                        }
+                    }
+                }
+            }
+            FileChange::WriteFile { path, contents } => {
+                let Some(record) = vault
+                    .records
+                    .values()
+                    .find(|record| Path::new(&record.path) == path.as_path())
+                else {
+                    continue;
+                };
+                if !record.is_retired() && frontmatter_retired(contents) {
+                    retired += 1;
+                }
+            }
+            FileChange::WriteBytes { .. } | FileChange::DeleteFile { .. } => {}
+        }
+    }
+    (retracted, retired)
+}
+
+/// Refuse an agent write that removes more memory than one request may
+/// (#883).
+///
+/// The cap is [`destructive_batch_cap`] over the vault's live records.
+/// Only agent-initiated writes are capped; a human write has no
+/// `agent_id`. The operator's explicit `--force` (`allow_destructive_batch`)
+/// approves the same batch. The refusal happens before any file is touched,
+/// so a large batch is never partially applied, and a dry run refuses it too
+/// (the same read-only-gate rule as #770).
+fn refuse_oversized_destructive_batch(
+    changes: &[FileChange],
+    opts: &WriteOptions,
+    vault: &Vault,
+) -> anyhow::Result<()> {
+    let is_agent = opts
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|agent| !agent.is_empty());
+    if !is_agent || opts.allow_destructive_batch {
+        return Ok(());
+    }
+    let (retracted, retired) = destructive_operations(changes, vault);
+    let operations = retracted + retired;
+    let live = vault
+        .records
+        .values()
+        .filter(|record| !record.is_retired())
+        .count();
+    let cap = destructive_batch_cap(live);
+    if operations <= cap {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(
+        DomainError::new(
+            ErrorKind::DestructiveBatchCap,
+            format!(
+                "agent write would retract {retracted} ledger line(s) and retire \
+                 {retired} record(s), above the safety cap of {cap} per request \
+                 ({DESTRUCTIVE_BATCH_PERCENT}% of {live} live record(s), minimum \
+                 {MIN_DESTRUCTIVE_BATCH_CAP}); operator approval required"
+            ),
+        )
+        .with_fix("Re-run the same command with --force to approve this batch"),
+    ))
+}
+
 fn apply_write_inner(
     root: &Path,
     pending: PendingWrite,
@@ -678,6 +805,12 @@ fn apply_write_inner(
     if !pre.ok && !repairing {
         return Ok(WriteOutcome::CheckBlocked { report: pre });
     }
+
+    // 3b. #883: cap how much memory one agent request may retract or retire.
+    // This runs after the idempotency replay (a retried, already-approved
+    // batch must still replay) and before a dry run or apply (a preview that
+    // passed where apply refuses would validate less, #770).
+    refuse_oversized_destructive_batch(&pending.changes, opts, &vault)?;
 
     // 4. Dry run: show the logical change, touch nothing. The post-write
     // check needs the applied tree, and a dry run never writes, so the
@@ -843,6 +976,98 @@ fn apply_write_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #883: 15% of live records, floored at 3. At the cap is allowed; the
+    /// caller refuses only `> cap`.
+    #[test]
+    fn destructive_batch_cap_is_fifteen_percent_with_a_floor_of_three() {
+        for live in 0..=20 {
+            assert_eq!(destructive_batch_cap(live), 3, "live={live}");
+        }
+        assert_eq!(destructive_batch_cap(21), 3);
+        assert_eq!(destructive_batch_cap(26), 3);
+        assert_eq!(destructive_batch_cap(27), 4);
+        assert_eq!(destructive_batch_cap(40), 6);
+        assert_eq!(destructive_batch_cap(100), 15);
+        assert_eq!(destructive_batch_cap(1_000), 150);
+    }
+
+    /// #883: retirement detection reads only the front matter, so a body
+    /// line that looks like the field is never counted.
+    #[test]
+    fn frontmatter_retired_reads_only_the_front_matter() {
+        assert!(frontmatter_retired(
+            "---\nid: p-01M3TC5H00MPJG000000000000\nretired: true\n---\n\nbody\n"
+        ));
+        assert!(frontmatter_retired(
+            "---\nretired:    true\nid: p-01M3TC5H00MPJG000000000000\n---\n"
+        ));
+        assert!(!frontmatter_retired(
+            "---\nid: p-01M3TC5H00MPJG000000000000\nretired: false\n---\n"
+        ));
+        assert!(!frontmatter_retired(
+            "---\nid: p-01M3TC5H00MPJG000000000000\n---\n\nretired: true\n"
+        ));
+    }
+
+    /// #883: count appended `retract` lines whichever command produced them,
+    /// and a record file that flips from live to `retired: true`; an
+    /// unrelated file change counts nothing.
+    #[test]
+    fn destructive_operations_counts_retractions_and_new_retirements() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("confidant.toml"),
+            "spec = \"0.4\"\npacks = []\nvault_id = \"01M3TC5H00MPJG000000000000\"\n",
+        )
+        .expect("write config");
+        let person = "p-01M3TC5H00MPJG000000000000";
+        let rel = format!("people/{person}/profile.md");
+        let live =
+            format!("---\nid: {person}\ntype: person\nname: \"Capped Example\"\n---\n\nFake.\n");
+        std::fs::create_dir_all(root.join(format!("people/{person}"))).expect("person dir");
+        std::fs::write(root.join(&rel), &live).expect("profile");
+        git(root, &["init", "-q", "-b", "main"], false).expect("init");
+        git(root, &["config", "user.name", "Test"], false).expect("name");
+        git(
+            root,
+            &["config", "user.email", "test@example.invalid"],
+            false,
+        )
+        .expect("email");
+        git(root, &["add", "-A"], false).expect("add");
+        git(root, &["commit", "-qm", "init"], false).expect("commit");
+        let vault = load_vault(root).expect("load vault");
+
+        let retirement = live.replacen("---\n", "---\nretired: true\n", 1);
+        let changes = vec![
+            FileChange::AppendLines {
+                path: PathBuf::from("ledger/2026/11.cfd"),
+                lines: vec![format!(
+                    "2026-11-02 retract {person} line:{} reason:duplicate",
+                    "a".repeat(64)
+                )],
+            },
+            FileChange::WriteFile {
+                path: PathBuf::from(&rel),
+                contents: retirement,
+            },
+            // Not a record and not a retract line: counts nothing.
+            FileChange::WriteFile {
+                path: PathBuf::from("README.md"),
+                contents: "retired: true\n".to_owned(),
+            },
+        ];
+        assert_eq!(destructive_operations(&changes, &vault), (1, 1));
+
+        // A write that leaves the record live is not a retirement.
+        let no_change = vec![FileChange::WriteFile {
+            path: PathBuf::from(&rel),
+            contents: live,
+        }];
+        assert_eq!(destructive_operations(&no_change, &vault), (0, 0));
+    }
 
     #[test]
     fn no_input_ssh_command_appends_batch_mode_and_keeps_existing() {

@@ -72,6 +72,10 @@ pub enum ErrorKind {
     /// the release installer failed (#876). Expected and actionable, so it
     /// carries a fix hint, never `internal_error`.
     UpdateFailed,
+    /// An agent-initiated write would retract/retire more than the per-request
+    /// safety cap (#883). Nothing was written; the operator can approve the
+    /// batch with `--force`.
+    DestructiveBatchCap,
     /// Unclassified failure. Reserved; never match on its message.
     Internal,
 }
@@ -97,6 +101,7 @@ impl ErrorKind {
             Self::AmbiguousPerson => "E_AMBIGUOUS_PERSON",
             Self::CannotSearch => "E_CANNOT_SEARCH",
             Self::UpdateFailed => "E_UPDATE_FAILED",
+            Self::DestructiveBatchCap => "E_DESTRUCTIVE_BATCH_CAP",
             Self::Internal => "internal_error",
         }
     }
@@ -423,6 +428,10 @@ mod tests {
     fn codes_are_stable() {
         assert_eq!(ErrorKind::Usage.code(), "usage_error");
         assert_eq!(ErrorKind::Internal.code(), "internal_error");
+        assert_eq!(
+            ErrorKind::DestructiveBatchCap.code(),
+            "E_DESTRUCTIVE_BATCH_CAP"
+        );
         assert_eq!(
             ErrorKind::IdempotencyConflict.code(),
             "E_IDEMPOTENCY_CONFLICT"
