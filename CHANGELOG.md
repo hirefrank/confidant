@@ -8,6 +8,12 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-07
+
+### Fixed
+- `confidant update` stops claiming a comparison it never made: when the latest release tag is fetched but cannot be parsed into a version (so behind-ness is undetermined), the human status line, the re-link-skills message, and the `--json` payload (`"status": "unknown"`, `"behind": null`) report `unknown` instead of a false `current` / `fetched` verdict (#880).
+- The cargo-dist self-update pins the installer to the running copy's real install root: a receipt that names the `bin` directory (the older receipt shape) resolves to its parent instead of installing into `bin/bin`, and a receipt prefix that matches neither the Cargo home nor the running binary's `bin` refuses with `E_UPDATE_FAILED` rather than installing into a different directory (#880).
+
 ## [0.9.0] - 2026-11-06
 
 ### Breaking
@@ -773,7 +779,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/hirefrank/confidant/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/hirefrank/confidant/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/hirefrank/confidant/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/hirefrank/confidant/compare/v0.7.1...v0.7.2
