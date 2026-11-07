@@ -36,7 +36,7 @@ over a newer deploy.
 The page is static, so the nav's version pill is not derived from anything:
 
 ```html
-<span class="pill">v0.9.0 · Apache-2.0</span>
+<span class="pill">v0.9.1 · Apache-2.0</span>
 ```
 
 `.github/scripts/check-site-version.py` compares it against
