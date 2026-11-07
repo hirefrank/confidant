@@ -3,10 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="color-scheme" content="light dark" />
-    <meta name="description" content="Using several AI agents? Confidant keeps the people in your life in Git-backed text files you own, so you don't have to brief each agent from scratch." />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Confidant keeps your history with people in Git-backed text files you own, so every connected AI agent can start from the same record." />
+    <link rel="canonical" href="https://hirefrank.com/confidant/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Confidant" />
+    <meta property="og:url" content="https://hirefrank.com/confidant/" />
+    <meta property="og:title" content="Confidant — Relationship memory for you and your AI agents" />
+    <meta property="og:description" content="Keep your history with people in Git-backed text files you own, so every connected AI agent can start from the same record." />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Confidant — Relationship memory for you and your AI agents" />
+    <meta name="twitter:description" content="Keep your history with people in Git-backed text files you own, so every connected AI agent can start from the same record." />
     <link rel="icon" href="data:," />
-    <title>Confidant — One relationship record for all your agents</title>
+    <title>Confidant — Relationship memory for you and your AI agents</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -247,22 +256,6 @@
       .page .step p { margin: 0 0 16px; color: var(--dim); font-size: 15px; line-height: 1.65; }
       .page .step code { font-family: var(--mono); font-size: 12.5px; background: rgba(0,0,0,.3); color: var(--teal); padding: 4px 10px; border-radius: 8px; }
 
-      /* ---------- Privacy ---------- */
-      .page .trust-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 52px; align-items: start; }
-      .page .trust-grid .big { font-family: var(--disp); font-size: 24px; font-weight: 600; line-height: 1.45; margin: 0 0 18px; }
-      .page .trust-grid p { color: var(--dim); font-size: 16.5px; line-height: 1.7; margin: 0 0 16px; }
-      .page .pieces { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
-      .page .pieces li {
-        background: var(--panel); border: 1px solid rgba(245,242,255,.09); border-radius: 16px;
-        padding: 18px 20px; font-size: 15.5px; font-weight: 700; display: flex; gap: 14px; align-items: center;
-      }
-      .page .pieces li i { width: 16px; height: 16px; flex: none; clip-path: polygon(15% 0, 100% 20%, 80% 100%, 0 80%); }
-      .page .pieces li:nth-child(4n+1) i { background: var(--teal); }
-      .page .pieces li:nth-child(4n+2) i { background: var(--coral); }
-      .page .pieces li:nth-child(4n+3) i { background: var(--gold); }
-      .page .pieces li:nth-child(4n) i { background: var(--violet); }
-      .page .pieces li span { display: block; font-weight: 600; color: var(--dim); font-size: 13.5px; margin-top: 2px; line-height: 1.5; }
-
       /* ---------- CTA / footer ---------- */
       .page .cta-band { padding: 40px 0 96px; }
       .page .cta-card {
@@ -292,40 +285,13 @@
       .page .hero-eyebrow { color: var(--teal); font: 700 12px var(--disp); letter-spacing: .14em; text-transform: uppercase; margin: 0 0 18px; }
       .page .hero-note { margin-top: 20px; }
       .page .story { border-top: 1px solid rgba(245,242,255,.12); }
-      .page .story-grid { display: grid; grid-template-columns: .78fr 1.22fr; gap: 70px; align-items: start; }
+      .page .story-grid { display: grid; grid-template-columns: 1fr 1.1fr; gap: 48px; align-items: start; }
+      .page .story-copy { padding-top: 32px; }
       .page .story-copy p { margin: 0 0 16px; color: var(--dim); font-size: 18px; line-height: 1.7; }
-      .page .story-copy .last-line { color: var(--ink); font-family: var(--disp); font-weight: 700; font-size: 23px; line-height: 1.35; }
-      .page .handoff { display: grid; grid-template-columns: minmax(0, 1fr) 78px minmax(0, 1fr); gap: 14px; align-items: stretch; }
-      .page .handoff-card { min-width: 0; border-radius: 24px; border: 1px solid rgba(245,242,255,.16); background: var(--panel); padding: 25px; }
-      .page .handoff-card .phase { color: var(--gold); font: 600 12px var(--mono); letter-spacing: .06em; text-transform: uppercase; margin: 0 0 19px; }
-      .page .handoff-card:last-child .phase { color: var(--teal); }
-      .page .handoff-card .message { padding: 15px 17px; border-radius: 16px; line-height: 1.55; font-size: 16px; }
-      .page .handoff-card .you { max-width: 88%; margin-left: auto; background: #3a2780; }
-      .page .handoff-card .agent { max-width: 96%; margin-top: 13px; background: #193d52; border: 1px solid rgba(47,214,192,.3); }
-      .page .handoff-card .speaker { display: block; font: 700 12px var(--mono); color: var(--teal); margin-bottom: 7px; }
-      .page .handoff-card .you .speaker { color: var(--coral); }
-      .page .handoff-bridge { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--teal); text-align: center; font: 600 11px/1.3 var(--mono); }
-      .page .handoff-bridge .arrow { display: grid; place-items: center; width: 43px; height: 43px; border-radius: 50%; background: rgba(47,214,192,.12); border: 1px solid rgba(47,214,192,.35); font: 700 24px var(--disp); }
-      .page .handoff-caption { color: var(--faint); font-size: 12px; line-height: 1.5; margin: 15px 0 0; }
-      .page .model-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 30px; }
-      .page .model-item { border-top: 2px solid var(--teal); padding: 18px 4px 0; }
-      .page .model-item:nth-child(2) { border-color: var(--coral); }
-      .page .model-item:nth-child(3) { border-color: var(--gold); }
-      .page .model-item h3 { margin: 0 0 7px; font: 700 19px var(--disp); }
-      .page .model-item p { margin: 0; color: var(--dim); line-height: 1.6; font-size: 14.5px; }
-      .page .positioning { margin-top: 34px; padding: 21px 25px; border-radius: 16px; background: rgba(157,123,255,.11); border: 1px solid rgba(157,123,255,.25); }
-      .page .positioning p { margin: 0; font: 700 19px/1.5 var(--disp); }
-      .page .positioning span { color: var(--teal); }
-      .page .trust-intro { max-width: 700px; }
-      .page .trust-grid { margin-top: 30px; }
-      .page .trust-grid .big { color: var(--teal); }
-      .page .start-grid { display: grid; grid-template-columns: .9fr 1.1fr; gap: 44px; align-items: start; }
-      .page .start-grid .steps { grid-template-columns: 1fr; gap: 11px; }
-      .page .start-grid .step { padding: 19px 21px; }
-      .page .start-grid .step .snum { width: 30px; height: 30px; font-size: 12px; margin-bottom: 9px; }
-      .page .start-grid .step h3 { font-size: 17px; margin-bottom: 5px; }
-      .page .start-grid .step p { margin-bottom: 0; font-size: 14px; }
-      .page .start-grid .install { margin-top: 20px; }
+      .page .start-intro { max-width: 800px; }
+      .page .start-intro .install { margin-top: 20px; }
+      .page .start-steps { margin-top: 36px; }
+      .page .start-steps .step p { margin-bottom: 0; }
       .page .dev-link { display: inline-block; margin-top: 20px; color: var(--teal); font-weight: 700; text-underline-offset: 4px; }
       .page .dev-detail { margin-top: 22px; }
       .page .dev-detail summary { color: var(--dim); cursor: pointer; font-weight: 700; }
@@ -338,7 +304,7 @@
       .page .pack-grid { margin-top: 30px; }
 
       @media (max-width: 900px) {
-        .page .hero-grid, .page .trust-grid, .page .story-grid, .page .start-grid { grid-template-columns: 1fr; }
+        .page .hero-grid, .page .story-grid { grid-template-columns: 1fr; }
         .page .feat-grid, .page .steps, .page .pack-grid, .page .portability-grid { grid-template-columns: 1fr; }
         .page .shard-stage { min-height: 380px; }
         .page nav { gap: 14px; }
@@ -349,6 +315,7 @@
         .page .cli-card pre { white-space: pre-wrap; word-break: break-word; }
         .page .contrast-inner { padding: 48px 20px; }
         .page .hero-grid, .page .story-grid { gap: 36px; }
+        .page .story-copy { padding-top: 0; }
       }
 
       @media (max-width: 560px) {
@@ -356,11 +323,6 @@
            wordmark, pill and GitHub button at 360px, and the hero repeats
            the GitHub CTA immediately below. */
         .page nav .btn { display: none; }
-        .page .model-grid { grid-template-columns: 1fr; }
-        .page .handoff { grid-template-columns: 1fr; gap: 12px; }
-        .page .handoff-card { padding: 18px; }
-        .page .handoff-card .you, .page .handoff-card .agent { max-width: 100%; }
-        .page .handoff-bridge .arrow { transform: rotate(90deg); }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -377,9 +339,7 @@
           <div class="wordmark"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>confidant</div>
           <div class="links">
             <a href="#why">Why Confidant</a>
-            <a href="#example">People first</a>
             <a href="#packs">Packs</a>
-            <a href="#trust">Privacy</a>
             <a href="#start">Get started</a>
           </div>
           <span class="pill">v0.9.0 · Apache-2.0</span>
@@ -396,9 +356,9 @@
               <p class="lede">You work with several AI agents. Tell one about a friend, and the others still don't know them. Confidant keeps your history with people in <strong>Git-backed text files you own</strong>, so every connected agent can start from the same record.</p>
               <div class="cta-row">
                 <a class="btn solid" href="#start">Get started with Confidant</a>
-                <a class="btn" href="#example">See what it remembers</a>
+                <a class="btn" href="#packs">See what's in the vault</a>
               </div>
-              <p class="hero-note">Open source · Local-first · Git-backed · No account</p>
+              <p class="hero-note">Open source · Local-first · Git-backed text files · No account</p>
             </div>
             <div class="shard-stage" aria-hidden="true">
               <svg class="shard s1" style="--r:-8deg" viewBox="0 0 100 100"><polygon points="8,12 92,4 74,88 0,70" fill="#2fd6c0" opacity=".92"/></svg>
@@ -424,11 +384,10 @@
 
       <section class="block story" id="why"><div class="wrap">
         <div class="story-grid">
-          <div><p class="sec-tag">Why Confidant?</p><h2>You're the one keeping <span class="t">every agent up to date.</span></h2></div>
+          <div><p class="sec-tag">Why Confidant?</p><h2>Stop spending your time keeping <span class="t">every agent up to date.</span></h2></div>
           <div class="story-copy">
-            <p>Your email agent knows one part of Robin's story. Your planning agent knows another. A third is new.</p>
-            <p>When every agent keeps its own notes, you repeat yourself and details drift.</p>
-            <p class="last-line">With Confidant, keep each relationship in one place. The agents you connect can read what you choose to share.</p>
+            <p>When every agent keeps its own notes, you repeat yourself and details drift. Businesses have CRMs. People need a Confidant.</p>
+            <p>Keep each relationship in one place. The agents you connect can read what you choose to share.</p>
           </div>
         </div>
         <div class="portability-grid">
@@ -438,88 +397,45 @@
         </div>
       </div></section>
 
-      <section class="block" id="example"><div class="wrap">
-        <div class="sec-head"><p class="sec-tag">People first</p><h2>Remember where you <span class="co">left off with someone.</span></h2><p class="sec-sub">Confidant keeps how you know a person, what matters to them, and your history together, so a connected agent can find the details you need.</p></div>
-        <div class="handoff" aria-label="Illustrative handoff between two agents">
-          <article class="handoff-card">
-            <p class="phase">01 · After coffee · Agent A</p>
-            <div class="message you"><span class="speaker">You</span>Robin mentioned a new climbing project today.</div>
-            <div class="message agent"><span class="speaker">Agent A</span>I can add that to Robin's record for you to review.</div>
-          </article>
-          <div class="handoff-bridge" aria-label="You approve the update"><span class="arrow" aria-hidden="true">→</span><span>You approve</span></div>
-          <article class="handoff-card">
-            <p class="phase">02 · Before next meetup · Agent B</p>
-            <div class="message you"><span class="speaker">You</span>What should I remember about Robin?</div>
-            <div class="message agent"><span class="speaker">Agent B</span>Robin mentioned a new climbing project. You usually climb together on Thursdays.</div>
-          </article>
-        </div>
-        <p class="handoff-caption">Illustrative workflow. Connected agents can read approved, agent-visible details from the same vault; phrasing depends on each agent's setup.</p>
-        <div class="model-grid">
-          <div class="model-item"><h3>People first</h3><p>Who they are, how you know them, and what matters to that relationship.</p></div>
-          <div class="model-item"><h3>Places and things</h3><p>The places and projects that bring people together, connected back to them.</p></div>
-          <div class="model-item"><h3>History you can trust</h3><p>Dated calls, meals, and meetings. Correct mistakes without erasing the past.</p></div>
-        </div>
-        <div class="positioning"><p>Your notes remember what you know. <span>Confidant remembers who you know, and where things stand.</span></p></div>
-      </div></section>
-
       <section class="block story" id="packs"><div class="wrap">
-        <div class="sec-head pack-intro"><p class="sec-tag">Packs</p><h2>Start with relationships. <span class="t">Add what you need.</span></h2><p class="sec-sub">The built-in personal pack covers people, places, things, and the moments that connect them. Packs give your vault additional record types, fields, and checks when you need them.</p></div>
+        <div class="sec-head pack-intro"><p class="sec-tag">Packs</p><h2>Start with relationships. <span class="t">Extend as needed.</span></h2><p class="sec-sub">The built-in personal pack covers people, places, things, and the moments that connect them. Packs add record types, fields, and checks when you need them.</p></div>
         <div class="pack-grid">
-          <article class="pack-card c-core"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Built in</p><h3>Personal</h3><p>Remember relationships, shared places and projects, dates, and when you last connected.</p></article>
-          <article class="pack-card c-draft"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Extend it</p><h3>Your vocabulary</h3><p>Add a pack when the personal model doesn't cover a part of your life or work.</p></article>
-          <article class="pack-card c-yours"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Keep it consistent</p><h3>Packs travel with the vault</h3><p>Optional packs live in the vault and are hash-pinned. Clone the vault and its vocabulary comes along.</p></article>
+          <article class="pack-card c-core"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Built in</p><h3>Personal</h3><p>Remember past conversations. Flag upcoming dates and overdue check-ins.</p></article>
+          <article class="pack-card c-draft"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Extend it</p><h3>Your vocabulary</h3><p>Ask your agent to build a pack for a new part of your life or work.</p></article>
+          <article class="pack-card c-yours"><div class="chip" aria-hidden="true">◆</div><p class="pack-kicker">Keep it consistent</p><h3>Packs travel with the vault</h3><p>Optional packs are hash-pinned in your vault, so its vocabulary travels with it.</p></article>
         </div>
         <a class="dev-link" href="https://github.com/hirefrank/confidant#packs" target="_blank" rel="noopener">How schema packs work ↗</a>
       </div></section>
 
-      <section class="block story" id="trust"><div class="wrap">
-        <div class="sec-head trust-intro"><p class="sec-tag">Your boundaries</p><h2>One record doesn't mean <span class="co">unlimited access.</span></h2><p class="sec-sub">You decide what your agents can read and which changes become part of the record.</p></div>
-        <div class="trust-grid">
-          <div>
-            <p class="big">Some things are just for you.</p>
-            <p>Mark a record <code>no-ai</code> and Confidant leaves it out of agent-facing reads. This boundary is enforced by Confidant's tools; it does not prevent an agent or person with direct file access from reading the underlying plaintext.</p>
-            <p>Your agents can propose changes for you to review. Keep the vault and its Git history on a trusted, encrypted device. There is no Confidant server or account.</p>
-          </div>
-          <ul class="pieces">
-            <li><i></i><div>Read with boundaries<span><code>no-ai</code> keeps marked records out of agent-facing output.</span></div></li>
-            <li><i></i><div>Approve changes<span>Review a proposed write before applying it.</span></div></li>
-            <li><i></i><div>Own the files<span>Plain text in your Git repo. Use a private remote if you sync.</span></div></li>
-          </ul>
-        </div>
-      </div></section>
-
       <section class="block" id="start"><div class="wrap">
-        <div class="start-grid">
-          <div>
-            <p class="sec-tag">Get started</p><h2>Start with <span class="t">your own vault.</span></h2>
-            <p class="sec-sub">Confidant is free and open source. Install it, create a vault, then connect the agents you use.</p>
-            <div class="install">
-              <code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh</code>
-              <button class="copy" type="button" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh">Copy</button>
-            </div>
-            <a class="dev-link" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">Installation options and documentation on GitHub ↗</a>
+        <div class="start-intro">
+          <p class="sec-tag">Get started</p><h2>Start with <span class="t">your own vault.</span></h2>
+          <p class="sec-sub">Confidant is free and open source. Install it, create a vault, then connect the agents you use.</p>
+          <div class="install">
+            <code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh</code>
+            <button class="copy" type="button" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/hirefrank/confidant/releases/latest/download/confidant-cli-installer.sh | sh">Copy</button>
           </div>
-          <div class="steps">
-            <article class="step"><div class="snum">1</div><h3>Install Confidant</h3><p>Get the CLI and terminal UI on your machine.</p></article>
-            <article class="step"><div class="snum">2</div><h3>Create your vault</h3><p>Keep your records in a local Git repository on an encrypted device.</p></article>
-            <article class="step"><div class="snum">3</div><h3>Connect an agent</h3><p>Give it access through Confidant's read tools. Review its proposed updates.</p></article>
-          </div>
+          <a class="dev-link" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">Installation options and documentation on GitHub ↗</a>
+        </div>
+        <div class="steps start-steps">
+          <article class="step"><div class="snum">1</div><h3>Install Confidant</h3><p>Install the CLI, then link agent skills. MCP is optional.</p></article>
+          <article class="step"><div class="snum">2</div><h3>Create your vault</h3><p>Keep your records in a local Git repository on an encrypted device.</p></article>
+          <article class="step"><div class="snum">3</div><h3>Connect an agent</h3><p>Build relationship memory together. Use <code>no-ai</code> to limit agent reads.</p></article>
         </div>
         <details class="dev-detail"><summary>For developers: see a write in the CLI</summary>
-          <div class="cli-card"><div class="cap"><i></i><i></i><i></i><span>confidant — your terminal</span></div><pre><span class="cm"># Preview a record update</span>
-<span class="p">$</span> confidant log touch "Robin Example" call --dry-run
-<span class="hl">+ 2026-09-14 touch p-01J9Z3K4QF… call</span>
+          <div class="cli-card"><div class="cap"><i></i><i></i><i></i><span>confidant — your terminal</span></div><pre><span class="cm"># Preview a call on Robin's record</span>
+<span class="p">$</span> confidant log touch "Robin Example" call --date 2026-09-14 --dry-run
 
 <span class="cm"># Apply after review</span>
-<span class="p">$</span> confidant log touch "Robin Example" call</pre></div>
+<span class="p">$</span> confidant log touch "Robin Example" call --date 2026-09-14</pre></div>
         </details>
       </div></section>
 
       <section class="cta-band">
         <div class="wrap">
           <div class="cta-card">
-            <h2>People stay. <span class="co">Tools change.</span></h2>
-            <p>Your relationships belong in a record you own. The personal pack is already there. Connect your agents and keep the history as your tools change.</p>
+            <h2>Your relationships. <span class="co">Your record.</span></h2>
+            <p>Keep your history with people in Git-backed text files you own. Connect the agents you use, and bring your record with you when your tools change.</p>
             <div class="cta-row">
               <a class="btn solid" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">Get Confidant on GitHub ↗</a>
             </div>
