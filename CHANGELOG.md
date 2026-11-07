@@ -8,6 +8,8 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-06
+
 ### Breaking
 - Removed the top-level `confidant log session` command and the MCP `log_session` tool; the TUI's `s` session capture is gone too (#799 step 2). `confidant log touch` remains the core personal write. A pack that declares a `session` verb (a coaching/CRM pack) logs it through `confidant import --file`, the shared pack-verb path, driven by the pack's skill. The pack `session` verb and the `ledger-balance` / `session-checks` / `activity-gap` rule kinds are unchanged. The write-response `command` enum no longer contains `log-session` and now contains `log-touch`.
 
@@ -771,7 +773,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/hirefrank/confidant/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/hirefrank/confidant/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/hirefrank/confidant/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/hirefrank/confidant/compare/v0.7.0...v0.7.1
