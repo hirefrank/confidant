@@ -13,6 +13,17 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # RUSTSEC-2026-0543: chrono is unmaintained (all versions, no patched
+    # release). It is a direct dependency of confidant-core and
+    # confidant-cli for date parsing and `Utc::now`, so it is on the
+    # record-writing path rather than a leaf we can drop. This is an
+    # informational "unmaintained" advisory, not a vulnerability, and
+    # cargo-deny offers no safe upgrade. Re-evaluate when chrono resumes
+    # maintenance; the durable fix is migrating to jiff or time, which is
+    # its own change and not a CI unblock.
+    "RUSTSEC-2026-0543",
+]
 
 [licenses]
 version = 2
