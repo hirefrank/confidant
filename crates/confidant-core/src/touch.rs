@@ -6,9 +6,9 @@
 //! malformed lines through them, `context` reads kinds through them, and
 //! `confidant log touch` validates against the same constant.
 
+use crate::date::Date;
 use crate::id::RecordId;
 use crate::ledger::{parse_duration_minutes, Arg, LedgerEntry};
-use chrono::NaiveDate;
 
 /// Closed list of touchpoint kinds for `touch` (#182, #227 Q1; the 0.1 set
 /// as amended by #509, plus `video` per #735). `coffee` was removed, not
@@ -94,7 +94,7 @@ pub fn extract_touch_mode(entry: &LedgerEntry) -> Option<String> {
 /// kind-less mirrored touchpoint cannot be shown identical to another, so
 /// `check` leaves those alone and `log touch` (which always carries a
 /// kind) never writes one.
-pub fn touch_identity(entry: &LedgerEntry) -> Option<(RecordId, NaiveDate, String)> {
+pub fn touch_identity(entry: &LedgerEntry) -> Option<(RecordId, Date, String)> {
     if entry.verb != "touch" {
         return None;
     }
@@ -163,12 +163,12 @@ fn parse_touch_args(args: &[Arg]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::date::Date;
     use crate::id::RecordId;
-    use chrono::NaiveDate;
 
     fn entry(args: Vec<Arg>) -> LedgerEntry {
         LedgerEntry {
-            date: NaiveDate::from_ymd_opt(2026, 10, 12).unwrap(),
+            date: Date::new(2026, 10, 12).unwrap(),
             verb: "touch".to_owned(),
             id: RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap(),
             args,

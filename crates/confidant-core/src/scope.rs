@@ -409,11 +409,11 @@ pub fn owner_labels(owners: &BTreeSet<OwnerKey>) -> Vec<&'static str> {
 mod tests {
     use super::*;
     use crate::check::{Finding, MergeMap};
+    use crate::date::Date;
     use crate::id::Prefix;
     use crate::ledger::parse_line;
     use crate::packs::{EdgeKind, Pack, PackState};
     use crate::vault::SourcedEntry;
-    use chrono::NaiveDate;
 
     /// A minimal second pack for scope tests. Claims one verb, one field,
     /// and one metric; folds to empty state. Mirrors the TestPack in
@@ -467,7 +467,7 @@ mod tests {
             &self,
             _vault: &Vault,
             _merges: &MergeMap,
-            _as_of: NaiveDate,
+            _as_of: Date,
             _findings: &mut Vec<Finding>,
         ) -> Box<dyn PackState> {
             Box::new(TestState)
@@ -476,7 +476,7 @@ mod tests {
             &self,
             _vault: &Vault,
             _state: &dyn PackState,
-            _as_of: NaiveDate,
+            _as_of: Date,
             _findings: &mut Vec<Finding>,
         ) {
         }

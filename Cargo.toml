@@ -28,11 +28,14 @@ description = "Relationship memory you own: plain-text records in a git repo, fo
 
 [workspace.dependencies]
 anyhow = "1.0"
-chrono = { version = "0.4.38", default-features = false, features = ["alloc", "std", "clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 confidant-core = { path = "crates/confidant-core", version = "0.9.1" }
 crossterm = "0.29"
 include_dir = "0.7"
+# Civil dates only (no time, no zone): the vault format stores `YYYY-MM-DD`.
+# Default features are off so the time-zone database and bundled tzdb are
+# not pulled in; `std` is enough for parsing, formatting and `Timestamp`.
+jiff = { version = "1.0.3", default-features = false, features = ["std"] }
 # Dev-only property testing (#886). Default `fork`/`timeout` are off: the
 # suite needs shrinking, not process isolation, and the leaner graph keeps
 # CI compile time down.

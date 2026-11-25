@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use crate::commands::check::print_check_human;
 use crate::{ok_envelope, print_json, Cli, FixExt};
+use confidant_core::date::{self, Date};
 use confidant_core::error::DomainError;
 use confidant_core::id::RecordId;
 use confidant_core::ledger::parse_strict_date;
@@ -306,16 +307,15 @@ pub(crate) fn announce_resolved_person(cli: &Cli, person: &ResolvedPersonArg) {
     }
 }
 
-pub(crate) fn parse_date_arg(raw: &Option<String>) -> anyhow::Result<chrono::NaiveDate> {
+pub(crate) fn parse_date_arg(raw: &Option<String>) -> anyhow::Result<Date> {
     match raw {
         Some(s) => parse_strict_date(s)
             .ok_or_else(|| anyhow::Error::new(DomainError::usage(format!("not YYYY-MM-DD: {s}")))),
-        None => Ok(chrono::Utc::now().date_naive()),
+        None => Ok(date::today()),
     }
 }
 
-pub(crate) fn month_path(date: &chrono::NaiveDate) -> PathBuf {
-    use chrono::Datelike;
+pub(crate) fn month_path(date: &Date) -> PathBuf {
     PathBuf::from(format!("ledger/{}/{:02}.cfd", date.year(), date.month()))
 }
 
@@ -350,7 +350,7 @@ pub(crate) fn require_log_verb(
 pub(crate) fn find_duplicate_touch(
     vault: &confidant_core::Vault,
     person: &RecordId,
-    date: &chrono::NaiveDate,
+    date: &Date,
     kind: &str,
 ) -> Option<(String, u32)> {
     vault.entries.iter().find_map(|sourced| {

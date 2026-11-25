@@ -15,7 +15,7 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use chrono::NaiveDate;
+use crate::date::Date;
 
 use crate::check::{Finding, MergeMap};
 use crate::config::SpecVersion;
@@ -254,7 +254,7 @@ pub trait Pack: Send + Sync {
         &self,
         vault: &Vault,
         merges: &MergeMap,
-        as_of: NaiveDate,
+        as_of: Date,
         findings: &mut Vec<Finding>,
     ) -> Box<dyn PackState>;
     /// Post-fold rules (gap rules, note integrity). Appends findings.
@@ -262,7 +262,7 @@ pub trait Pack: Send + Sync {
         &self,
         vault: &Vault,
         state: &dyn PackState,
-        as_of: NaiveDate,
+        as_of: Date,
         findings: &mut Vec<Finding>,
     );
     /// Verify one `balance` ledger line whose metric this pack claims.
@@ -301,7 +301,7 @@ pub trait Pack: Send + Sync {
         _state: &dyn PackState,
         _person: &RecordId,
         _canonical: &RecordId,
-        _as_of: NaiveDate,
+        _as_of: Date,
     ) -> Option<serde_json::Value> {
         None
     }
@@ -598,7 +598,7 @@ mod tests {
             &self,
             _vault: &Vault,
             _merges: &MergeMap,
-            _as_of: NaiveDate,
+            _as_of: Date,
             _findings: &mut Vec<Finding>,
         ) -> Box<dyn PackState> {
             Box::new(TestState)
@@ -607,7 +607,7 @@ mod tests {
             &self,
             _vault: &Vault,
             _state: &dyn PackState,
-            _as_of: NaiveDate,
+            _as_of: Date,
             _findings: &mut Vec<Finding>,
         ) {
         }
@@ -755,7 +755,7 @@ mod tests {
                 &self,
                 _vault: &Vault,
                 _merges: &MergeMap,
-                _as_of: NaiveDate,
+                _as_of: Date,
                 _findings: &mut Vec<Finding>,
             ) -> Box<dyn PackState> {
                 Box::new(TestState)
@@ -764,7 +764,7 @@ mod tests {
                 &self,
                 _vault: &Vault,
                 _state: &dyn PackState,
-                _as_of: NaiveDate,
+                _as_of: Date,
                 _findings: &mut Vec<Finding>,
             ) {
             }
@@ -821,7 +821,7 @@ mod tests {
                 &self,
                 _vault: &Vault,
                 _merges: &MergeMap,
-                _as_of: NaiveDate,
+                _as_of: Date,
                 _findings: &mut Vec<Finding>,
             ) -> Box<dyn PackState> {
                 Box::new(TestState)
@@ -830,7 +830,7 @@ mod tests {
                 &self,
                 _vault: &Vault,
                 _state: &dyn PackState,
-                _as_of: NaiveDate,
+                _as_of: Date,
                 _findings: &mut Vec<Finding>,
             ) {
             }
@@ -879,7 +879,7 @@ mod tests {
                     &self,
                     _vault: &Vault,
                     _merges: &MergeMap,
-                    _as_of: NaiveDate,
+                    _as_of: Date,
                     _findings: &mut Vec<Finding>,
                 ) -> Box<dyn PackState> {
                     Box::new(TestState)
@@ -888,7 +888,7 @@ mod tests {
                     &self,
                     _vault: &Vault,
                     _state: &dyn PackState,
-                    _as_of: NaiveDate,
+                    _as_of: Date,
                     _findings: &mut Vec<Finding>,
                 ) {
                 }

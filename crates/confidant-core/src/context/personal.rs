@@ -99,7 +99,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use chrono::NaiveDate;
+use crate::date::Date;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -292,7 +292,7 @@ pub fn build_personal_view(
     vault: &Vault,
     person: &RecordId,
     canonical: &RecordId,
-    as_of: NaiveDate,
+    as_of: Date,
     declared: &[FieldDecl],
     event_verbs: &[&str],
 ) -> Option<Value> {
@@ -319,7 +319,7 @@ pub fn build_personal_view(
     };
 
     let mut cadence: Option<Cadence> = None;
-    let mut snooze_until: Option<NaiveDate> = None;
+    let mut snooze_until: Option<Date> = None;
     for field in declared {
         // Reserved derived keys are never emitted from the declared map.
         if DERIVED_VIEW_KEYS.contains(&field.name.as_str()) {
@@ -458,7 +458,7 @@ pub fn build_personal_view(
     view.cadence_never = matches!(cadence, Some(Cadence::Never));
 
     let last_touch = last_contact_on(vault, canonical, &members, as_of, event_verbs);
-    view.days_since_touch = last_touch.map(|d| as_of.signed_duration_since(d).num_days());
+    view.days_since_touch = last_touch.map(|d| crate::date::days_between(d, as_of));
     view.last_touch = last_touch.map(|d| d.to_string());
     view.overdue = match view.cadence_days {
         None => false,
@@ -486,7 +486,7 @@ pub fn build_personal_view(
 
 /// The merge map for `as_of`. Merge problems are reported by `check`; here
 /// they are dropped, exactly as `context` does for its own copy.
-fn merge_map(vault: &Vault, as_of: NaiveDate) -> crate::check::MergeMap {
+fn merge_map(vault: &Vault, as_of: Date) -> crate::check::MergeMap {
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
     let mut findings: Vec<Finding> = Vec::new();
     check_aliases_and_merges(vault, &known_ids, as_of, &mut findings)
@@ -499,7 +499,7 @@ fn merge_members(
     vault: &Vault,
     canonical: &RecordId,
     merges: &crate::check::MergeMap,
-    as_of: NaiveDate,
+    as_of: Date,
 ) -> Vec<RecordId> {
     let mut members: Vec<RecordId> = vault
         .records
@@ -545,9 +545,9 @@ fn last_contact_on(
     vault: &Vault,
     canonical: &RecordId,
     members: &[RecordId],
-    as_of: NaiveDate,
+    as_of: Date,
     event_verbs: &[&str],
-) -> Option<NaiveDate> {
+) -> Option<Date> {
     let is_member = |id: &RecordId| id == canonical || members.contains(id);
     let ledger = vault
         .effective_entries()
@@ -584,7 +584,7 @@ fn recent_touches(
     vault: &Vault,
     canonical: &RecordId,
     merges: &crate::check::MergeMap,
-    as_of: NaiveDate,
+    as_of: Date,
 ) -> Vec<RecentTouch> {
     let mut touches: Vec<RecentTouch> = vault
         .effective_entries()

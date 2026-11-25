@@ -1,6 +1,6 @@
 //! Dated one-line ledger grammar (ADR-2).
 
-use chrono::NaiveDate;
+use crate::date::Date;
 use sha2::{Digest, Sha256};
 
 use crate::id::{strip_ignorable, RecordId};
@@ -286,7 +286,7 @@ impl Arg {
 /// A parsed ledger entry. Comments are preserved for round-trip.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LedgerEntry {
-    pub date: NaiveDate,
+    pub date: Date,
     pub verb: String,
     pub id: RecordId,
     pub args: Vec<Arg>,
@@ -294,7 +294,7 @@ pub struct LedgerEntry {
 }
 
 /// Strict `YYYY-MM-DD`: zero-padded, exactly 10 characters, a real calendar date.
-pub fn parse_strict_date(s: &str) -> Option<NaiveDate> {
+pub fn parse_strict_date(s: &str) -> Option<Date> {
     if s.len() != 10 {
         return None;
     }
@@ -311,7 +311,7 @@ pub fn parse_strict_date(s: &str) -> Option<NaiveDate> {
     }) {
         return None;
     }
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+    Date::strptime("%Y-%m-%d", s).ok()
 }
 
 /// Case-folded verb on a ledger line. On any non-comment line, the verb is
@@ -504,7 +504,7 @@ impl<'a> Lexer<'a> {
         self.s[self.i..].starts_with(';')
     }
 
-    fn date(&mut self) -> Result<NaiveDate, String> {
+    fn date(&mut self) -> Result<Date, String> {
         if self.i >= self.s.len() {
             return Err("missing date".to_owned());
         }

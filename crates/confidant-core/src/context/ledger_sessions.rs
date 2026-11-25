@@ -49,7 +49,7 @@
 //! owns the fold and the merge-aware queries, and a `[context]` pack's
 //! `ledger-balance` rule produces the [`LedgerFacts`] this builder consumes.
 
-use chrono::NaiveDate;
+use crate::date::Date;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -216,7 +216,7 @@ pub(crate) fn params(manifest: &PackManifest) -> Option<LedgerSessionsParams> {
 pub(crate) fn build_ledger_sessions_view(
     vault: &Vault,
     canonical: &RecordId,
-    as_of: NaiveDate,
+    as_of: Date,
     facts: &LedgerFacts,
     consume_verb: &str,
     recent_limit: usize,

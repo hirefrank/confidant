@@ -10,7 +10,7 @@
 //! against; [`parse_field_grammar`] dispatches a name to its parser. A
 //! test pins the two together.
 
-use chrono::{Datelike, NaiveDate};
+use crate::date::Date;
 
 use crate::config::MAX_GAP_DAYS;
 use crate::ledger::parse_strict_date;
@@ -75,7 +75,7 @@ pub enum FieldValue {
     /// `provenance-list`: comma-separated `KEY|SOURCE|DATE` entries.
     ProvenanceList(Vec<ProvenanceEntry>),
     /// `date`: one strict `YYYY-MM-DD`.
-    Date(NaiveDate),
+    Date(Date),
     /// `non-empty-string`: whitespace-trimmed text.
     Text(String),
 }
@@ -189,7 +189,7 @@ impl RecurringDate {
             let day: u32 = d_str.parse().ok()?;
             // Validate month/day against leap year 2024 so `--02-29` is valid
             // while `--02-30` and `--13-01` are rejected.
-            NaiveDate::from_ymd_opt(2024, month, day)?;
+            Date::new(2024, i8::try_from(month).ok()?, i8::try_from(day).ok()?).ok()?;
             Some(Self {
                 label: label.into(),
                 raw: trimmed.to_owned(),
@@ -202,16 +202,16 @@ impl RecurringDate {
             Some(Self {
                 label: label.into(),
                 raw: trimmed.to_owned(),
-                year: Some(date.year()),
-                month: date.month(),
-                day: date.day(),
+                year: Some(i32::from(date.year())),
+                month: date.month() as u32,
+                day: date.day() as u32,
             })
         }
     }
 
     /// Next occurrence of this month/day on or after `as_of`, respecting
     /// `self.year` (an event with a year cannot occur before that year).
-    pub fn next_occurrence_on_or_after(&self, as_of: NaiveDate) -> Option<NaiveDate> {
+    pub fn next_occurrence_on_or_after(&self, as_of: Date) -> Option<Date> {
         for cy in [
             as_of.year(),
             as_of.year() + 1,
@@ -219,10 +219,14 @@ impl RecurringDate {
             as_of.year() + 3,
             as_of.year() + 4,
         ] {
-            if self.year.is_some_and(|y| cy < y) {
+            if self.year.is_some_and(|y| i32::from(cy) < y) {
                 continue;
             }
-            if let Some(occ) = NaiveDate::from_ymd_opt(cy, self.month, self.day) {
+            if let Ok(occ) = Date::new(
+                cy,
+                i8::try_from(self.month).ok()?,
+                i8::try_from(self.day).ok()?,
+            ) {
                 if occ >= as_of {
                     return Some(occ);
                 }
@@ -320,7 +324,7 @@ pub fn parse_labeled_list(raw: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// Parse `date`: one strict `YYYY-MM-DD` (reused from the ledger parser).
-pub fn parse_date(raw: &str) -> Option<NaiveDate> {
+pub fn parse_date(raw: &str) -> Option<Date> {
     parse_strict_date(raw.trim())
 }
 
@@ -679,10 +683,7 @@ mod tests {
 
     #[test]
     fn date_parser_is_strict() {
-        assert_eq!(
-            parse_date(" 2026-10-18 "),
-            NaiveDate::from_ymd_opt(2026, 10, 18)
-        );
+        assert_eq!(parse_date(" 2026-10-18 "), Date::new(2026, 10, 18).ok());
         // Not a one-off date: year-less and impossible dates are rejected.
         assert_eq!(parse_date("--10-18"), None);
         assert_eq!(parse_date("2026-02-29"), None);
@@ -718,7 +719,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_field_grammar("date", "snooze_until", "2026-10-18"),
-            Some(FieldValue::Date(d)) if d == NaiveDate::from_ymd_opt(2026, 10, 18).unwrap()
+            Some(FieldValue::Date(d)) if d == Date::new(2026, 10, 18).unwrap()
         ));
     }
 

@@ -14,6 +14,7 @@
 use crate::check::Finding;
 use crate::check::MergeMap;
 use crate::context::ledger_sessions::LedgerSessionsParams;
+use crate::date::Date;
 use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
 use crate::packs::groups::MergeGroups;
@@ -22,7 +23,6 @@ use crate::packs::rules::ledger::{self, LedgerFacts};
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::record_type::{NoAiPolicy, RecordTypeDecl, TypeOwner};
 use crate::vault::{SourcedEntry, Vault};
-use chrono::NaiveDate;
 
 fn leak_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
@@ -296,7 +296,7 @@ impl Pack for ManifestPack {
         &self,
         vault: &Vault,
         merges: &MergeMap,
-        _as_of: NaiveDate,
+        _as_of: Date,
         _findings: &mut Vec<Finding>,
     ) -> Box<dyn PackState> {
         let merge = MergeGroups::new(merges.clone());
@@ -320,13 +320,7 @@ impl Pack for ManifestPack {
     /// Declarative rules + field-grammar validation (#441). Runs the
     /// evaluator's two phases in manifest order; findings are appended
     /// deterministically.
-    fn findings(
-        &self,
-        vault: &Vault,
-        state: &dyn PackState,
-        as_of: NaiveDate,
-        out: &mut Vec<Finding>,
-    ) {
+    fn findings(&self, vault: &Vault, state: &dyn PackState, as_of: Date, out: &mut Vec<Finding>) {
         let Some(state) = state.as_any().downcast_ref::<ManifestState>() else {
             return; // never happens in-tree; fold always makes ManifestState
         };
@@ -364,7 +358,7 @@ impl Pack for ManifestPack {
         state: &dyn PackState,
         person: &RecordId,
         canonical: &RecordId,
-        as_of: NaiveDate,
+        as_of: Date,
     ) -> Option<serde_json::Value> {
         if self.serves_core_personal_view() {
             // #799: contact verbs are the pack's declaration, not a literal

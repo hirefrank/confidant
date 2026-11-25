@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::catch_unwind;
 use std::sync::Mutex;
 
-use chrono::NaiveDate;
+use crate::date::{self, Date};
 
 use crate::check::{Finding, FindingCode, Severity};
 
@@ -56,7 +56,7 @@ pub(crate) struct RuleCtx<'a> {
     #[allow(dead_code)]
     pub merges: &'a MergeGroups,
     #[allow(dead_code)]
-    pub as_of: NaiveDate,
+    pub as_of: Date,
     #[allow(dead_code)]
     pub manifest: &'a PackManifest,
     /// The rule's resolved severity (`off` rules never reach `evaluate`).
@@ -312,7 +312,7 @@ fn evaluate_catching_panic(
 pub(crate) fn run(
     vault: &Vault,
     merges: &MergeGroups,
-    as_of: NaiveDate,
+    as_of: Date,
     manifest: &PackManifest,
     out: &mut Vec<Finding>,
 ) {
@@ -646,13 +646,11 @@ impl RuleKind for CadenceOverdueKind {
                 .map(|s| s.entry.date)
                 .max();
             if let Some(d) = last {
-                if ctx.as_of.signed_duration_since(d)
-                    <= chrono::Duration::days(i64::from(cadence_days))
-                {
+                if date::days_between(d, ctx.as_of) <= i64::from(cadence_days) {
                     continue; // within the window
                 }
             }
-            let start = ctx.as_of - chrono::Duration::days(i64::from(cadence_days));
+            let start = date::add_days(ctx.as_of, -i64::from(cadence_days));
             let (message, fix) = match last {
                 Some(d) => (
                     ctx.manifest.render_message(
@@ -903,7 +901,7 @@ impl RuleKind for DateUpcomingKind {
                 let Some(occ) = date.next_occurrence_on_or_after(ctx.as_of) else {
                     continue;
                 };
-                let delta = occ.signed_duration_since(ctx.as_of).num_days();
+                let delta = date::days_between(ctx.as_of, occ);
                 if !(0..=window_i).contains(&delta) {
                     continue;
                 }
@@ -1172,7 +1170,7 @@ impl RuleKind for NoteRefKind {
             };
             // The compiled functions canonicalize as of "now" (`MAX`),
             // not `as_of`: ownership is not a point-in-time question.
-            let person = ctx.merges.canonical_on(&entry.id, NaiveDate::MAX);
+            let person = ctx.merges.canonical_on(&entry.id, Date::MAX);
             let finding =
                 |code: FindingCode, variant: &str, args: &[(&str, &dyn std::fmt::Display)]| {
                     Finding::new(
@@ -1206,7 +1204,7 @@ impl RuleKind for NoteRefKind {
                         let note_person = rec
                             .person()
                             .or_else(|| crate::id::person_id_from_path(&rec.path))
-                            .map(|p| ctx.merges.canonical_on(&p, NaiveDate::MAX));
+                            .map(|p| ctx.merges.canonical_on(&p, Date::MAX));
                         if note_person.as_ref() != Some(&person) {
                             out.push(finding(
                                 unknown_code,
@@ -1293,8 +1291,8 @@ mod tests {
         }
     }
 
-    pub(super) fn as_of() -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, 10, 8).unwrap()
+    pub(super) fn as_of() -> Date {
+        Date::new(2026, 10, 8).unwrap()
     }
 
     /// Manifest with one `[[rules]]` entry of the given kind.

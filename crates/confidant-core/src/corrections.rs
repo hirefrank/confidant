@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use chrono::NaiveDate;
+use crate::date::Date;
 
 use crate::check::{Finding, FindingCode, Severity};
 use crate::config::SpecVersion;
@@ -24,7 +24,7 @@ pub struct Retraction {
     pub target: LineRef,
     pub replacement: Option<LineRef>,
     pub reason: RetractReason,
-    pub date: NaiveDate,
+    pub date: Date,
     pub subject: RecordId,
     pub target_file: String,
     pub target_line: u32,
@@ -36,7 +36,7 @@ pub struct Retraction {
 #[derive(Clone, Debug, Default)]
 pub struct Corrections {
     by_target: BTreeMap<LineRef, Retraction>,
-    voided_on: BTreeMap<LineRef, NaiveDate>,
+    voided_on: BTreeMap<LineRef, Date>,
     voided_locations: HashSet<(String, u32)>,
     findings: Vec<Finding>,
 }
@@ -157,7 +157,7 @@ impl Corrections {
         }
 
         // Duplicate/fork detection and the first-retraction map.
-        let mut fork_earliest: BTreeMap<LineRef, NaiveDate> = BTreeMap::new();
+        let mut fork_earliest: BTreeMap<LineRef, Date> = BTreeMap::new();
         for item in &pending {
             let spec = &item.spec;
             let target = lookup.get(&spec.target).expect("target validated above");
@@ -358,7 +358,7 @@ impl Corrections {
         self.voided_on.contains_key(line)
     }
 
-    pub fn voided_on(&self, line: &LineRef) -> Option<NaiveDate> {
+    pub fn voided_on(&self, line: &LineRef) -> Option<Date> {
         self.voided_on.get(line).copied()
     }
 
@@ -400,7 +400,7 @@ pub fn is_entry_voided(corrections: &Corrections, sourced: &SourcedEntry) -> boo
 }
 
 /// Helper for pack folds: the retraction date of an entry, if any.
-pub fn voided_on_entry(corrections: &Corrections, sourced: &SourcedEntry) -> Option<NaiveDate> {
+pub fn voided_on_entry(corrections: &Corrections, sourced: &SourcedEntry) -> Option<Date> {
     corrections.voided_on(&sourced.line_ref)
 }
 

@@ -133,8 +133,8 @@ impl PackRegistry {
 mod tests {
     use super::*;
     use crate::check::{Finding, MergeMap};
+    use crate::date::Date;
     use crate::vault::{SourcedEntry, Vault};
-    use chrono::NaiveDate;
 
     struct CollidingExternal;
     struct EmptyState;
@@ -171,7 +171,7 @@ mod tests {
             &self,
             _vault: &Vault,
             _merges: &MergeMap,
-            _as_of: NaiveDate,
+            _as_of: Date,
             _findings: &mut Vec<Finding>,
         ) -> Box<dyn crate::packs::PackState> {
             Box::new(EmptyState)
@@ -180,7 +180,7 @@ mod tests {
             &self,
             _vault: &Vault,
             _state: &dyn crate::packs::PackState,
-            _as_of: NaiveDate,
+            _as_of: Date,
             _findings: &mut Vec<Finding>,
         ) {
         }

@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::NaiveDate;
+use crate::date::Date;
 
 use crate::check::{duration_of, Finding, FindingCode, Severity};
 use crate::error::DomainError;
@@ -354,9 +354,9 @@ pub(crate) static SESSION_CHECKS: SessionChecksKind = SessionChecksKind;
 fn note_coverage(
     vault: &Vault,
     merges: &crate::packs::groups::MergeGroups,
-    as_of: NaiveDate,
-) -> HashMap<RecordId, HashSet<NaiveDate>> {
-    let mut map: HashMap<RecordId, HashSet<NaiveDate>> = HashMap::new();
+    as_of: Date,
+) -> HashMap<RecordId, HashSet<Date>> {
+    let mut map: HashMap<RecordId, HashSet<Date>> = HashMap::new();
     for rec in vault.records.values() {
         if rec.kind != RecordKind::Note {
             continue;

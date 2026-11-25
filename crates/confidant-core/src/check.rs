@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use chrono::{Datelike, NaiveDate};
+use crate::date::Date;
 use serde::Serialize;
 
 use crate::config::{parse_iso_date, SpecVersion};
@@ -509,7 +509,7 @@ pub struct CheckReport {
 /// Options that do not come from the vault files themselves.
 #[derive(Clone, Debug, Default)]
 pub struct CheckOptions {
-    pub as_of: Option<NaiveDate>,
+    pub as_of: Option<Date>,
     pub fail_on: Option<Severity>,
 }
 
@@ -808,7 +808,7 @@ fn finish_report(vault: &Vault, options: &CheckOptions, findings: Vec<Finding>) 
     }
 }
 
-fn resolve_as_of(vault: &Vault, options: &CheckOptions) -> NaiveDate {
+fn resolve_as_of(vault: &Vault, options: &CheckOptions) -> Date {
     if let Some(d) = options.as_of {
         return d;
     }
@@ -816,14 +816,14 @@ fn resolve_as_of(vault: &Vault, options: &CheckOptions) -> NaiveDate {
 }
 
 /// The effective as-of date for pack folds: config override, else today.
-pub fn resolve_as_of_date(vault: &Vault) -> NaiveDate {
+pub fn resolve_as_of_date(vault: &Vault) -> Date {
     if let Some(raw) = vault.config.checks.as_of.as_deref() {
         if let Ok(d) = parse_iso_date(raw) {
             return d;
         }
         // Invalid as_of in config is reported as E_CONFIG at load time.
     }
-    chrono::Utc::now().date_naive()
+    crate::date::today()
 }
 
 /// Best-effort pack states for read commands (e.g. `context`).
@@ -832,10 +832,7 @@ pub fn resolve_as_of_date(vault: &Vault) -> NaiveDate {
 /// best-effort and the findings discarded. One entry per enabled pack, in
 /// config order. Packs with conflicting claims are still folded here —
 /// `run` is the gate that refuses them; read commands degrade gracefully.
-pub fn pack_snapshots(
-    vault: &Vault,
-    as_of: NaiveDate,
-) -> Vec<(&'static dyn Pack, Box<dyn PackState>)> {
+pub fn pack_snapshots(vault: &Vault, as_of: Date) -> Vec<(&'static dyn Pack, Box<dyn PackState>)> {
     let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
     let mut findings = Vec::new();
@@ -913,7 +910,9 @@ pub fn verb_passes_check(vault: &Vault, verb: &str) -> bool {
 fn check_ledger_paths(vault: &Vault, findings: &mut Vec<Finding>) {
     for entry in vault.effective_entries() {
         if let Some((year, month)) = parse_ledger_file(&entry.file) {
-            if entry.entry.date.year() != year || entry.entry.date.month() != month {
+            if i32::from(entry.entry.date.year()) != year
+                || entry.entry.date.month() as u32 != month
+            {
                 findings.push(
                     Finding::new(
                         FindingCode::LedgerDate,
@@ -1101,12 +1100,12 @@ fn check_verbs_and_refs(
     }
 }
 
-pub(crate) type MergeMap = HashMap<RecordId, (RecordId, NaiveDate)>;
+pub(crate) type MergeMap = HashMap<RecordId, (RecordId, Date)>;
 
 pub(crate) fn check_aliases_and_merges(
     vault: &Vault,
     known_ids: &HashSet<RecordId>,
-    _as_of: NaiveDate,
+    _as_of: Date,
     findings: &mut Vec<Finding>,
 ) -> MergeMap {
     let mut parent: MergeMap = HashMap::new();
@@ -1259,7 +1258,7 @@ pub(crate) fn parse_merge(entry: &LedgerEntry) -> MergeParse {
     }
 }
 
-pub(crate) fn canonical_on(id: &RecordId, parent: &MergeMap, on: NaiveDate) -> RecordId {
+pub(crate) fn canonical_on(id: &RecordId, parent: &MergeMap, on: Date) -> RecordId {
     let mut seen = HashSet::new();
     let mut cur = id.clone();
     while let Some((next, date)) = parent.get(&cur) {
@@ -1649,7 +1648,7 @@ fn check_edges(
     enabled_packs: &[&dyn Pack],
     orphans: &OrphanOwners,
     merges: &MergeMap,
-    as_of: NaiveDate,
+    as_of: Date,
     findings: &mut Vec<Finding>,
 ) {
     let spec = vault.spec_version().unwrap_or(SpecVersion::V01);
@@ -2109,7 +2108,7 @@ fn check_duplicate_src(vault: &Vault, findings: &mut Vec<Finding>) {
 /// [`check_duplicate_sessions`]) so a repeated session line is not
 /// invisible while a repeated touch is flagged.
 fn check_duplicate_touches(vault: &Vault, findings: &mut Vec<Finding>) {
-    let mut seen: BTreeMap<(RecordId, NaiveDate, String), (String, u32)> = BTreeMap::new();
+    let mut seen: BTreeMap<(RecordId, Date, String), (String, u32)> = BTreeMap::new();
     for sourced in vault.effective_entries() {
         let Some(identity) = crate::touch::touch_identity(&sourced.entry) else {
             continue;
@@ -2141,7 +2140,7 @@ fn check_duplicate_touches(vault: &Vault, findings: &mut Vec<Finding>) {
 /// minutes (`60m` and `1h` flag) and tags compare lowercased; lines
 /// with no parseable duration carry no identity and are never flagged.
 fn check_duplicate_sessions(vault: &Vault, findings: &mut Vec<Finding>) {
-    let mut seen: BTreeMap<(RecordId, NaiveDate, u32, String), (String, u32)> = BTreeMap::new();
+    let mut seen: BTreeMap<(RecordId, Date, u32, String), (String, u32)> = BTreeMap::new();
     for sourced in vault.effective_entries() {
         let entry = &sourced.entry;
         if entry.verb != "session" {

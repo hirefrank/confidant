@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::NaiveDate;
+use confidant_core::date::Date;
 use confidant_core::id::{ulid_from_parts, Prefix, RecordId};
 use confidant_core::ledger::{format_entry, parse_line, Arg, LedgerEntry};
 use confidant_core::record::{format_record, parse_record, Record, RecordKind};
@@ -59,11 +59,11 @@ fn comment() -> impl Strategy<Value = String> {
     prop::collection::vec(comment_word(), 1..=4).prop_map(|words| words.join(" "))
 }
 
-fn date() -> impl Strategy<Value = NaiveDate> {
+fn date() -> impl Strategy<Value = Date> {
     // Day <= 28 keeps every month valid without a rejection filter, which
     // would weaken shrinking.
-    (1970i32..2100, 1u32..=12, 1u32..=28).prop_map(|(year, month, day)| {
-        NaiveDate::from_ymd_opt(year, month, day).expect("generated day <= 28 is valid")
+    (1970i16..2100, 1i8..=12, 1i8..=28).prop_map(|(year, month, day)| {
+        Date::new(year, month, day).expect("generated day <= 28 is valid")
     })
 }
 
