@@ -16,6 +16,7 @@ pub mod config;
 pub mod conflict;
 pub mod context;
 pub mod corrections;
+pub mod date;
 pub mod discover;
 pub mod error;
 pub mod id;

@@ -9,6 +9,7 @@ use crate::commands::shared::{
     write_options,
 };
 use crate::{Cli, FixExt};
+use confidant_core::date::Date;
 use confidant_core::error::DomainError;
 use confidant_core::id::{Prefix, RecordId};
 use confidant_core::ledger::{
@@ -127,7 +128,7 @@ pub(crate) fn require_spec_04(
 }
 
 pub(crate) fn ledger_correction_line(
-    date: chrono::NaiveDate,
+    date: Date,
     subject: &RecordId,
     target: LineRef,
     reason: RetractReason,

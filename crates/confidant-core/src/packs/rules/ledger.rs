@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::NaiveDate;
+use crate::date::{self, Date};
 
 use crate::check::duration_of;
 use crate::id::{Prefix, RecordId};
@@ -44,20 +44,20 @@ pub(crate) fn format_hundredths(n: i64) -> String {
 
 #[derive(Clone, Debug)]
 struct OpenEvent {
-    date: NaiveDate,
+    date: Date,
     n: i64,
     /// Date the line was retracted (#746). `None` is effective forever.
-    voided_on: Option<NaiveDate>,
+    voided_on: Option<Date>,
 }
 
 #[derive(Clone, Debug)]
 struct SessionEvent {
-    date: NaiveDate,
+    date: Date,
     minutes: Option<u32>,
     pps: bool,
     consumes: bool,
     /// Date the line was retracted (#746). `None` is effective forever.
-    voided_on: Option<NaiveDate>,
+    voided_on: Option<Date>,
 }
 
 /// One person's ledger events, before merge grouping.
@@ -68,7 +68,7 @@ pub(crate) struct PersonLedger {
 }
 
 impl PersonLedger {
-    fn remaining_on(&self, on: NaiveDate) -> Option<i64> {
+    fn remaining_on(&self, on: Date) -> Option<i64> {
         let mut opened: i64 = 0;
         for o in self
             .opens
@@ -87,7 +87,7 @@ impl PersonLedger {
         opened.checked_sub(used)
     }
 
-    fn minutes_on(&self, on: NaiveDate) -> u32 {
+    fn minutes_on(&self, on: Date) -> u32 {
         self.sessions
             .iter()
             .filter(|s| s.date <= on && s.voided_on.is_none_or(|v| v > on))
@@ -95,7 +95,7 @@ impl PersonLedger {
             .fold(0u32, |acc, m| acc.saturating_add(m))
     }
 
-    fn last_session_on(&self, on: NaiveDate) -> Option<NaiveDate> {
+    fn last_session_on(&self, on: Date) -> Option<Date> {
         self.sessions
             .iter()
             .filter(|s| s.voided_on.is_none_or(|v| v > on))
@@ -104,7 +104,7 @@ impl PersonLedger {
             .max()
     }
 
-    fn last_open_on(&self, on: NaiveDate) -> Option<NaiveDate> {
+    fn last_open_on(&self, on: Date) -> Option<Date> {
         self.opens
             .iter()
             .filter(|o| o.voided_on.is_none_or(|v| v > on))
@@ -113,19 +113,19 @@ impl PersonLedger {
             .max()
     }
 
-    fn pps_in_lookback(&self, as_of: NaiveDate, window: chrono::Duration) -> bool {
+    fn pps_in_lookback(&self, as_of: Date, window: i64) -> bool {
         self.sessions.iter().any(|s| {
             s.pps
                 && s.date <= as_of
                 && s.voided_on.is_none_or(|v| v > as_of)
-                && as_of.signed_duration_since(s.date) <= window
+                && date::days_between(s.date, as_of) <= window
         })
     }
 
     /// Total minutes accumulated so far, used for the compiled overflow
     /// check before appending a session.
     fn total_minutes(&self) -> u32 {
-        self.minutes_on(NaiveDate::MAX)
+        self.minutes_on(Date::MAX)
     }
 }
 
@@ -155,11 +155,11 @@ impl LedgerFacts {
         }
     }
 
-    pub(crate) fn canonical_on(&self, id: &RecordId, on: NaiveDate) -> RecordId {
+    pub(crate) fn canonical_on(&self, id: &RecordId, on: Date) -> RecordId {
         self.merge.canonical_on(id, on)
     }
 
-    fn ensure_members(&self, on: NaiveDate) {
+    fn ensure_members(&self, on: Date) {
         self.merge.ensure_members(self.people.keys().cloned(), on);
     }
 
@@ -167,7 +167,7 @@ impl LedgerFacts {
         &'a self,
         groups: &'a HashMap<RecordId, Vec<RecordId>>,
         id: &RecordId,
-        on: NaiveDate,
+        on: Date,
     ) -> impl Iterator<Item = &'a PersonLedger> {
         let root = self.merge.canonical_on(id, on);
         let members = groups.get(&root).map(Vec::as_slice).unwrap_or(&[]);
@@ -178,7 +178,7 @@ impl LedgerFacts {
         &self,
         groups: &HashMap<RecordId, Vec<RecordId>>,
         id: &RecordId,
-        on: NaiveDate,
+        on: Date,
     ) -> i64 {
         let mut total: i64 = 0;
         for person in self.group_people(groups, id, on) {
@@ -195,7 +195,7 @@ impl LedgerFacts {
 
     /// Canonical person ids for `on`, sorted. Caches the merge groups
     /// (idempotent per date).
-    pub(crate) fn roots_on(&self, on: NaiveDate) -> Vec<RecordId> {
+    pub(crate) fn roots_on(&self, on: Date) -> Vec<RecordId> {
         self.ensure_members(on);
         let groups = self.merge.groups();
         let groups = groups.get(&on).expect("members cached");
@@ -204,13 +204,13 @@ impl LedgerFacts {
         roots
     }
 
-    pub(crate) fn sessions_remaining_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
+    pub(crate) fn sessions_remaining_on(&self, id: &RecordId, on: Date) -> i64 {
         self.ensure_members(on);
         let groups = self.merge.groups();
         self.remaining_with(groups.get(&on).expect("members cached"), id, on)
     }
 
-    pub(crate) fn icf_hours_hundredths_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
+    pub(crate) fn icf_hours_hundredths_on(&self, id: &RecordId, on: Date) -> i64 {
         self.ensure_members(on);
         let groups = self.merge.groups();
         let mut minutes: u32 = 0;
@@ -222,12 +222,7 @@ impl LedgerFacts {
 
     /// Whether anyone in `id`'s merge group has a `pps` session inside the
     /// lookback window ending at `as_of` (inclusive).
-    pub(crate) fn pps_in_lookback(
-        &self,
-        id: &RecordId,
-        as_of: NaiveDate,
-        window: chrono::Duration,
-    ) -> bool {
+    pub(crate) fn pps_in_lookback(&self, id: &RecordId, as_of: Date, window: i64) -> bool {
         self.ensure_members(as_of);
         let groups = self.merge.groups();
         let group = groups.get(&as_of).expect("members cached");
@@ -238,7 +233,7 @@ impl LedgerFacts {
     }
 
     /// `id`'s merge group members for `on`, sorted.
-    pub(crate) fn group_members(&self, id: &RecordId, on: NaiveDate) -> Vec<RecordId> {
+    pub(crate) fn group_members(&self, id: &RecordId, on: Date) -> Vec<RecordId> {
         self.ensure_members(on);
         let groups = self.merge.groups();
         let root = self.merge.canonical_on(id, on);
@@ -251,7 +246,7 @@ impl LedgerFacts {
     }
 
     /// The latest open-verb date on or before `on` for `id`'s group.
-    pub(crate) fn last_open_on(&self, id: &RecordId, on: NaiveDate) -> Option<NaiveDate> {
+    pub(crate) fn last_open_on(&self, id: &RecordId, on: Date) -> Option<Date> {
         self.ensure_members(on);
         let groups = self.merge.groups();
         self.group_people(groups.get(&on).expect("members cached"), id, on)
@@ -260,7 +255,7 @@ impl LedgerFacts {
     }
 
     /// The latest consuming-verb date on or before `on` for `id`'s group.
-    pub(crate) fn last_session_on(&self, id: &RecordId, on: NaiveDate) -> Option<NaiveDate> {
+    pub(crate) fn last_session_on(&self, id: &RecordId, on: Date) -> Option<Date> {
         self.ensure_members(on);
         let groups = self.merge.groups();
         self.group_people(groups.get(&on).expect("members cached"), id, on)
@@ -363,7 +358,7 @@ fn apply_open<'a>(
     facts: &mut LedgerFacts,
     sourced: &'a SourcedEntry,
     max_open_n: i64,
-    voided_on: Option<NaiveDate>,
+    voided_on: Option<Date>,
     issues: &mut Vec<(&'a SourcedEntry, LedgerIssue)>,
 ) {
     let entry = &sourced.entry;
@@ -429,7 +424,7 @@ fn parse_open(entry: &LedgerEntry) -> Option<Result<(RecordId, i64), OpenIssue>>
 fn apply_session<'a>(
     facts: &mut LedgerFacts,
     sourced: &'a SourcedEntry,
-    voided_on: Option<NaiveDate>,
+    voided_on: Option<Date>,
     issues: &mut Vec<(&'a SourcedEntry, LedgerIssue)>,
 ) {
     let entry = &sourced.entry;

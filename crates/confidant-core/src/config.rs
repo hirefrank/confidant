@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::check::{Finding, FindingCode, Severity};
+use crate::date::Date;
 use crate::error::DomainError;
 use crate::ledger::parse_strict_date;
 
@@ -572,7 +573,7 @@ fn expand_tilde(raw: &String) -> PathBuf {
     PathBuf::from(raw)
 }
 
-pub fn parse_iso_date(s: &str) -> Result<chrono::NaiveDate, DomainError> {
+pub fn parse_iso_date(s: &str) -> Result<Date, DomainError> {
     parse_strict_date(s)
         .ok_or_else(|| DomainError::invalid(format!("date '{s}' is not YYYY-MM-DD")))
 }

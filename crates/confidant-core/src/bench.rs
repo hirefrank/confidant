@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
+use crate::date::Date;
 use anyhow::Result;
-use chrono::NaiveDate;
 
 use crate::error::DomainError;
 use crate::id::{ulid_from_parts, Prefix, RecordId};
@@ -86,9 +86,8 @@ example-pack.lookback_days = 180
                 Prefix::Note,
                 ulid_from_parts(TIME_MS, 50_000 + (i as u128) * 256 + n as u128),
             )?;
-            let note_date =
-                NaiveDate::from_ymd_opt(2024 + (n / 12) as i32, (n % 12) as u32 + 1, 15)
-                    .unwrap_or(NaiveDate::from_ymd_opt(2026, 10, 1).expect("valid"));
+            let note_date = Date::new(2024 + (n / 12) as i16, ((n % 12) + 1) as i8, 15)
+                .unwrap_or(Date::new(2026, 10, 1).expect("valid"));
             let mut note_body =
                 format!("Entry note {n} for generated person {i}. Themes: {common}.\n{filler}\n");
             while note_body.len() < NOTE_BODY_KB * 1024 {

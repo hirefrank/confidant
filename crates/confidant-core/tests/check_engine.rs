@@ -8,6 +8,7 @@ mod common;
 
 use common::{example_pack_dir, install_example_pack};
 use confidant_core::check::{CheckOptions, FindingCode, Severity};
+use confidant_core::date::Date;
 use confidant_core::{check_vault, load_vault};
 use serde_json::{json, Value};
 
@@ -110,7 +111,7 @@ example-pack.lookback_days = 180
 
 fn report_json(root: &Path, as_of: Option<&str>) -> Value {
     let vault = load_vault(root).unwrap();
-    let as_of = as_of.map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap());
+    let as_of = as_of.map(|s| Date::strptime("%Y-%m-%d", s).unwrap());
     let report = check_vault(
         &vault,
         &CheckOptions {
@@ -7112,11 +7113,8 @@ fn date_rule_leap_day_in_non_leap_year() {
     use confidant_core::packs::grammars::RecurringDate;
     let oracle = RecurringDate::parse("birthday", "--02-29")
         .unwrap()
-        .next_occurrence_on_or_after(chrono::NaiveDate::from_ymd_opt(2026, 2, 27).unwrap());
-    assert_eq!(
-        oracle,
-        Some(chrono::NaiveDate::from_ymd_opt(2028, 2, 29).unwrap())
-    );
+        .next_occurrence_on_or_after(Date::new(2026, 2, 27).unwrap());
+    assert_eq!(oracle, Some(Date::new(2028, 2, 29).unwrap()));
     let (personal, _) = assert_date_parity("2026-02-27", "birthday: --02-29\n", "", "", 7);
     assert!(date_upcoming(&personal).is_empty(), "{personal:?}");
 }
@@ -7748,7 +7746,7 @@ fn personal_04_vault(extra_fields: &str, ledger: &str) -> tempfile::TempDir {
 fn personal_view_0_4(root: &Path) -> Value {
     let vault = load_vault(root).unwrap();
     let id = confidant_core::id::RecordId::parse(ADA).unwrap();
-    let as_of = chrono::NaiveDate::parse_from_str("2026-10-08", "%Y-%m-%d").unwrap();
+    let as_of = Date::strptime("%Y-%m-%d", "2026-10-08").unwrap();
     build_personal_view(
         &vault,
         &id,
@@ -8595,7 +8593,7 @@ fn personal_view(root: &Path, person: &str) -> Value {
 fn personal_view_0_2(root: &Path, person: &str, as_of: &str) -> Value {
     let vault = load_vault(root).unwrap();
     let id = confidant_core::id::RecordId::parse(person).unwrap();
-    let as_of = chrono::NaiveDate::parse_from_str(as_of, "%Y-%m-%d").unwrap();
+    let as_of = Date::strptime("%Y-%m-%d", as_of).unwrap();
     build_personal_view(
         &vault,
         &id,
@@ -8622,7 +8620,7 @@ fn personal_view_contact_verbs_are_pack_declared() {
     );
     let vault = load_vault(dir.path()).unwrap();
     let ada = confidant_core::id::RecordId::parse(ADA).unwrap();
-    let as_of = chrono::NaiveDate::parse_from_str("2026-10-08", "%Y-%m-%d").unwrap();
+    let as_of = Date::strptime("%Y-%m-%d", "2026-10-08").unwrap();
     let fields = fields_0_2();
 
     let touch_only = build_personal_view(&vault, &ada, &ada, as_of, &fields, &["touch"]).unwrap();
@@ -8840,7 +8838,7 @@ fn context_view_merged_person_uses_canonical() {
     let vault = load_vault(dir.path()).unwrap();
     let ada = confidant_core::id::RecordId::parse(ADA).unwrap();
     let bea = confidant_core::id::RecordId::parse(BEA).unwrap();
-    let as_of = chrono::NaiveDate::parse_from_str("2026-10-08", "%Y-%m-%d").unwrap();
+    let as_of = Date::strptime("%Y-%m-%d", "2026-10-08").unwrap();
     let fields = fields_0_2();
     let view =
         build_personal_view(&vault, &ada, &ada, as_of, &fields, &["touch", "session"]).unwrap();

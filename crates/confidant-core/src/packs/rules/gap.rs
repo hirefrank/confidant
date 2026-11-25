@@ -10,7 +10,7 @@
 //! `balance_metric`; this module only resolves parameters and renders
 //! messages.
 
-use chrono::NaiveDate;
+use crate::date::{self, Date};
 
 use crate::check::Finding;
 use crate::error::DomainError;
@@ -173,8 +173,8 @@ impl RuleKind for ActivityGapKind {
         let lookback = resolve_int_check(ctx, params.lookback_days_key);
         let days_i = i64::try_from(days).unwrap_or(i64::MAX);
         let lookback_i = i64::try_from(lookback).unwrap_or(i64::MAX);
-        let window = chrono::Duration::days(days_i);
-        let lookback_window = chrono::Duration::days(lookback_i);
+        let window = days_i;
+        let lookback_window = lookback_i;
 
         let folded = ledger::fold(ctx.vault, ctx.merges, balance_params.fold_params());
         let facts = &folded.facts;
@@ -193,7 +193,7 @@ impl RuleKind for ActivityGapKind {
             let members = (params.activity_verb != balance_params.consume_verb
                 || params.start_verb != balance_params.open_verb)
                 .then(|| facts.group_members(&id, ctx.as_of));
-            let scan = |verb: &str| -> Option<NaiveDate> {
+            let scan = |verb: &str| -> Option<Date> {
                 let members = members.as_deref().unwrap_or(&[]);
                 ctx.vault
                     .entries
@@ -221,11 +221,11 @@ impl RuleKind for ActivityGapKind {
                 (None, None) => None,
             };
             if let Some(activity) = clock {
-                if ctx.as_of.signed_duration_since(activity) <= window {
+                if date::days_between(activity, ctx.as_of) <= window {
                     continue;
                 }
             }
-            let start = ctx.as_of - window;
+            let start = date::add_days(ctx.as_of, -days_i);
             let (message, fix) = match (last_session, remaining > 0) {
                 (None, _) => (
                     ctx.manifest

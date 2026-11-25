@@ -13,6 +13,7 @@ use std::path::Path;
 
 use confidant_core::config::SpecVersion;
 use confidant_core::corrections::Corrections;
+use confidant_core::date::Date;
 use confidant_core::error::{DomainError, ErrorKind};
 use confidant_core::ledger::{format_entry, line_ref, parse_line, LineRef};
 use confidant_core::load_vault;
@@ -205,9 +206,9 @@ proptest! {
         let target_text = format!("2026-10-01 touch {PERSON} {kind}");
         let target_ref: LineRef =
             line_ref(&parse_line(&target_text).unwrap().unwrap(), 1);
-        let retract_date = chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+        let retract_date = Date::new(2026, 11, 1)
             .unwrap()
-            .checked_add_days(chrono::Days::new(u64::from(offset_days)))
+            .checked_add(jiff::Span::new().days(i64::from(offset_days)))
             .unwrap();
         let retract_text = format!(
             "{retract_date} retract {PERSON} line:{} reason:{reason}",

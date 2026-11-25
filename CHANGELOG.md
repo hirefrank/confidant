@@ -8,6 +8,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Breaking
+- `confidant-core` civil dates are `jiff::civil::Date` (`confidant_core::date::Date`) instead of `chrono::NaiveDate`. Vault dates stay strict `YYYY-MM-DD`, and "today" stays UTC. This drops the unmaintained `chrono` dependency (RUSTSEC-2026-0543). Day differences and shifts go through `date::days_between` and `date::add_days`.
+
 ## [0.9.1] - 2026-11-07
 
 ### Fixed

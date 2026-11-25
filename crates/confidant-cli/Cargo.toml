@@ -23,7 +23,7 @@ dist = true
 
 [dependencies]
 anyhow.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 clap.workspace = true
 confidant-core.workspace = true
 include_dir.workspace = true

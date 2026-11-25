@@ -504,8 +504,9 @@ pub(crate) fn machine_name() -> String {
 }
 
 pub(crate) fn format_system_time(time: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(time)
-        .format("%Y-%m-%d %H:%M UTC")
+    jiff::Timestamp::try_from(time)
+        .expect("system time is inside the civil calendar")
+        .strftime("%Y-%m-%d %H:%M UTC")
         .to_string()
 }
 

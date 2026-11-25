@@ -10,13 +10,13 @@
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 
-use chrono::NaiveDate;
+use crate::date::Date;
 
 use crate::check::{canonical_on, MergeMap};
 use crate::id::{Prefix, RecordId};
 
 /// `as_of` → canonical person id → the member ids folded into it.
-pub(crate) type MembersByRoot = HashMap<NaiveDate, HashMap<RecordId, Vec<RecordId>>>;
+pub(crate) type MembersByRoot = HashMap<Date, HashMap<RecordId, Vec<RecordId>>>;
 
 /// Merge map + per-date merge-group cache. [`MergeGroups`] is `Clone` so a
 /// pack's fold can `Clone` it out of the parent's state; it shares the
@@ -36,14 +36,14 @@ impl MergeGroups {
     }
 
     /// Merge-canonical id as of `on`.
-    pub(crate) fn canonical_on(&self, id: &RecordId, on: NaiveDate) -> RecordId {
+    pub(crate) fn canonical_on(&self, id: &RecordId, on: Date) -> RecordId {
         canonical_on(id, &self.parent, on)
     }
 
     /// Cache the merge-group map for `on`, seeded from `seed` (the pack's own
     /// person ids) plus every merge-map endpoint, so a canonical person with
     /// no direct events still groups correctly. Idempotent per date.
-    pub(crate) fn ensure_members<I>(&self, seed: I, on: NaiveDate)
+    pub(crate) fn ensure_members<I>(&self, seed: I, on: Date)
     where
         I: IntoIterator<Item = RecordId>,
     {
